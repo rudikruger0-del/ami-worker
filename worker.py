@@ -2,16 +2,16 @@ import time
 import json
 import base64
 import io
+import os
 
 from supabase import create_client, Client
 from openai import OpenAI
 from PyPDF2 import PdfReader
 
-# ----------------------------
-# Environment
-# ----------------------------
-import os
 
+# ----------------------------------------
+# ENVIRONMENT
+# ----------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -20,31 +20,40 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
-# ----------------------------
-# AI CALL
-# ----------------------------
-def call_ami_ai(extracted_text, pdf_base64):
+# ----------------------------------------
+# AI CALL — HIGH ACCURACY VERSION
+# ----------------------------------------
+def call_ami_ai(extracted_text: str, pdf_base64: str):
+    """
+    Calls GPT-4o with a very strict prompt ensuring:
+    - No hallucinations
+    - Proper CBC & chemistry parsing
+    - JSON-only output
+    """
 
+    # Clean and trim extracted text
     if extracted_text:
         extracted_text = extracted_text.strip()
         if len(extracted_text) > 20000:
             extracted_text = extracted_text[:20000]
 
+    # Only include PDF data if text is missing or incomplete
     pdf_chunk = ""
-    if not extracted_text or len(extracted_text) < 100:
+    if not extracted_text or len(extracted_text) < 80:
         pdf_chunk = pdf_base64[:60000]
 
-    system_message = """
-You are AMI — an advanced laboratory interpretation AI.
-You analyse blood tests (CBC, chemistry, markers of infection/inflammation).
+    system_prompt = """
+You are AMI — an advanced medical laboratory interpretation AI.
+You analyse blood test reports ONLY from provided text/PDF content.
 
-CRITICAL RULES:
-1. Base your interpretation ONLY on values found in the provided text/PDF.
-2. NEVER invent values.
-3. If markers are missing, state clearly that they cannot be evaluated.
-4. Output STRICT JSON ONLY.
+STRICT RULES:
+- NEVER invent values or diagnoses.
+- ONLY extract numbers and markers that appear in the text.
+- If a value is missing, do NOT guess it.
+- If infection markers (WBC, neutrophils, CRP, ESR) are missing, clearly state this.
+- Output STRICT JSON ONLY. No explanations outside the JSON.
 
-Expected JSON structure:
+OUTPUT FORMAT:
 {
   "summary": [],
   "trend_summary": [],
@@ -58,14 +67,14 @@ Expected JSON structure:
 }
 """
 
-    user_message = f"""
+    user_prompt = f"""
 Extracted Lab Text:
 {extracted_text}
 
-PDF Fallback (limited):
+PDF Fallback (optional):
 {pdf_chunk}
 
-Return ONLY the JSON object described.
+Return ONLY valid JSON.
 """
 
     try:
@@ -73,102 +82,113 @@ Return ONLY the JSON object described.
             model="gpt-4o",
             max_output_tokens=1800,
             input=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": user_message},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
             ]
         )
 
         ai_text = response.output_text.strip()
+
+        # Strip backticks if present
         ai_text = ai_text.replace("```json", "").replace("```", "").strip()
 
+        # Ensure JSON boundaries
         if "{" in ai_text and "}" in ai_text:
-            ai_text = ai_text[ai_text.index("{"): ai_text.rindex("}") + 1]
+            ai_text = ai_text[ai_text.index("{"):ai_text.rindex("}") + 1]
 
         return json.loads(ai_text)
 
     except Exception as e:
-        print("❌ AI error:", e)
+        print("❌ AI ERROR:", e)
         return {"error": str(e)}
 
 
-# ----------------------------
-# PDF → Extract Text
-# ----------------------------
-def extract_text_from_pdf(pdf_bytes):
+# ----------------------------------------
+# PDF TEXT EXTRACTION
+# ----------------------------------------
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     try:
         pdf_stream = io.BytesIO(pdf_bytes)
         reader = PdfReader(pdf_stream)
 
         text = ""
         for page in reader.pages:
-            page_text = page.extract_text() or ""
-            text += page_text + "\n"
+            content = page.extract_text() or ""
+            text += content + "\n"
 
+        print("📄 Extracted text length:", len(text))
         return text.strip()
 
     except Exception as e:
-        print("❌ PDF extract error:", e)
+        print("❌ PDF EXTRACT ERROR:", e)
         return ""
 
 
-# ----------------------------
-# PROCESS NEXT REPORT
-# ----------------------------
+# ----------------------------------------
+# PROCESS REPORT
+# ----------------------------------------
 def process_next_report():
-    print("🔍 Checking for queued reports...")
+    print("🔍 Looking for QUEUED reports...")
 
-    # Pull next report in queue
+    # Pull next queued report
     response = supabase.table("reports") \
         .select("*") \
-        .eq("ai_status", "processing") \
+        .eq("ai_status", "queued") \
         .limit(1) \
         .execute()
 
     if not response.data:
-        return None
+        return None  # Nothing to process
 
     report = response.data[0]
-    print("📄 Processing report:", report["id"])
-
+    report_id = report["id"]
     file_path = report["file_path"]
 
-    # ----------------------------
+    print(f"📄 Found report to process: {report_id}")
+
+    # Mark as processing
+    supabase.table("reports") \
+        .update({"ai_status": "processing"}) \
+        .eq("id", report_id) \
+        .execute()
+
+    # ------------------------------
     # DOWNLOAD PDF FROM STORAGE
-    # ----------------------------
+    # ------------------------------
     try:
-        print("⬇️ Downloading PDF from Supabase...")
-        file_res = supabase.storage.from_("reports").download(file_path)
-        pdf_bytes = file_res
+        print("⬇️ Downloading PDF from Supabase Storage:", file_path)
+        pdf_bytes = supabase.storage.from_("reports").download(file_path)
     except Exception as e:
-        print("❌ Could not download PDF:", e)
-        supabase.table("reports").update({"ai_status": "failed"}).eq("id", report["id"]).execute()
+        print("❌ STORAGE DOWNLOAD ERROR:", e)
+        supabase.table("reports").update({
+            "ai_status": "failed",
+            "ai_results": {"error": "File download failed"}
+        }).eq("id", report_id).execute()
         return None
 
-    # ----------------------------
-    # Extract text
-    # ----------------------------
+    # ------------------------------
+    # EXTRACT TEXT
+    # ------------------------------
     extracted_text = extract_text_from_pdf(pdf_bytes)
-
-    # PDF base64 for fallback
     pdf_base64 = base64.b64encode(pdf_bytes).decode()
 
-    # ----------------------------
-    # Call AI
-    # ----------------------------
+    # ------------------------------
+    # CALL AI
+    # ------------------------------
     ai_json = call_ami_ai(extracted_text, pdf_base64)
 
     if "error" in ai_json:
-        print("❌ AI failed:", ai_json["error"])
+        print("❌ AI FAILED:", ai_json["error"])
         supabase.table("reports").update({
             "ai_status": "failed",
             "ai_results": ai_json
-        }).eq("id", report["id"]).execute()
+        }).eq("id", report_id).execute()
         return None
 
-    # ----------------------------
-    # Save back to Supabase
-    # ----------------------------
-    print("💾 Saving results to database...")
+    # ------------------------------
+    # SAVE RESULTS
+    # ------------------------------
+    print("💾 Saving AI results into Supabase…")
 
     supabase.table("reports").update({
         "ai_status": "completed",
@@ -176,20 +196,20 @@ def process_next_report():
         "extracted_text": extracted_text,
         "cbc_json": ai_json.get("cbc_values", {}),
         "trend_json": ai_json.get("trend_summary", [])
-    }).eq("id", report["id"]).execute()
+    }).eq("id", report_id).execute()
 
-    print("✅ Report completed:", report["id"])
+    print(f"✅ Report completed: {report_id}")
 
 
-# ----------------------------
+# ----------------------------------------
 # MAIN LOOP
-# ----------------------------
-print("🚀 Worker started...")
+# ----------------------------------------
+print("🚀 Worker started successfully…")
 
 while True:
     try:
         process_next_report()
     except Exception as e:
-        print("❌ Worker crash prevented:", e)
+        print("⚠️ Worker crashed but recovered:", e)
 
     time.sleep(5)
