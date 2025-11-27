@@ -6,12 +6,16 @@ import os
 
 from supabase import create_client, Client
 from openai import OpenAI
-from pypdf import PdfReader   # correct and installed
+
+from pypdf import PdfReader
+from pdf2image import convert_from_bytes
+import pytesseract
+from PIL import Image
 
 
-# ----------------------------
-# ENVIRONMENT
-# ----------------------------
+# -------------------------------------------
+# ENV
+# -------------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -20,52 +24,70 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
-# ----------------------------
-# PDF → TEXT EXTRACTION
-# ----------------------------
-def extract_text_from_pdf(pdf_bytes):
+# -------------------------------------------
+# OCR FUNCTION
+# -------------------------------------------
+def ocr_pdf(pdf_bytes):
+    try:
+        pages = convert_from_bytes(pdf_bytes)
+        text = ""
+
+        for p in pages:
+            ocr_text = pytesseract.image_to_string(p)
+            text += ocr_text + "\n"
+
+        return text.strip()
+
+    except Exception as e:
+        print("❌ OCR error:", e)
+        return ""
+
+
+# -------------------------------------------
+# Extract text with BOTH PdfReader + OCR
+# -------------------------------------------
+def extract_text(pdf_bytes):
+    text = ""
+
+    # Try normal text extraction
     try:
         pdf_stream = io.BytesIO(pdf_bytes)
         reader = PdfReader(pdf_stream)
 
-        text = ""
         for page in reader.pages:
-            t = page.extract_text() or ""
-            text += t + "\n"
+            page_text = page.extract_text() or ""
+            text += page_text + "\n"
 
-        return text.strip()
-    except Exception as e:
-        print("❌ PDF extraction error:", e)
-        return ""
+    except:
+        pass
+
+    # If NO text, run OCR
+    if len(text.strip()) < 50:
+        print("⚠️ No text found — using OCR…")
+        text = ocr_pdf(pdf_bytes)
+
+    return text.strip()
 
 
-# ----------------------------
-# AI CALL
-# ----------------------------
-def call_ami_ai(extracted_text: str, pdf_base64: str):
-    # CLEAN TEXT
-    if extracted_text:
-        extracted_text = extracted_text.strip()
-        if len(extracted_text) > 15000:
-            extracted_text = extracted_text[:15000]
+# -------------------------------------------
+# GPT PROCESSING
+# -------------------------------------------
+def call_ai(extracted_text):
 
-    # FALLBACK: SEND SMALL PIECE OF PDF IF TEXT TOO SHORT
-    pdf_chunk = ""
-    if not extracted_text or len(extracted_text) < 50:
-        pdf_chunk = pdf_base64[:30000]  # tiny, safe for GPT-4o
+    if len(extracted_text) > 15000:
+        extracted_text = extracted_text[:15000]
 
     system_prompt = """
-You are AMI — expert medical laboratory analysis system.
+You are AMI — a medical lab interpretation AI.
 
-CRITICAL RULES:
-- ONLY use values found in the text/PDF.
-- NEVER invent values or diagnoses.
-- If markers (WBC, NEUT, CRP, ESR) are missing, clearly state that.
-- Output STRICT JSON ONLY.
+Rules:
+- Only use values found in the text.
+- If missing, say “not provided”.
+- Output strict JSON in this format:
 
-JSON format:
 {
   "summary": [],
+  "trend_summary": [],
   "flagged_results": [],
   "interpretation": [],
   "risk_level": "",
@@ -78,90 +100,75 @@ JSON format:
 
     user_prompt = f"""
 Extracted Lab Text:
+-----------------------
 {extracted_text}
-
-PDF Fallback (may be empty):
-{pdf_chunk}
-
-Return ONLY the JSON structure exactly as described.
 """
 
     try:
         response = openai_client.responses.create(
-            model="gpt-4o-mini",     # safe & fast, low tokens
-            max_output_tokens=1200,
+            model="gpt-4o",
             input=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ]
+                {"role": "user", "content": user_prompt},
+            ],
+            max_output_tokens=1200
         )
 
-        ai_out = response.output_text.strip()
+        txt = response.output_text.strip()
 
-        # CLEAN
-        ai_out = ai_out.replace("```json", "").replace("```", "").strip()
-        ai_out = ai_out[ai_out.index("{"): ai_out.rindex("}") + 1]
+        # clean JSON
+        if "{" in txt and "}" in txt:
+            txt = txt[txt.index("{"): txt.rindex("}") + 1]
 
-        return json.loads(ai_out)
+        return json.loads(txt)
 
     except Exception as e:
         print("❌ AI error:", e)
         return {"error": str(e)}
 
 
-# ----------------------------
-# PROCESS NEXT REPORT
-# ----------------------------
-def process_next_report():
+# -------------------------------------------
+# PROCESSING LOOP
+# -------------------------------------------
+def process_next():
     print("🔍 Checking for queued reports...")
 
-    # 1️⃣ LOOK FOR QUEUED REPORTS (FIXED!)
-    response = supabase.table("reports") \
+    row = supabase.table("reports") \
         .select("*") \
         .eq("ai_status", "queued") \
-        .order("id", desc=False) \
         .limit(1) \
         .execute()
 
-    if not response.data:
-        return None
+    if not row.data:
+        return
 
-    report = response.data[0]
+    report = row.data[0]
     report_id = report["id"]
-    file_path = report["file_path"]
 
-    print("📄 Found report:", report_id)
+    print("📄 Processing:", report_id)
 
-    # 2️⃣ LOCK IT
-    supabase.table("reports").update({"ai_status": "processing"}).eq("id", report_id).execute()
-
-    # 3️⃣ DOWNLOAD
+    # download pdf
     try:
-        print("⬇️ Downloading PDF...")
-        pdf_bytes = supabase.storage.from_("reports").download(file_path)
+        file_bytes = supabase.storage.from_("reports").download(report["file_path"])
     except Exception as e:
         print("❌ Download error:", e)
         supabase.table("reports").update({"ai_status": "failed"}).eq("id", report_id).execute()
         return
 
-    # 4️⃣ EXTRACT TEXT
-    extracted_text = extract_text_from_pdf(pdf_bytes)
-    pdf_base64 = base64.b64encode(pdf_bytes).decode()
+    # extract text
+    extracted_text = extract_text(file_bytes)
 
-    # 5️⃣ AI
-    ai_json = call_ami_ai(extracted_text, pdf_base64)
+    # call ai
+    ai_json = call_ai(extracted_text)
 
     if "error" in ai_json:
-        print("❌ AI failed:", ai_json["error"])
         supabase.table("reports").update({
             "ai_status": "failed",
             "ai_results": ai_json
         }).eq("id", report_id).execute()
         return
 
-    # 6️⃣ SAVE
-    print("💾 Saving AI results...")
-
+    # save
     supabase.table("reports").update({
         "ai_status": "completed",
         "ai_results": ai_json,
@@ -170,17 +177,14 @@ def process_next_report():
         "extracted_text": extracted_text
     }).eq("id", report_id).execute()
 
-    print("✅ Report completed:", report_id)
+    print("✅ Completed:", report_id)
 
 
-# ----------------------------
-# MAIN LOOP
-# ----------------------------
-print("🚀 AMI Worker started (text-only, safe tokens)…")
+print("🚀 AMI Worker (OCR + text) started…")
 
 while True:
     try:
-        process_next_report()
+        process_next()
+        time.sleep(4)
     except Exception as e:
         print("❌ Worker crash prevented:", e)
-    time.sleep(5)
