@@ -1,5 +1,4 @@
 openai
 supabase
-PyMuPDF==1.23.3
-PyPDF2==3.0.1
 python-dotenv
+pypdf
