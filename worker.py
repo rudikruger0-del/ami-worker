@@ -1,171 +1,120 @@
-import time
-import json
 import base64
-import os
-
-from supabase import create_client, Client
 from openai import OpenAI
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-
-CHECK_INTERVAL = 5  # seconds
-
-
-# --------------------------
-# GPT-4o Vision: Extract Data
-# --------------------------
-def process_pdf_with_gpt_vision(pdf_base64: str):
+def run_ai_analysis(pdf_bytes, extracted_text):
     """
-    Sends the PDF directly to GPT-4o Vision.
-    Returns structured JSON.
+    pdf_bytes: raw PDF file bytes
+    extracted_text: text extracted via PyMuPDF fallback
     """
 
-    prompt = """
-You are AMI — an advanced medical AI assistant.
+    pdf_base64 = base64.b64encode(pdf_bytes).decode()
 
-Extract ALL clinically relevant information from this lab report.
-This PDF may include chemistry, CBC, hormones, urine, or special tests.
+    response = client.responses.create(
+        model="gpt-4o-mini",   # can upgrade to: gpt-4o, gpt-4.1, or gpt-4.1-mini
+        response_format={"type": "json"},
+        input=[
+            {
+                "role": "system",
+                "content": """
+You are AMI — an advanced clinical laboratory interpretation AI.
 
-RETURN JSON ONLY in this EXACT structure:
+You will analyze a medical laboratory report (CBC + chemistry). The input may include extracted text and/or a base64 PDF.
 
+------------------------------------------
+YOUR TASKS
+------------------------------------------
+1. Extract all identifiable CBC + chemistry values.
+2. Detect abnormalities and patterns.
+3. Create a detailed medical-style report.
+4. Return ONLY a strict JSON object.
+
+------------------------------------------
+JSON OUTPUT STRUCTURE (MANDATORY)
+------------------------------------------
 {
-  "patient_info": {
-    "name": "",
-    "age": "",
-    "sex": "",
-    "lab_date": ""
-  },
-  "cbc": {
-    "wbc": "",
-    "rbc": "",
-    "hemoglobin": "",
-    "hematocrit": "",
-    "mcv": "",
-    "mch": "",
-    "mchc": "",
-    "platelets": "",
-    "neutrophils": "",
-    "lymphocytes": "",
-    "monocytes": "",
-    "eosinophils": "",
-    "basophils": ""
-  },
-  "chemistry": {},
-  "hormones": {},
-  "urine": {},
-  "other_tests": {},
-  
-  "interpretation": {
-    "risk_level": "",
-    "summary": "",
-    "flagged_results": [],
-    "trend_summary": "",
-    "recommendations": "",
-    "urgent_findings": ""
-  },
-
-  "disclaimer": "This AI interpretation is assistive and not a medical diagnosis."
+  "risk_level": "", 
+  "narrative_text": "", 
+  "summary": [],
+  "trend_summary": [],
+  "flagged_results": [],
+  "recommendations": [],
+  "urgent_care": [],
+  "cbc_values": {},
+  "chemistry_values": {},
+  "disclaimer": "This AI report is for informational purposes only and is not a diagnosis."
 }
 
-Be very detailed in the interpretation. 
-If something is normal, say WHY.
-If something is abnormal, explain WHAT it means.
-Avoid medical jargon that a layperson won't understand.
+------------------------------------------
+REQUIREMENTS
+------------------------------------------
+narrative_text:
+- 2–5 short paragraphs.
+- Explain the meaning of the lab profile.
+- Describe abnormalities and concerns.
+- Professional but friendly clinician tone.
+
+summary:
+- 3–6 bullet points summarizing the findings.
+
+trend_summary:
+- If no trend data:
+  ["No trend comparison is possible based on this report alone."]
+
+flagged_results:
+- ONLY real abnormalities.
+- Format each:
+  {
+    "test": "",
+    "value": "",
+    "units": "",
+    "flag": "high | low | normal",
+    "reference_range": "",
+    "comment": ""
+  }
+
+recommendations:
+- General health suggestions.
+- Do NOT prescribe medication.
+
+urgent_care:
+- Red-flag symptoms associated with abnormalities.
+
+cbc_values / chemistry_values:
+- Extract ONLY real values.
+- If a value is missing, omit it completely.
+
+------------------------------------------
+SAFETY
+------------------------------------------
+- No diagnosis.
+- No speculation.
+- No treatment plans.
+- Always use safe language ("may indicate", "can be associated with").
+
+Return ONLY JSON.
 """
+            },
+            {
+                "role": "user",
+                "content": f"""
+Extracted Text:
+{extracted_text}
 
-    try:
-        response = openai_client.responses.create(
-            model="gpt-4o",
-            input=[
-                {"role": "system", "content": prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": "Here is the lab PDF."
-                        },
-                        {
-                            "type": "input_image",
-                            "image_url": f"data:application/pdf;base64,{pdf_base64}"
-                        }
-                    ]
-                }
-            ]
-        )
+Base64 PDF:
+{pdf_base64}
 
-        ai_json = response.output[0].content[0].text
-        return json.loads(ai_json)
+Respond ONLY with valid JSON.
+"""
+            }
+        ]
+    )
 
-    except Exception as e:
-        return {"error": str(e)}
+    # Extract the JSON cleanly
+    ai_json = (
+        response.output[0].content[0].get("json") or
+        response.output[0].content[0].get("text") or
+        {}
+    )
 
-
-# --------------------------
-# WORKER LOOP
-# --------------------------
-def worker_loop():
-    print("🚀 AMI Worker Started (GPT-4o Vision PDF mode)…")
-
-    while True:
-        try:
-            # pull the next queued report
-            result = (
-                supabase.table("reports")
-                .select("*")
-                .eq("ai_status", "queued")
-                .order("created_at", desc=False)
-                .limit(1)
-                .execute()
-            )
-
-            if not result.data:
-                print("⏳ No queued reports…")
-                time.sleep(CHECK_INTERVAL)
-                continue
-
-            report = result.data[0]
-            report_id = report["id"]
-            filename = report_id + ".pdf"
-
-            print(f"\n📄 Processing report: {report_id}")
-
-            # update status to processing
-            supabase.table("reports").update({"ai_status": "processing"}).eq("id", report_id).execute()
-
-            # download PDF from Supabase Storage
-            file_res = supabase.storage.from_("reports").download(filename)
-
-            if file_res is None:
-                raise Exception("PDF missing in storage")
-
-            pdf_bytes = file_res
-            pdf_base64 = base64.b64encode(pdf_bytes).decode()
-
-            # send to GPT-4o Vision
-            ai_data = process_pdf_with_gpt_vision(pdf_base64)
-
-            # determine status
-            new_status = "completed" if "error" not in ai_data else "failed"
-
-            # save results
-            supabase.table("reports").update({
-                "ai_status": new_status,
-                "ai_results": ai_data
-            }).eq("id", report_id).execute()
-
-            print(f"✅ Completed: {report_id}\n")
-
-        except Exception as error:
-            print("❌ Worker Error:", error)
-
-        time.sleep(CHECK_INTERVAL)
-
-
-if __name__ == "__main__":
-    worker_loop()
+    return ai_json
