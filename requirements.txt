@@ -1,7 +1,3 @@
-openai
 supabase
+openai
 python-dotenv
-pypdf
-pytesseract
-Pillow
-pdf2image
