@@ -2,7 +2,6 @@ import time
 import json
 import base64
 import os
-import fitz  # PyMuPDF
 from supabase import create_client, Client
 from openai import OpenAI
 
@@ -13,36 +12,32 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-print("🔧 AMI Worker Ready (GPT-4o-mini Vision)")
+print("🔧 AMI Worker Ready (GPT-4o-mini Vision, no PyMuPDF)")
 
 
 # ---------------------------------------------------------
-# TOKEN-SAFE AI CALL
+# AI CALL (Vision → JSON)
 # ---------------------------------------------------------
-def call_ami_ai(pdf_b64, extracted_text):
-    """
-    Token-optimized Vision→JSON pipeline.
-    """
+def call_ami_ai(pdf_bytes):
     try:
-        # ALWAYS send only the FIRST 10–80 lines of text to reduce tokens
-        safe_text = "\n".join(extracted_text.splitlines()[:80]) if extracted_text else ""
+        pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
 
-        prompt = f"""
+        prompt = """
 You are AMI — Artificial Medical Intelligence.
 Interpret a laboratory report with clinical accuracy.
 
 Rules:
-- NEVER invent numbers.
-- Only use values visible in the image or in the extracted text.
-- If a section has no data, return an empty list/object.
-- Output STRICT JSON.
+- ONLY use values visible in the PDF image.
+- No hallucinations.
+- If a section has no data, return empty values.
+- Output valid JSON only.
 
 JSON FORMAT:
-{{
+{
   "patient_summary": "",
   "overall_risk": "",
-  "cbc_values": {{}},
-  "chemistry_values": {{}},
+  "cbc_values": {},
+  "chemistry_values": {},
   "flagged_abnormalities": [],
   "infection_indicators": [],
   "dehydration_markers": [],
@@ -54,11 +49,8 @@ JSON FORMAT:
   "detailed_interpretation": [],
   "doctor_recommendations": [],
   "urgent_findings": [],
-  "disclaimer": "This is an assistive AI analysis, not a medical diagnosis."
-}}
-
-Extracted text (may be incomplete):
-{safe_text}
+  "disclaimer": "This is an assistive AI interpretation, not a medical diagnosis."
+}
 """
 
         res = openai_client.responses.create(
@@ -78,36 +70,16 @@ Extracted text (may be incomplete):
             ]
         )
 
-        # AI JSON output
-        final = res.output[0].content[0].json
-        return final
+        return res.output[0].content[0].json
 
     except Exception as e:
-        return {"error": f"AI Failure: {str(e)}"}
+        return {"error": f"AI Error: {str(e)}"}
 
 
 # ---------------------------------------------------------
-# SAFE PDF LOADER → BASE64 + TEXT
-# ---------------------------------------------------------
-def load_pdf_for_ai(pdf_bytes):
-    pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
-
-    text = ""
-    try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        for page in doc:
-            text += page.get_text()
-    except:
-        text = ""
-
-    return pdf_b64, text.strip()
-
-
-# ---------------------------------------------------------
-# POLLING WORKER LOOP
+# PROCESS REPORT
 # ---------------------------------------------------------
 def process_next_report():
-    # Get the oldest queued report
     job = (
         supabase.table("reports")
         .select("*")
@@ -118,38 +90,33 @@ def process_next_report():
     )
 
     if not job.data:
-        return None
+        return False
 
     report = job.data[0]
     report_id = report["id"]
     file_path = report["file_path"]
 
-    print(f"📄 Processing report: {report_id}")
+    print(f"📄 Processing: {report_id}")
 
-    # Mark processing
     supabase.table("reports").update({"ai_status": "processing"}).eq("id", report_id).execute()
 
-    # Download PDF from storage
-    pdf_file = supabase.storage.from_("reports").download(file_path)
+    # Download PDF
+    pdf_bytes = supabase.storage.from_("reports").download(file_path)
 
-    if not pdf_file:
+    if not pdf_bytes:
         supabase.table("reports").update(
-            {"ai_status": "failed", "ai_results": {"error": "File missing in storage"}}
+            {"ai_status": "failed", "ai_results": {"error": "File missing"}}
         ).eq("id", report_id).execute()
-        return
+        return True
 
-    pdf_bytes = pdf_file
-    pdf_b64, extracted_text = load_pdf_for_ai(pdf_bytes)
+    # AI analysis
+    ai_result = call_ami_ai(pdf_bytes)
 
-    # Run AI
-    result = call_ami_ai(pdf_b64, extracted_text)
-
-    # Store results
+    # Save to DB
     supabase.table("reports").update(
         {
-            "ai_results": result,
-            "ai_status": "completed",
-            "extracted_text": extracted_text[:20000]
+            "ai_results": ai_result,
+            "ai_status": "completed"
         }
     ).eq("id", report_id).execute()
 
@@ -158,15 +125,15 @@ def process_next_report():
 
 
 # ---------------------------------------------------------
-# MAIN LOOP
+# LOOP
 # ---------------------------------------------------------
 while True:
     try:
-        done = process_next_report()
-        if not done:
-            print("⏳ No reports. Waiting...")
+        if not process_next_report():
+            print("⏳ No tasks. Waiting...")
         time.sleep(5)
 
     except Exception as e:
-        print("WORKER ERROR:", str(e))
+        print("Worker crash:", e)
         time.sleep(5)
+        
