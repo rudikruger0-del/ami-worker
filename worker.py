@@ -14,16 +14,14 @@ load_dotenv()
 # ------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 
-# AUTO-DETECT SUPABASE KEY
 SUPABASE_KEY = (
-    os.getenv("SUPABASE_SERVICE_ROLE_KEY") or
-    os.getenv("SUPABASE_KEY") or
-    None
+    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    or os.getenv("SUPABASE_KEY")
+    or None
 )
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Validate baked-in
 if not SUPABASE_URL:
     raise Exception("Missing SUPABASE_URL")
 if not SUPABASE_KEY:
@@ -98,8 +96,8 @@ def extract_pdf_text(file_path: str) -> str:
 def run_ai_interpretation(extracted_text: str) -> dict:
     prompt = f"""
 You are AMI — Artificial Medical Intelligence.
-Provide doctor-level analysis with trends, abnormalities, risk, and recommendations.
-Return ONLY valid JSON following the schema.
+Provide strong medical interpretation with trends, risks, flagged values.
+Return ONLY valid JSON.
 
 Lab Report:
 -----------
@@ -127,11 +125,11 @@ def download_pdf(url: str, local_path: str):
 
 
 # ------------------------------
-# PROCESS ONE JOB
+# PROCESS JOB
 # ------------------------------
 def process_next_job():
     job = (
-        supabase.table("ami_tasks")
+        supabase.table("reports")
         .select("*")
         .eq("ai_status", "queued")
         .limit(1)
@@ -142,66 +140,73 @@ def process_next_job():
         print("No queued jobs.")
         return
 
-    task = job.data[0]
-    task_id = task["id"]
-    pdf_path = task["pdf_path"]
+    report = job.data[0]
+    report_id = report["id"]
+    file_path = report["file_path"]
 
     print("\n-----------------------------------")
-    print("Processing task:", task_id)
+    print("Processing report:", report_id)
     print("-----------------------------------\n")
 
-    pdf_url = f"{SUPABASE_URL}/storage/v1/object/public/{pdf_path}"
+    pdf_url = f"{SUPABASE_URL}/storage/v1/object/public/{file_path}"
     local_file = "/tmp/report.pdf"
 
+    # Download PDF
     try:
         download_pdf(pdf_url, local_file)
     except Exception as e:
         print("Download error:", e)
-        supabase.table("ami_tasks").update({
-            "ai_status": "failed"
-        }).eq("id", task_id).execute()
+        supabase.table("reports").update({
+            "ai_status": "failed",
+            "ai_error": f"Download error: {e}"
+        }).eq("id", report_id).execute()
         return
 
+    # Extract text
     extracted_text = extract_pdf_text(local_file)
 
     if len(extracted_text) < 20:
-        print("No readable text extracted.")
-        supabase.table("ami_tasks").update({
+        print("Unreadable PDF")
+        supabase.table("reports").update({
             "ai_status": "failed",
-            "extracted_text": extracted_text
-        }).eq("id", task_id).execute()
+            "extracted_text": extracted_text,
+            "ai_error": "PDF extraction produced no readable text"
+        }).eq("id", report_id).execute()
         return
 
+    # AI interpretation
     try:
         result_json = run_ai_interpretation(extracted_text)
     except Exception as e:
         print("AI error:", e)
-        supabase.table("ami_tasks").update({
-            "ai_status": "failed"
-        }).eq("id", task_id).execute()
+        supabase.table("reports").update({
+            "ai_status": "failed",
+            "ai_error": f"AI error: {e}"
+        }).eq("id", report_id).execute()
         return
 
-    supabase.table("ami_tasks").update({
+    # Save results
+    supabase.table("reports").update({
         "ai_status": "completed",
         "extracted_text": extracted_text,
         "ai_results": result_json,
         "cbc_json": result_json.get("cbc_values", {}),
         "trend_json": result_json.get("trend_summary", [])
-    }).eq("id", task_id).execute()
+    }).eq("id", report_id).execute()
 
-    print("Task completed:", task_id)
+    print("Report completed:", report_id)
 
 
 # ------------------------------
 # MAIN LOOP
 # ------------------------------
 def main():
-    print("AMI Worker started. Listening for jobs...")
+    print("AMI Worker started. Ready for reports...")
     while True:
         try:
             process_next_job()
         except Exception as e:
-            print("Worker runtime error:", e)
+            print("Worker error:", e)
         time.sleep(4)
 
 
