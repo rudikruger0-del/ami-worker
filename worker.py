@@ -10,18 +10,30 @@ from openai import OpenAI
 load_dotenv()
 
 # ------------------------------
-# ENV VARIABLES
+# ENV VARIABLES (AUTO-DETECT)
 # ------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+# AUTO-DETECT SUPABASE KEY
+SUPABASE_KEY = (
+    os.getenv("SUPABASE_SERVICE_ROLE_KEY") or
+    os.getenv("SUPABASE_KEY") or
+    None
+)
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Validate environment variables
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise Exception("Missing SUPABASE_URL or SUPABASE_KEY")
-
+# Validate baked-in
+if not SUPABASE_URL:
+    raise Exception("Missing SUPABASE_URL")
+if not SUPABASE_KEY:
+    raise Exception("Missing SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY")
 if not OPENAI_API_KEY:
     raise Exception("Missing OPENAI_API_KEY")
+
+print("Supabase URL Loaded:", bool(SUPABASE_URL))
+print("Supabase Key Loaded:", bool(SUPABASE_KEY))
+print("OpenAI Key Loaded:", bool(OPENAI_API_KEY))
 
 # ------------------------------
 # CLIENTS
@@ -34,7 +46,7 @@ supabase: Client = create_client(
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ------------------------------
-# STRICT JSON SCHEMA FOR AI
+# STRICT JSON SCHEMA
 # ------------------------------
 JSON_SCHEMA = {
     "type": "object",
@@ -86,17 +98,8 @@ def extract_pdf_text(file_path: str) -> str:
 def run_ai_interpretation(extracted_text: str) -> dict:
     prompt = f"""
 You are AMI — Artificial Medical Intelligence.
-Analyse the lab report text below.
-
-Provide:
-- Doctor-level interpretation
-- Trends
-- Flagged abnormalities
-- Clinical meaning
-- Risk assessment
-- Actionable recommendations
-
-Return ONLY valid JSON using the schema.
+Provide doctor-level analysis with trends, abnormalities, risk, and recommendations.
+Return ONLY valid JSON following the schema.
 
 Lab Report:
 -----------
@@ -147,11 +150,9 @@ def process_next_job():
     print("Processing task:", task_id)
     print("-----------------------------------\n")
 
-    # Build public storage URL
     pdf_url = f"{SUPABASE_URL}/storage/v1/object/public/{pdf_path}"
     local_file = "/tmp/report.pdf"
 
-    # Download PDF
     try:
         download_pdf(pdf_url, local_file)
     except Exception as e:
@@ -161,7 +162,6 @@ def process_next_job():
         }).eq("id", task_id).execute()
         return
 
-    # Extract text
     extracted_text = extract_pdf_text(local_file)
 
     if len(extracted_text) < 20:
@@ -172,7 +172,6 @@ def process_next_job():
         }).eq("id", task_id).execute()
         return
 
-    # AI interpretation
     try:
         result_json = run_ai_interpretation(extracted_text)
     except Exception as e:
@@ -182,7 +181,6 @@ def process_next_job():
         }).eq("id", task_id).execute()
         return
 
-    # Save back to Supabase
     supabase.table("ami_tasks").update({
         "ai_status": "completed",
         "extracted_text": extracted_text,
@@ -195,7 +193,7 @@ def process_next_job():
 
 
 # ------------------------------
-# MAIN WORKER LOOP
+# MAIN LOOP
 # ------------------------------
 def main():
     print("AMI Worker started. Listening for jobs...")
