@@ -1,22 +1,41 @@
 import os
 import json
 import time
-from pypdf import PdfReader
-from supabase import create_client, Client
-from dotenv import load_dotenv
-from openai import OpenAI
 import requests
+from pypdf import PdfReader
+from dotenv import load_dotenv
+from supabase import create_client, Client
+from openai import OpenAI
 
 load_dotenv()
 
+# ------------------------------
+# ENV VARIABLES
+# ------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Validate environment variables
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise Exception("Missing SUPABASE_URL or SUPABASE_KEY")
+
+if not OPENAI_API_KEY:
+    raise Exception("Missing OPENAI_API_KEY")
+
+# ------------------------------
+# CLIENTS
+# ------------------------------
+supabase: Client = create_client(
+    supabase_url=SUPABASE_URL,
+    supabase_key=SUPABASE_KEY
+)
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Strict JSON schema the AI must follow
+# ------------------------------
+# STRICT JSON SCHEMA FOR AI
+# ------------------------------
 JSON_SCHEMA = {
     "type": "object",
     "properties": {
@@ -45,51 +64,68 @@ JSON_SCHEMA = {
     ]
 }
 
-
-def extract_pdf_text(file_path):
+# ------------------------------
+# PDF TEXT EXTRACTION
+# ------------------------------
+def extract_pdf_text(file_path: str) -> str:
     try:
         reader = PdfReader(file_path)
         text = ""
-
         for page in reader.pages:
-            txt = page.extract_text() or ""
-            text += txt + "\n"
-
+            extracted = page.extract_text() or ""
+            text += extracted + "\n"
         return text.strip()
     except Exception as e:
         print("PDF extraction error:", e)
         return ""
 
 
-def run_ai_interpretation(extracted_text):
+# ------------------------------
+# AI INTERPRETATION
+# ------------------------------
+def run_ai_interpretation(extracted_text: str) -> dict:
     prompt = f"""
 You are AMI — Artificial Medical Intelligence.
+Analyse the lab report text below.
 
-Analyse this lab report text and produce DOCTOR-LEVEL detail with patterns, trends, flagged values, and clinical interpretation.
+Provide:
+- Doctor-level interpretation
+- Trends
+- Flagged abnormalities
+- Clinical meaning
+- Risk assessment
+- Actionable recommendations
 
-Return ONLY the JSON object. No text outside JSON.
+Return ONLY valid JSON using the schema.
 
-Lab Report Text:
-----------------
+Lab Report:
+-----------
 {extracted_text}
 """
 
     response = client.responses.create(
         model="gpt-4.1",
         input=prompt,
-        max_output_tokens=2500,
+        max_output_tokens=2000,
         response_format={"type": "json_schema", "json_schema": JSON_SCHEMA}
     )
 
     return json.loads(response.output[0].content[0].text)
 
 
-def download_pdf(public_url, local_path):
-    r = requests.get(public_url)
+# ------------------------------
+# DOWNLOAD PDF
+# ------------------------------
+def download_pdf(url: str, local_path: str):
+    r = requests.get(url)
+    r.raise_for_status()
     with open(local_path, "wb") as f:
         f.write(r.content)
 
 
+# ------------------------------
+# PROCESS ONE JOB
+# ------------------------------
 def process_next_job():
     job = (
         supabase.table("ami_tasks")
@@ -107,39 +143,46 @@ def process_next_job():
     task_id = task["id"]
     pdf_path = task["pdf_path"]
 
+    print("\n-----------------------------------")
     print("Processing task:", task_id)
+    print("-----------------------------------\n")
 
-    # PUBLIC URL from Supabase Storage
-    public_url = f"{SUPABASE_URL}/storage/v1/object/public/{pdf_path}"
+    # Build public storage URL
+    pdf_url = f"{SUPABASE_URL}/storage/v1/object/public/{pdf_path}"
     local_file = "/tmp/report.pdf"
 
+    # Download PDF
     try:
-        download_pdf(public_url, local_file)
-    except:
-        supabase.table("ami_tasks").update({"ai_status": "failed"}).eq("id", task_id).execute()
-        print("Failed: Could not download PDF.")
+        download_pdf(pdf_url, local_file)
+    except Exception as e:
+        print("Download error:", e)
+        supabase.table("ami_tasks").update({
+            "ai_status": "failed"
+        }).eq("id", task_id).execute()
         return
 
-    # Extract
+    # Extract text
     extracted_text = extract_pdf_text(local_file)
 
-    if len(extracted_text.strip()) < 20:
+    if len(extracted_text) < 20:
+        print("No readable text extracted.")
         supabase.table("ami_tasks").update({
             "ai_status": "failed",
             "extracted_text": extracted_text
         }).eq("id", task_id).execute()
-        print("Failed: No readable text.")
         return
 
-    # AI INTERPRETATION
+    # AI interpretation
     try:
         result_json = run_ai_interpretation(extracted_text)
     except Exception as e:
         print("AI error:", e)
-        supabase.table("ami_tasks").update({"ai_status": "failed"}).eq("id", task_id).execute()
+        supabase.table("ami_tasks").update({
+            "ai_status": "failed"
+        }).eq("id", task_id).execute()
         return
 
-    # SAVE RESULTS
+    # Save back to Supabase
     supabase.table("ami_tasks").update({
         "ai_status": "completed",
         "extracted_text": extracted_text,
@@ -148,14 +191,20 @@ def process_next_job():
         "trend_json": result_json.get("trend_summary", [])
     }).eq("id", task_id).execute()
 
-    print("Completed:", task_id)
+    print("Task completed:", task_id)
 
 
+# ------------------------------
+# MAIN WORKER LOOP
+# ------------------------------
 def main():
-    print("Worker started...")
+    print("AMI Worker started. Listening for jobs...")
     while True:
-        process_next_job()
-        time.sleep(5)
+        try:
+            process_next_job()
+        except Exception as e:
+            print("Worker runtime error:", e)
+        time.sleep(4)
 
 
 if __name__ == "__main__":
