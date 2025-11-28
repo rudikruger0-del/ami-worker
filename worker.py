@@ -10,7 +10,7 @@ from openai import OpenAI
 load_dotenv()
 
 # ------------------------------
-# ENV VARIABLES (AUTO-DETECT)
+# ENV
 # ------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = (
@@ -19,20 +19,10 @@ SUPABASE_KEY = (
 )
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-if not SUPABASE_URL:
-    raise Exception("Missing SUPABASE_URL")
-if not SUPABASE_KEY:
-    raise Exception("Missing SUPABASE_SERVICE_ROLE_KEY")
-if not OPENAI_API_KEY:
-    raise Exception("Missing OPENAI_API_KEY")
-
 print("Supabase URL Loaded:", bool(SUPABASE_URL))
 print("Supabase Key Loaded:", bool(SUPABASE_KEY))
 print("OpenAI Key Loaded:", bool(OPENAI_API_KEY))
 
-# ------------------------------
-# CLIENTS
-# ------------------------------
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -54,61 +44,60 @@ JSON_SCHEMA = {
         "disclaimer": {"type": "string"},
     },
     "required": [
-        "summary", "trend_summary", "flagged_results", "interpretation",
-        "risk_level", "recommendations", "when_to_seek_urgent_care",
-        "cbc_values", "chemistry_values", "disclaimer"
+        "summary",
+        "trend_summary",
+        "flagged_results",
+        "interpretation",
+        "risk_level",
+        "recommendations",
+        "when_to_seek_urgent_care",
+        "cbc_values",
+        "chemistry_values",
+        "disclaimer"
     ]
 }
 
 # ------------------------------
-# PDF TEXT EXTRACTION
+# PDF EXTRACT
 # ------------------------------
-def extract_pdf_text(file_path: str) -> str:
+def extract_pdf_text(path: str) -> str:
     try:
-        reader = PdfReader(file_path)
+        reader = PdfReader(path)
         text = ""
-        for page in reader.pages:
-            extracted = page.extract_text() or ""
-            text += extracted + "\n"
+        for p in reader.pages:
+            text += (p.extract_text() or "") + "\n"
         return text.strip()
     except Exception as e:
         print("PDF extraction error:", e)
         return ""
 
+
 # ------------------------------
-# AI INTERPRETATION
+# AI
 # ------------------------------
-def run_ai_interpretation(extracted_text: str) -> dict:
+def run_ai(text: str) -> dict:
     prompt = f"""
 You are AMI — Artificial Medical Intelligence.
-Provide strong medical interpretation with trends, risks, flagged values.
-Return ONLY valid JSON.
+Provide detailed CBC interpretation with trends, risks, flagged values.
 
-Lab Report:
------------
-{extracted_text}
+Return ONLY valid JSON matching the schema.
+
+Lab Report Text:
+{text}
 """
 
-    response = client.responses.create(
+    r = client.responses.create(
         model="gpt-4.1",
         input=prompt,
-        max_output_tokens=2000,
+        max_output_tokens=2500,
         response_format={"type": "json_schema", "json_schema": JSON_SCHEMA}
     )
 
-    return json.loads(response.output[0].content[0].text)
+    return json.loads(r.output[0].content[0].text)
+
 
 # ------------------------------
-# DOWNLOAD PDF
-# ------------------------------
-def download_pdf(url: str, local_path: str):
-    r = requests.get(url)
-    r.raise_for_status()
-    with open(local_path, "wb") as f:
-        f.write(r.content)
-
-# ------------------------------
-# PROCESS ONE JOB
+# MAIN PROCESSOR
 # ------------------------------
 def process_next_job():
     job = (
@@ -127,78 +116,74 @@ def process_next_job():
     report_id = report["id"]
     file_path = report["file_path"]
 
-    print("\n-----------------------------------")
-    print("Processing report:", report_id)
-    print("file_path:", file_path)
-    print("-----------------------------------\n")
+    print("\n==============================")
+    print("Processing:", report_id)
+    print("==============================\n")
 
-    # Fix path if database stored only "<id>.pdf"
-    if not file_path.startswith("reports/"):
-        storage_path = f"reports/{file_path}"
-    else:
-        storage_path = file_path
+    # CORRECT PUBLIC URL
+    pdf_url = f"{SUPABASE_URL}/storage/v1/object/public/reports/{file_path}"
+    local_pdf = "/tmp/report.pdf"
 
-    pdf_url = f"{SUPABASE_URL}/storage/v1/object/public/{storage_path}"
-    print("Downloading:", pdf_url)
-
-    local_file = "/tmp/report.pdf"
-
-    # DOWNLOAD PDF
+    # Download PDF
     try:
-        download_pdf(pdf_url, local_file)
+        r = requests.get(pdf_url)
+        r.raise_for_status()
+        with open(local_pdf, "wb") as f:
+            f.write(r.content)
     except Exception as e:
         print("Download error:", e)
         supabase.table("reports").update({
             "ai_status": "failed",
-            "ai_error": f"Download error: {str(e)}"
+            "ai_error": f"Download error: {e}"
         }).eq("id", report_id).execute()
         return
 
-    # EXTRACT TEXT
-    extracted_text = extract_pdf_text(local_file)
+    # Extract PDF
+    extracted = extract_pdf_text(local_pdf)
 
-    if len(extracted_text) < 20:
-        print("Unreadable PDF")
+    if len(extracted) < 10:
         supabase.table("reports").update({
             "ai_status": "failed",
-            "extracted_text": extracted_text,
-            "ai_error": "PDF extraction produced no readable text"
+            "extracted_text": extracted,
+            "ai_error": "Empty or unreadable PDF."
         }).eq("id", report_id).execute()
         return
 
-    # AI INTERPRETATION
+    # AI step
     try:
-        result_json = run_ai_interpretation(extracted_text)
+        result = run_ai(extracted)
     except Exception as e:
         print("AI error:", e)
         supabase.table("reports").update({
             "ai_status": "failed",
-            "ai_error": f"AI error: {str(e)}"
+            "ai_error": f"AI error: {e}"
         }).eq("id", report_id).execute()
         return
 
-    # SAVE RESULTS
+    # Save to DB
     supabase.table("reports").update({
         "ai_status": "completed",
-        "extracted_text": extracted_text,
-        "ai_results": result_json,
-        "cbc_json": result_json.get("cbc_values", {}),
-        "trend_json": result_json.get("trend_summary", [])
+        "extracted_text": extracted,
+        "ai_results": result,
+        "cbc_json": result.get("cbc_values", {}),
+        "trend_json": result.get("trend_summary", [])
     }).eq("id", report_id).execute()
 
     print("Report completed:", report_id)
 
+
 # ------------------------------
-# MAIN LOOP
+# LOOP
 # ------------------------------
 def main():
-    print("AMI Worker started. Ready for reports...")
+    print("AMI Worker running...")
     while True:
         try:
             process_next_job()
         except Exception as e:
-            print("Worker error:", e)
+            print("Worker crash:", e)
         time.sleep(4)
+
 
 if __name__ == "__main__":
     main()
