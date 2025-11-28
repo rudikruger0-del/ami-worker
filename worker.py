@@ -1,93 +1,211 @@
 import os
 import time
 import json
+import io
 import traceback
+
 from supabase import create_client, Client
 from openai import OpenAI
+from pypdf import PdfReader
 
-# ENV
+# -------- ENV & CLIENTS --------
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # OpenAI can also read from env
 
-# INIT
+if not SUPABASE_URL or not SUPABASE_KEY:
+  raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_KEY is missing")
+
+if not OPENAI_API_KEY:
+  print("⚠️  OPENAI_API_KEY is not set – OpenAI client will fail.")
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-client = OpenAI()
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 BUCKET = "reports"
 
 
-def process_report(job):
-    try:
-        report_id = job["id"]
-        l_text = job.get("l_text", "")
-        file_path = job.get("file_path")
+# -------- HELPERS --------
 
-        if not file_path:
-            return {"error": f"Missing file_path for report {report_id}"}
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+  """Extracts text from a PDF (no logging of content for POPIA safety)."""
+  try:
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    pages = []
+    for page in reader.pages:
+      txt = page.extract_text() or ""
+      pages.append(txt)
+    return "\n\n".join(pages)
+  except Exception as e:
+    print("PDF parse error:", e)
+    return ""
 
-        # SIGNED URL
-        signed = supabase.storage.from_(BUCKET).create_signed_url(
-            file_path,
-            expires_in=3600
-        )
-        signed_url = signed["signedURL"]
-        print("SIGNED URL:", signed_url)
 
-        # === OPENAI CALL (FINAL, CORRECT VERSION) ===
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Extract and summarize blood test data. Respond ONLY in JSON."},
-                {"role": "user", "content": l_text}
-            ],
-            response_format={"type": "json_object"}
-        )
+def call_ai_on_report(text: str) -> dict:
+  """
+  Send report text to OpenAI. Returns a Python dict parsed from strict JSON.
+  Tokens kept in check by truncating long text.
+  """
 
-        # === FIXED PARSING ===
-        raw_text = response.choices[0].message.content
-        ai_json = json.loads(raw_text)
+  # crude but safe char limit ~ 10–12k chars to keep within gpt-4o-mini context.
+  MAX_CHARS = 12000
+  if len(text) > MAX_CHARS:
+    text = text[:MAX_CHARS]
 
-        # UPDATE DB
-        supabase.table("reports").update({
-            "ai_status": "completed",
-            "ai_results": ai_json,
-            "ai_error": None
-        }).eq("id", report_id).execute()
+  system_prompt = (
+    "You are an assistive clinical tool analysing a Complete Blood Count (CBC) report. "
+    "You MUST NOT give a formal diagnosis. Only describe laboratory abnormalities and "
+    "possible follow-up *in general terms*.\n\n"
+    "Return STRICT JSON with this exact structure:\n"
+    "{\n"
+    '  \"patient\": {\n'
+    '    \"name\": string | null,\n'
+    '    \"age\": number | null,\n'
+    '    \"sex\": \"Male\" | \"Female\" | \"Unknown\"\n'
+    "  },\n"
+    '  \"cbc\": [\n'
+    '    {\n'
+    '      \"analyte\": string,\n'
+    '      \"value\": number | null,\n'
+    '      \"units\": string | null,\n'
+    '      \"reference_low\": number | null,\n'
+    '      \"reference_high\": number | null,\n'
+    '      \"flag\": \"low\" | \"normal\" | \"high\" | \"unknown\"\n'
+    "    }\n"
+    "  ],\n"
+    '  \"summary\": {\n'
+    '    \"impression\": string,\n'
+    '    \"suggested_follow_up\": string\n'
+    "  }\n"
+    "}\n\n"
+    "Output ONLY this JSON. No extra text, no markdown, no explanations."
+  )
 
-        return {"success": True, "data": ai_json}
+  response = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[
+      {"role": "system", "content": system_prompt},
+      {"role": "user", "content": text},
+    ],
+    response_format={"type": "json_object"},
+    temperature=0.1,  # low temp = more stable, less hallucination
+  )
 
-    except Exception as e:
-        error_msg = str(e)
-        traceback.print_exc()
+  content = response.choices[0].message.content
 
-        supabase.table("reports").update({
-            "ai_status": "failed",
-            "ai_error": error_msg
-        }).eq("id", job["id"]).execute()
+  # content is usually a string, but be defensive
+  if isinstance(content, list):
+    raw = "".join(
+      part.get("text", "")
+      for part in content
+      if isinstance(part, dict)
+    )
+  else:
+    raw = content or ""
 
-        return {"error": error_msg}
+  if not raw.strip():
+    raise ValueError("AI returned empty content")
 
+  return json.loads(raw)
+
+
+# -------- CORE JOB PROCESSING --------
+
+def process_report(job: dict) -> dict:
+  report_id = job["id"]
+  file_path = job.get("file_path")
+  l_text = job.get("l_text") or ""
+
+  try:
+    if not file_path:
+      raise ValueError(f"Missing file_path for report {report_id}")
+
+    # Download PDF bytes from private bucket
+    pdf_bytes = supabase.storage.from_(BUCKET).download(file_path)
+    # depending on library, this might already be bytes
+    if hasattr(pdf_bytes, "data"):
+      pdf_bytes = pdf_bytes.data
+
+    # Extract text from PDF
+    pdf_text = extract_text_from_pdf(pdf_bytes)
+
+    if pdf_text:
+      merged_text = (l_text + "\n\n" + pdf_text).strip() if l_text else pdf_text
+    else:
+      merged_text = l_text
+
+    if not merged_text.strip():
+      raise ValueError("No text extracted from report for AI to analyse")
+
+    # Call OpenAI with strict JSON response
+    ai_json = call_ai_on_report(merged_text)
+
+    # Update DB – success
+    supabase.table("reports").update(
+      {
+        "ai_status": "completed",
+        "ai_results": ai_json,
+        "ai_error": None,
+      }
+    ).eq("id", report_id).execute()
+
+    print(f"✅ Report {report_id} processed successfully")
+    return {"success": True, "data": ai_json}
+
+  except Exception as e:
+    err = f"{type(e).__name__}: {e}"
+    print(f"❌ Error processing report {report_id}: {err}")
+    traceback.print_exc()
+
+    supabase.table("reports").update(
+      {
+        "ai_status": "failed",
+        "ai_error": err,
+      }
+    ).eq("id", report_id).execute()
+
+    return {"error": err}
+
+
+# -------- WORKER LOOP --------
 
 def main():
-    print("AMI Worker started… watching for jobs.")
+  print("AMI Worker started… watching for jobs.")
 
-    while True:
-        try:
-            res = supabase.table("reports").select("*").eq("ai_status", "queued").limit(1).execute()
-            jobs = res.data
+  while True:
+    try:
+      # IMPORTANT: status must match upload.js -> 'pending'
+      res = (
+        supabase.table("reports")
+        .select("*")
+        .eq("ai_status", "pending")
+        .limit(1)
+        .execute()
+      )
+      jobs = res.data or []
 
-            if jobs:
-                job = jobs[0]
-                print("Processing job:", job["id"])
-                process_report(job)
-            else:
-                print("No jobs...")
-            time.sleep(5)
+      if jobs:
+        job = jobs[0]
+        job_id = job["id"]
+        print(f"🔎 Found job: {job_id}")
 
-        except Exception as e:
-            print("Worker error:", e)
-            time.sleep(5)
+        # mark as processing to avoid double work
+        supabase.table("reports").update(
+          {"ai_status": "processing"}
+        ).eq("id", job_id).execute()
+
+        process_report(job)
+      else:
+        print("No jobs...")
+
+      time.sleep(5)
+
+    except Exception as e:
+      print("Worker loop error:", e)
+      traceback.print_exc()
+      time.sleep(5)
 
 
 if __name__ == "__main__":
-    main()
+  main()
