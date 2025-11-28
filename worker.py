@@ -1,167 +1,118 @@
 import os
-import json
 import time
+import base64
 import requests
-from pypdf import PdfReader
-from dotenv import load_dotenv
 from supabase import create_client, Client
 from openai import OpenAI
 
-load_dotenv()
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_ROLE = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ------------------------------
-# PDF TEXT EXTRACTION
-# ------------------------------
-def extract_pdf_text(path):
-    try:
-        reader = PdfReader(path)
-        text = ""
-        for p in reader.pages:
-            t = p.extract_text()
-            if t:
-                text += t + "\n"
-        return text.strip()
-    except Exception as e:
-        print("PDF ERROR:", e)
-        return ""
+BUCKET = "reports"  # storage bucket name
 
-# ------------------------------
-# AI INTERPRETATION
-# ------------------------------
-def run_ai(text):
-    prompt = f"""
-    You are AMI Health AI. Extract CBC values, trends, risks.
-    Return ONLY valid JSON.
+def get_pending_reports():
+    res = supabase.table("reports").select("*").eq("ai_status", "queued").execute()
+    return res.data or []
 
-    LAB REPORT:
-    -----------
-    {text}
+def download_pdf_signed(path):
     """
+    Generates a signed URL (NOT public), downloads the file safely, POPIA compliant.
+    """
+    signed = supabase.storage.from_(BUCKET).create_signed_url(path, 3600)
+    if "signedURL" not in signed:
+        raise Exception("Could not generate signed URL")
 
-    completion = client.chat.completions.create(
-        model="gpt-4.1",
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "type": "object",
-                "properties": {
-                    "cbc_values": {"type": "object"},
-                    "trend_summary": {"type": "array", "items": {"type": "string"}},
-                    "interpretation": {"type": "array", "items": {"type": "string"}},
-                    "flagged_results": {"type": "array", "items": {"type": "string"}},
-                    "risk_level": {"type": "string"},
-                },
-                "required": ["cbc_values", "trend_summary", "interpretation", "flagged_results", "risk_level"]
-            },
-        },
-        messages=[
-            {"role": "user", "content": prompt}
-        ]
-    )
-
-    return json.loads(completion.choices[0].message.content)
-
-# ------------------------------
-# SIGNED URL FETCH
-# ------------------------------
-def download_pdf_signed(path, local):
-    signed = supabase.storage.from_("reports").create_signed_url(path, 3600)
     url = signed["signedURL"]
 
-    r = requests.get(url)
-    r.raise_for_status()
+    resp = requests.get(url)
+    if resp.status_code != 200:
+        raise Exception(f"Download failed {resp.status_code}")
 
-    with open(local, "wb") as f:
-        f.write(r.content)
+    return resp.content
 
-# ------------------------------
-# PROCESS NEXT REPORT
-# ------------------------------
-def process_next():
-    job = (
-        supabase.table("reports")
-        .select("*")
-        .eq("ai_status", "queued")
-        .limit(1)
-        .execute()
+def extract_text_using_ai(pdf_bytes):
+    """
+    Uses new 2025 OpenAI Responses API.
+    """
+    b64_pdf = base64.b64encode(pdf_bytes).decode()
+
+    response = client.responses.create(
+        model="gpt-4.1",
+        input="Extract ALL CBC values and summarize any abnormalities.",
+        attachments=[
+            {
+                "type": "application/pdf",
+                "data": b64_pdf,
+            }
+        ],
+        response_format={ 
+            "type": "json_schema",
+            "json_schema": {
+                "name": "cbc_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "cbc": { "type": "object" },
+                        "interpretation": { "type": "string" }
+                    },
+                    "required": ["cbc", "interpretation"]
+                }
+            }
+        }
     )
 
-    if not job.data:
-        print("No jobs...")
-        return
+    return response.output_json
 
-    report = job.data[0]
-    rid = report["id"]
-    fpath = report.get("file_path")
+def process_report(row):
+    report_id = row["id"]
+    path = row["file_path"]
 
-    if not fpath:
-        supabase.table("reports").update({
-            "ai_status": "failed",
-            "ai_error": f"Missing file_path for report {rid}"
-        }).eq("id", rid).execute()
-        return
-
-    print("\n--- Processing", rid, " ---")
+    if not path:
+        raise Exception(f"Missing file_path for report {report_id}")
 
     # 1. Download PDF via signed URL
-    local_pdf = f"/tmp/{rid}.pdf"
-    try:
-        download_pdf_signed(fpath, local_pdf)
-    except Exception as e:
-        supabase.table("reports").update({
-            "ai_status": "failed",
-            "ai_error": f"PDF download failed: {e}"
-        }).eq("id", rid).execute()
-        return
+    pdf_bytes = download_pdf_signed(path)
 
-    # 2. Extract text
-    text = extract_pdf_text(local_pdf)
-    if len(text) < 15:
-        supabase.table("reports").update({
-            "ai_status": "failed",
-            "ai_error": "Unreadable or empty PDF"
-        }).eq("id", rid).execute()
-        return
+    # 2. Extract CBC + Interpretation
+    result_json = extract_text_using_ai(pdf_bytes)
 
-    # 3. Run AI
-    try:
-        result = run_ai(text)
-    except Exception as e:
-        supabase.table("reports").update({
-            "ai_status": "failed",
-            "ai_error": f"AI error: {e}"
-        }).eq("id", rid).execute()
-        return
-
-    # 4. Save results
+    # 3. Save back to database
     supabase.table("reports").update({
-        "ai_status": "completed",
-        "extracted_text": text,
-        "ai_results": result,
-        "cbc_json": result.get("cbc_values", {}),
-        "trend_json": result.get("trend_summary", []),
-    }).eq("id", rid).execute()
+        "ai_status": "done",
+        "ai_results": result_json
+    }).eq("id", report_id).execute()
 
-    print("✔ Completed:", rid)
 
-# ------------------------------
-# MAIN LOOP
-# ------------------------------
 def main():
-    print("AMI Worker running…")
+    print("AMI Worker started… watching for jobs.")
+
     while True:
         try:
-            process_next()
+            jobs = get_pending_reports()
+
+            if not jobs:
+                print("No jobs...")
+            else:
+                print(f"Processing {len(jobs)} job(s)…")
+
+            for job in jobs:
+                try:
+                    process_report(job)
+                except Exception as e:
+                    print("Error processing:", e)
+                    supabase.table("reports").update({
+                        "ai_status": "failed",
+                        "ai_error": str(e)
+                    }).eq("id", job["id"]).execute()
+
         except Exception as e:
             print("Worker crashed:", e)
-        time.sleep(4)
+
+        time.sleep(6)
 
 if __name__ == "__main__":
     main()
