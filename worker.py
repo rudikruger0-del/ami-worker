@@ -1,206 +1,88 @@
 import os
-import json
 import time
-import requests
-from pypdf import PdfReader
-from dotenv import load_dotenv
+import json
+import base64
+import traceback
 from supabase import create_client, Client
 from openai import OpenAI
 
-load_dotenv()
-
-# -----------------------------------
-# ENV
-# -----------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-if not SUPABASE_URL:
-    raise Exception("Missing SUPABASE_URL")
-if not SUPABASE_KEY:
-    raise Exception("Missing SUPABASE_SERVICE_ROLE_KEY")
-if not OPENAI_API_KEY:
-    raise Exception("Missing OPENAI_API_KEY")
-
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+client = OpenAI()
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-client = OpenAI(api_key=OPENAI_API_KEY)
 
-# -----------------------------------
-# JSON Schema
-# -----------------------------------
-JSON_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "summary": {"type": "array", "items": {"type": "string"}},
-        "trend_summary": {"type": "array", "items": {"type": "string"}},
-        "flagged_results": {"type": "array", "items": {"type": "string"}},
-        "interpretation": {"type": "array", "items": {"type": "string"}},
-        "risk_level": {"type": "string"},
-        "recommendations": {"type": "array", "items": {"type": "string"}},
-        "when_to_seek_urgent_care": {"type": "array", "items": {"type": "string"}},
-        "cbc_values": {"type": "object"},
-        "chemistry_values": {"type": "object"},
-        "disclaimer": {"type": "string"},
-    },
-    "required": [
-        "summary",
-        "trend_summary",
-        "flagged_results",
-        "interpretation",
-        "risk_level",
-        "recommendations",
-        "when_to_seek_urgent_care",
-        "cbc_values",
-        "chemistry_values",
-        "disclaimer",
-    ],
-}
+BUCKET = "reports"
 
-# -----------------------------------
-# PDF extraction
-# -----------------------------------
-def extract_pdf_text(file_path: str) -> str:
+def process_report(job):
     try:
-        reader = PdfReader(file_path)
-        text = ""
-        for page in reader.pages:
-            t = page.extract_text() or ""
-            text += t + "\n"
-        return text.strip()
+        report_id = job["id"]
+        l_text = job.get("l_text", "")
+        file_path = job.get("file_path")
+
+        if not file_path:
+            return {"error": f"Missing file_path for report {report_id}"}
+
+        # --- Generate signed URL (POPPIA SAFE) ---
+        signed = supabase.storage.from_(BUCKET).create_signed_url(
+            file_path,
+            expires_in=3600  # 1 hour secure link
+        )
+
+        signed_url = signed["signedURL"]
+        print("SIGNED URL:", signed_url)
+
+        # --- Call OpenAI ---
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Extract and summarize blood test data. Respond in JSON."},
+                {"role": "user", "content": l_text}
+            ],
+            response_format={"type": "json_object"}
+        )
+
+        ai_json = response.choices[0].message.parsed
+
+        # --- Update DB ---
+        supabase.table("reports").update({
+            "ai_status": "completed",
+            "ai_results": ai_json,
+            "ai_error": None
+        }).eq("id", report_id).execute()
+
+        return {"success": True, "data": ai_json}
+
     except Exception as e:
-        print("PDF extraction error:", e)
-        return ""
+        error_msg = str(e)
+        traceback.print_exc()
 
-
-# -----------------------------------
-# AI INTERPRETATION (FIXED)
-# -----------------------------------
-def run_ai_interpretation(text: str) -> dict:
-    prompt = f"""
-You are AMI — Artificial Medical Intelligence.
-Produce a structured interpretation and return ONLY valid JSON.
-
-Lab Report:
-{text}
-"""
-
-    # FIXED — THIS IS THE CORRECT ENDPOINT
-    response = client.chat.completions.create(
-        model="gpt-4.1",
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_schema", "json_schema": JSON_SCHEMA},
-        max_tokens=1500,
-    )
-
-    data = response.choices[0].message["content"]
-    return json.loads(data)
-
-
-# -----------------------------------
-# SIGNED URL DOWNLOAD
-# -----------------------------------
-def download_pdf_signed(path: str) -> str:
-    signed = supabase.storage.from_("reports").create_signed_url(
-        path, expires_in=3600
-    )
-
-    url = signed.get("signedURL")
-    if not url:
-        raise Exception("No signed URL returned")
-
-    print("Signed URL:", url)
-
-    local_path = "/tmp/report.pdf"
-    r = requests.get(url)
-    r.raise_for_status()
-
-    with open(local_path, "wb") as f:
-        f.write(r.content)
-
-    return local_path
-
-
-# -----------------------------------
-# PROCESS JOB
-# -----------------------------------
-def process_next_job():
-    job = (
-        supabase.table("reports")
-        .select("*")
-        .eq("ai_status", "queued")
-        .limit(1)
-        .execute()
-    )
-
-    if not job.data:
-        print("No jobs...")
-        return
-
-    report = job.data[0]
-    report_id = report["id"]
-    file_path = report.get("file_path")
-
-    if not file_path:
-        err = f"Missing file_path for report {report_id}"
-        print(err)
         supabase.table("reports").update({
             "ai_status": "failed",
-            "ai_error": err
-        }).eq("id", report_id).execute()
-        return
+            "ai_error": error_msg
+        }).eq("id", job["id"]).execute()
 
-    print(f"\nProcessing {report_id}...")
-
-    try:
-        local_pdf = download_pdf_signed(file_path)
-    except Exception as e:
-        supabase.table("reports").update({
-            "ai_status": "failed",
-            "ai_error": f"Signed URL download error: {e}"
-        }).eq("id", report_id).execute()
-        return
-
-    text = extract_pdf_text(local_pdf)
-    if len(text) < 10:
-        supabase.table("reports").update({
-            "ai_status": "failed",
-            "ai_error": "PDF extraction failed",
-            "extracted_text": text
-        }).eq("id", report_id).execute()
-        return
-
-    try:
-        ai = run_ai_interpretation(text)
-    except Exception as e:
-        supabase.table("reports").update({
-            "ai_status": "failed",
-            "ai_error": f"AI error: {e}"
-        }).eq("id", report_id).execute()
-        return
-
-    supabase.table("reports").update({
-        "ai_status": "completed",
-        "extracted_text": text,
-        "ai_results": ai,
-        "cbc_json": ai.get("cbc_values", {}),
-        "trend_json": ai.get("trend_summary", [])
-    }).eq("id", report_id).execute()
-
-    print("Completed:", report_id)
+        return {"error": error_msg}
 
 
-# -----------------------------------
-# MAIN LOOP
-# -----------------------------------
 def main():
     print("AMI Worker started… watching for jobs.")
+
     while True:
         try:
-            process_next_job()
+            res = supabase.table("reports").select("*").eq("ai_status", "pending").limit(1).execute()
+            jobs = res.data
+
+            if jobs:
+                job = jobs[0]
+                print("Processing job:", job["id"])
+                process_report(job)
+            else:
+                print("No jobs...")
+            time.sleep(5)
+
         except Exception as e:
             print("Worker error:", e)
-        time.sleep(4)
+            time.sleep(5)
 
 
 if __name__ == "__main__":
