@@ -13,19 +13,16 @@ load_dotenv()
 # ENV VARIABLES (AUTO-DETECT)
 # ------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-
 SUPABASE_KEY = (
     os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     or os.getenv("SUPABASE_KEY")
-    or None
 )
-
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not SUPABASE_URL:
     raise Exception("Missing SUPABASE_URL")
 if not SUPABASE_KEY:
-    raise Exception("Missing SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY")
+    raise Exception("Missing SUPABASE_SERVICE_ROLE_KEY")
 if not OPENAI_API_KEY:
     raise Exception("Missing OPENAI_API_KEY")
 
@@ -36,11 +33,7 @@ print("OpenAI Key Loaded:", bool(OPENAI_API_KEY))
 # ------------------------------
 # CLIENTS
 # ------------------------------
-supabase: Client = create_client(
-    supabase_url=SUPABASE_URL,
-    supabase_key=SUPABASE_KEY
-)
-
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ------------------------------
@@ -61,16 +54,9 @@ JSON_SCHEMA = {
         "disclaimer": {"type": "string"},
     },
     "required": [
-        "summary",
-        "trend_summary",
-        "flagged_results",
-        "interpretation",
-        "risk_level",
-        "recommendations",
-        "when_to_seek_urgent_care",
-        "cbc_values",
-        "chemistry_values",
-        "disclaimer"
+        "summary", "trend_summary", "flagged_results", "interpretation",
+        "risk_level", "recommendations", "when_to_seek_urgent_care",
+        "cbc_values", "chemistry_values", "disclaimer"
     ]
 }
 
@@ -88,7 +74,6 @@ def extract_pdf_text(file_path: str) -> str:
     except Exception as e:
         print("PDF extraction error:", e)
         return ""
-
 
 # ------------------------------
 # AI INTERPRETATION
@@ -113,7 +98,6 @@ Lab Report:
 
     return json.loads(response.output[0].content[0].text)
 
-
 # ------------------------------
 # DOWNLOAD PDF
 # ------------------------------
@@ -123,9 +107,8 @@ def download_pdf(url: str, local_path: str):
     with open(local_path, "wb") as f:
         f.write(r.content)
 
-
 # ------------------------------
-# PROCESS JOB
+# PROCESS ONE JOB
 # ------------------------------
 def process_next_job():
     job = (
@@ -146,23 +129,32 @@ def process_next_job():
 
     print("\n-----------------------------------")
     print("Processing report:", report_id)
+    print("file_path:", file_path)
     print("-----------------------------------\n")
 
-    pdf_url = f"{SUPABASE_URL}/storage/v1/object/public/{file_path}"
+    # Fix path if database stored only "<id>.pdf"
+    if not file_path.startswith("reports/"):
+        storage_path = f"reports/{file_path}"
+    else:
+        storage_path = file_path
+
+    pdf_url = f"{SUPABASE_URL}/storage/v1/object/public/{storage_path}"
+    print("Downloading:", pdf_url)
+
     local_file = "/tmp/report.pdf"
 
-    # Download PDF
+    # DOWNLOAD PDF
     try:
         download_pdf(pdf_url, local_file)
     except Exception as e:
         print("Download error:", e)
         supabase.table("reports").update({
             "ai_status": "failed",
-            "ai_error": f"Download error: {e}"
+            "ai_error": f"Download error: {str(e)}"
         }).eq("id", report_id).execute()
         return
 
-    # Extract text
+    # EXTRACT TEXT
     extracted_text = extract_pdf_text(local_file)
 
     if len(extracted_text) < 20:
@@ -174,18 +166,18 @@ def process_next_job():
         }).eq("id", report_id).execute()
         return
 
-    # AI interpretation
+    # AI INTERPRETATION
     try:
         result_json = run_ai_interpretation(extracted_text)
     except Exception as e:
         print("AI error:", e)
         supabase.table("reports").update({
             "ai_status": "failed",
-            "ai_error": f"AI error: {e}"
+            "ai_error": f"AI error: {str(e)}"
         }).eq("id", report_id).execute()
         return
 
-    # Save results
+    # SAVE RESULTS
     supabase.table("reports").update({
         "ai_status": "completed",
         "extracted_text": extracted_text,
@@ -195,7 +187,6 @@ def process_next_job():
     }).eq("id", report_id).execute()
 
     print("Report completed:", report_id)
-
 
 # ------------------------------
 # MAIN LOOP
@@ -208,7 +199,6 @@ def main():
         except Exception as e:
             print("Worker error:", e)
         time.sleep(4)
-
 
 if __name__ == "__main__":
     main()
