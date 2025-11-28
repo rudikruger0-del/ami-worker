@@ -5,103 +5,81 @@ import traceback
 from supabase import create_client, Client
 from openai import OpenAI
 
-# ---------------------------------------------------------
+# ------------------------------
 # ENVIRONMENT VARIABLES
-# ---------------------------------------------------------
+# ------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")   # MUST be the Service Key
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise Exception("❌ SUPABASE_URL or SUPABASE_SERVICE_KEY is missing!")
+# Validate envs early
+if not SUPABASE_URL:
+    raise Exception("SUPABASE_URL missing")
+if not SUPABASE_KEY:
+    raise Exception("SUPABASE_SERVICE_KEY missing")
+if not OPENAI_API_KEY:
+    raise Exception("OPENAI_API_KEY missing")
 
+# ------------------------------
+# CLIENTS
+# ------------------------------
+client = OpenAI(api_key=OPENAI_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-client = OpenAI()   # NEW SDK – this is correct
 
 BUCKET = "reports"
 
-# ---------------------------------------------------------
-# AI JSON SCHEMA FOR RESPONSE
-# ---------------------------------------------------------
-AI_SCHEMA = {
-    "name": "blood_test_extraction",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "cbc": {
-                "type": "object",
-                "properties": {
-                    "WBC": {"type": "string"},
-                    "RBC": {"type": "string"},
-                    "Hemoglobin": {"type": "string"},
-                    "Hematocrit": {"type": "string"},
-                    "Platelets": {"type": "string"},
-                }
-            },
-            "summary": {"type": "string"}
-        },
-        "required": ["summary"]
-    }
-}
 
-# ---------------------------------------------------------
-# JOB PROCESSING FUNCTION
-# ---------------------------------------------------------
+# ------------------------------
+# PROCESS ONE REPORT
+# ------------------------------
+
 def process_report(job):
     try:
         report_id = job["id"]
-        l_text = job.get("l_text", "")
         file_path = job.get("file_path")
+        l_text = job.get("l_text", "")
 
         if not file_path:
-            raise Exception(f"Missing file_path for report {report_id}")
+            return {"error": f"Missing file_path for report {report_id}"}
 
-        # ---------------------------------------------------------
-        # Generate a secure POPIA-safe signed URL (not public)
-        # ---------------------------------------------------------
+        # ----- Generate signed URL -----
         signed = supabase.storage.from_(BUCKET).create_signed_url(
             file_path,
-            expires_in=3600  # 1 hour
+            expires_in=3600
         )
 
-        if "signedURL" not in signed:
-            raise Exception(f"Supabase signed URL generation failed: {signed}")
-
-        signed_url = signed["signedURL"]
+        signed_url = signed.get("signedURL")
         print("SIGNED URL:", signed_url)
 
-        # ---------------------------------------------------------
-        # Call OpenAI using NEW 2024 SDK (responses API)
-        # ---------------------------------------------------------
-        ai_response = client.responses.create(
+        # ----- Call OpenAI -----
+        response = client.chat.completions.create(
             model="gpt-4o-mini",
-            input=f"You are an expert medical AI. Extract CBC results from this file:\n\n{l_text}",
-            response_format={
-                "type": "json_schema",
-                "json_schema": AI_SCHEMA
-            }
+            messages=[
+                {"role": "system", "content": "Extract and summarize blood test data. Respond in JSON."},
+                {"role": "user", "content": l_text}
+            ],
+            response_format={"type": "json_object"}
         )
 
-        # Parse JSON result safely
-        ai_json = ai_response.output[0].content[0].json
+        # The new SDK returns JSON inside message["content"]
+        raw_json = response.choices[0].message["content"]
 
-        # ---------------------------------------------------------
-        # Update DB → Completed
-        # ---------------------------------------------------------
+        # Convert JSON string → Python dict
+        ai_json = json.loads(raw_json)
+
+        # ----- Update DB -----
         supabase.table("reports").update({
             "ai_status": "completed",
             "ai_results": ai_json,
             "ai_error": None
         }).eq("id", report_id).execute()
 
-        print("AI processing completed:", report_id)
         return {"success": True}
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         traceback.print_exc()
 
-        # Update DB → Failed
         supabase.table("reports").update({
             "ai_status": "failed",
             "ai_error": error_msg
@@ -109,18 +87,17 @@ def process_report(job):
 
         return {"error": error_msg}
 
-# ---------------------------------------------------------
+
+# ------------------------------
 # WORKER LOOP
-# ---------------------------------------------------------
+# ------------------------------
+
 def main():
-    print("AMI Worker started… watching for jobs.")
+    print("AMI Worker started…")
 
     while True:
         try:
-            res = supabase.table("reports").select("*")\
-                .eq("ai_status", "pending")\
-                .limit(1).execute()
-
+            res = supabase.table("reports").select("*").eq("ai_status", "queued").limit(1).execute()
             jobs = res.data
 
             if jobs:
