@@ -12,7 +12,7 @@ from pypdf import PdfReader
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # OpenAI can also read from env
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
   raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_KEY is missing")
@@ -48,7 +48,6 @@ def call_ai_on_report(text: str) -> dict:
   Tokens kept in check by truncating long text.
   """
 
-  # crude but safe char limit ~ 10–12k chars to keep within gpt-4o-mini context.
   MAX_CHARS = 12000
   if len(text) > MAX_CHARS:
     text = text[:MAX_CHARS]
@@ -89,12 +88,11 @@ def call_ai_on_report(text: str) -> dict:
       {"role": "user", "content": text},
     ],
     response_format={"type": "json_object"},
-    temperature=0.1,  # low temp = more stable, less hallucination
+    temperature=0.1,
   )
 
   content = response.choices[0].message.content
 
-  # content is usually a string, but be defensive
   if isinstance(content, list):
     raw = "".join(
       part.get("text", "")
@@ -118,16 +116,25 @@ def process_report(job: dict) -> dict:
   l_text = job.get("l_text") or ""
 
   try:
-    if not file_path:
-      raise ValueError(f"Missing file_path for report {report_id}")
+    # ⭐⭐⭐ BULLETPROOF SAFETY NET ⭐⭐⭐
+    if not file_path or str(file_path).strip() == "":
+      err = f"Missing file_path for report {report_id}"
+      print(f"⚠️ {err}")
 
-    # Download PDF bytes from private bucket
+      supabase.table("reports").update(
+        {
+          "ai_status": "failed",
+          "ai_error": err,
+        }
+      ).eq("id", report_id).execute()
+
+      return {"error": err}
+
+    # Download PDF bytes
     pdf_bytes = supabase.storage.from_(BUCKET).download(file_path)
-    # depending on library, this might already be bytes
     if hasattr(pdf_bytes, "data"):
       pdf_bytes = pdf_bytes.data
 
-    # Extract text from PDF
     pdf_text = extract_text_from_pdf(pdf_bytes)
 
     if pdf_text:
@@ -138,10 +145,8 @@ def process_report(job: dict) -> dict:
     if not merged_text.strip():
       raise ValueError("No text extracted from report for AI to analyse")
 
-    # Call OpenAI with strict JSON response
     ai_json = call_ai_on_report(merged_text)
 
-    # Update DB – success
     supabase.table("reports").update(
       {
         "ai_status": "completed",
@@ -175,7 +180,6 @@ def main():
 
   while True:
     try:
-      # IMPORTANT: status must match upload.js -> 'pending'
       res = (
         supabase.table("reports")
         .select("*")
@@ -190,7 +194,6 @@ def main():
         job_id = job["id"]
         print(f"🔎 Found job: {job_id}")
 
-        # mark as processing to avoid double work
         supabase.table("reports").update(
           {"ai_status": "processing"}
         ).eq("id", job_id).execute()
