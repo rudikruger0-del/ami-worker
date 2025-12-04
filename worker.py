@@ -202,7 +202,7 @@ def main():
       else:
         print("No jobs...")
 
-      time.sleep(5)
+      time.sleep(1)
 
     except Exception as e:
       print("Worker loop error:", e)
