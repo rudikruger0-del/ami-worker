@@ -3,11 +3,13 @@ FROM python:3.13-slim
 # Install Poppler (required for pdf2image)
 RUN apt-get update && apt-get install -y \
     poppler-utils \
+    poppler-data \
+    libpoppler-cpp-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy files into container
+# Copy files
 COPY . /app
 
 # Install Python dependencies
