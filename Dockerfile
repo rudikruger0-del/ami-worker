@@ -1,19 +1,18 @@
-FROM python:3.13-slim
+FROM python:3.10-slim
 
-# Install Poppler (required for pdf2image)
+# Install Poppler for pdf2image
 RUN apt-get update && apt-get install -y \
     poppler-utils \
-    poppler-data \
-    libpoppler-cpp-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy files
-COPY . /app
-
 # Install Python dependencies
+COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Start worker
+# Copy ALL source files
+COPY . /app
+
+# Run worker
 CMD ["python", "worker.py"]
