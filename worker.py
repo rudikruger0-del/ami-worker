@@ -8,7 +8,7 @@ import base64
 from supabase import create_client, Client
 from openai import OpenAI
 from pypdf import PdfReader
-from pdf2image import convert_from_bytes   # ⭐ NEW: convert scanned PDFs → images
+from pdf2image import convert_from_bytes   # convert scanned PDFs → images
 
 
 # -------- ENV & CLIENTS --------
@@ -39,15 +39,18 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     for page in reader.pages:
       txt = page.extract_text() or ""
       pages.append(txt)
-    return "\n\n".join(pages).strip()
+    full = "\n\n".join(pages).strip()
+    return full
   except Exception as e:
     print("PDF parse error:", e)
     return ""
 
 
-# ⭐ NEW: DETECT IF PDF IS SCANNED BY CHECKING TEXT CONTENT
 def is_scanned_pdf(pdf_text: str) -> bool:
-  """If there’s almost no text, assume the PDF is scanned."""
+  """
+  If there’s almost no text, assume the PDF is scanned.
+  (Simple heuristic on total extracted text length.)
+  """
   if not pdf_text:
     return True
   if len(pdf_text.strip()) < 30:
@@ -55,11 +58,13 @@ def is_scanned_pdf(pdf_text: str) -> bool:
   return False
 
 
-# ⭐ NEW: OPENAI VISION OCR → Extract CBC table from image
+# -------- OCR WITH VISION --------
+
 def extract_cbc_from_image(image_bytes: bytes) -> dict:
   """
   Sends the scanned image to OpenAI Vision to extract CBC values.
-  Returns a dict with EXACT structure required for merging into the main AMI pipeline.
+  Returns a dict with structure:
+  { "cbc": [ { "analyte": ..., "value": ..., "units": ..., "reference_low": ..., "reference_high": ... } ] }
   """
 
   base64_image = base64.b64encode(image_bytes).decode("utf-8")
@@ -67,43 +72,87 @@ def extract_cbc_from_image(image_bytes: bytes) -> dict:
   system_prompt = (
     "You are an OCR and data extraction assistant for medical laboratory PDF scans. "
     "Extract ALL CBC-related analytes INCLUDING chemistry, liver enzymes, CK, CK-MB, creatinine, electrolytes. "
-    "Return STRICT JSON with this structure: "
-    "{ 'cbc': [ { 'analyte': '', 'value': '', 'units': '', 'reference_low': '', 'reference_high': '' } ] } "
+    "Return STRICT JSON with this structure:\n"
+    "{\n"
+    "  \"cbc\": [\n"
+    "    { \"analyte\": \"\", \"value\": \"\", \"units\": \"\", \"reference_low\": \"\", \"reference_high\": \"\" }\n"
+    "  ]\n"
+    "}\n"
     "Return ONLY JSON with no extra text."
   )
 
+  # ✅ Correct Vision message format (image_url)
   response = client.chat.completions.create(
-    model="gpt-4o",   # ⭐ Vision-capable model
+    model="gpt-4o",   # Vision-capable model
     messages=[
       {"role": "system", "content": system_prompt},
       {
         "role": "user",
         "content": [
           {
-            "type": "input_image",
-            "image_url": f"data:image/png;base64,{base64_image}"
+            "type": "text",
+            "text": "Here is a scanned blood report. Extract all CBC and chemistry values into the requested JSON."
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": f"data:image/png;base64,{base64_image}"
+            }
           }
-        ]
-      }
+        ],
+      },
     ],
     response_format={"type": "json_object"},
     temperature=0.1,
   )
 
   raw = response.choices[0].message.content
-  return json.loads(raw)
+  if not raw:
+    return {}
+  try:
+    return json.loads(raw)
+  except Exception as e:
+    print("JSON parse error from Vision OCR:", e)
+    return {}
 
 
 def call_ai_on_report(text: str) -> dict:
-  """Your existing interpretation model — unchanged."""
+  """
+  Main interpretation model.
+  Input: either raw extracted text, or JSON-as-text from OCR.
+  Output: { patient: {...}, cbc: [...], summary: {...} }
+  """
   MAX_CHARS = 12000
   if len(text) > MAX_CHARS:
     text = text[:MAX_CHARS]
 
   system_prompt = (
     "You are an assistive clinical tool analysing CBC and chemistry results. "
-    "Do NOT diagnose. Only describe lab patterns.\n\n"
-    "Output STRICT JSON with fields: patient, cbc, summary."
+    "You MUST NOT give a formal diagnosis or prescribe treatment. "
+    "Only describe laboratory abnormalities, patterns, and general follow-up recommendations.\n\n"
+    "Output STRICT JSON with this structure:\n"
+    "{\n"
+    "  \"patient\": {\n"
+    "    \"name\": string | null,\n"
+    "    \"age\": number | null,\n"
+    "    \"sex\": \"Male\" | \"Female\" | \"Unknown\"\n"
+    "  },\n"
+    "  \"cbc\": [\n"
+    "    {\n"
+    "      \"analyte\": string,\n"
+    "      \"value\": number | null,\n"
+    "      \"units\": string | null,\n"
+    "      \"reference_low\": number | null,\n"
+    "      \"reference_high\": number | null,\n"
+    "      \"flag\": \"low\" | \"normal\" | \"high\" | \"unknown\"\n"
+    "    }\n"
+    "  ],\n"
+    "  \"summary\": {\n"
+    "    \"impression\": string,\n"
+    "    \"suggested_follow_up\": string\n"
+    "  }\n"
+    "}\n"
+    "Return ONLY this JSON, no extra text."
   )
 
   response = client.chat.completions.create(
@@ -142,12 +191,11 @@ def process_report(job: dict) -> dict:
     if hasattr(pdf_bytes, "data"):
       pdf_bytes = pdf_bytes.data
 
-    text = extract_text_from_pdf(pdf_bytes)
-    scanned = is_scanned_pdf(text)
+    # Try normal text extraction first
+    pdf_text = extract_text_from_pdf(pdf_bytes)
+    scanned = is_scanned_pdf(pdf_text)
 
-    cbc_json = None
-
-    # ⭐ NEW — SCANNED PDF HANDLING
+    # -------------- BRANCH 1: SCANNED PDF → VISION OCR --------------
     if scanned:
       print(f"📄 Report {report_id} detected as SCANNED — using Vision OCR")
 
@@ -155,31 +203,44 @@ def process_report(job: dict) -> dict:
       combined_cbc = []
 
       for img in images:
-        img_bytes = io.BytesIO()
-        img.save(img_bytes, format="PNG")
-        img_bytes = img_bytes.getvalue()
+        img_bytes_io = io.BytesIO()
+        img.save(img_bytes_io, format="PNG")
+        img_bytes = img_bytes_io.getvalue()
 
         try:
           result = extract_cbc_from_image(img_bytes)
-          if "cbc" in result:
+          if isinstance(result, dict) and "cbc" in result and isinstance(result["cbc"], list):
             combined_cbc.extend(result["cbc"])
         except Exception as e:
-          print("Vision OCR error:", e)
+          print("Vision OCR error on page:", e)
 
       if len(combined_cbc) == 0:
-        raise ValueError("Vision OCR failed to extract CBC values")
+        # ❗ Fail-safe: do NOT crash the worker. Fall back to a safe text message.
+        print(f"⚠️ Vision OCR failed to extract CBC values for report {report_id}. "
+              f"Proceeding with a generic 'no data' summary.")
+        merged_text = (
+          "The uploaded PDF appears to be a scanned image, and the system was unable to "
+          "reliably extract numeric CBC or chemistry values. Please state clearly in your "
+          "JSON that no structured data was available and that the original lab report "
+          "must be reviewed directly."
+        )
+      else:
+        # Use extracted CBC JSON as input text for the interpreter model
+        cbc_json = {"cbc": combined_cbc}
+        merged_text = json.dumps(cbc_json)
 
-      cbc_json = {"cbc": combined_cbc}
-      merged_text = json.dumps(cbc_json)
-
+    # -------------- BRANCH 2: DIGITAL PDF → DIRECT TEXT --------------
     else:
       print(f"📝 Report {report_id} appears to have digital text — using text interpreter")
-      merged_text = text or l_text
+      if pdf_text and l_text:
+        merged_text = (l_text + "\n\n" + pdf_text).strip()
+      else:
+        merged_text = (pdf_text or l_text).strip()
 
     if not merged_text.strip():
       raise ValueError("No usable content extracted for AI processing")
 
-    # Final interpretation step → your existing function
+    # Final interpretation step → main AI function
     ai_json = call_ai_on_report(merged_text)
 
     supabase.table("reports").update(
