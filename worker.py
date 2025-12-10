@@ -3,15 +3,18 @@ print(">>> AMI Worker starting, loading imports...")
 # -----------------------
 # BASE PYTHON IMPORTS
 # -----------------------
-import os
-import time
-import json
-import io
-import traceback
-import base64
-import re
-
-print(">>> Base imports loaded")
+try:
+    import os
+    import time
+    import json
+    import io
+    import traceback
+    import base64
+    import re
+    print(">>> Base imports loaded")
+except Exception as e:
+    print("❌ Failed loading base imports:", e)
+    raise e
 
 # -----------------------
 # THIRD PARTY IMPORTS
@@ -95,87 +98,34 @@ def is_scanned_pdf(pdf_text: str) -> bool:
 
 
 # ======================================================
-#   SMALL UTILITIES FOR ROUTE ENGINE
+#   SMALL UTILITIES
 # ======================================================
 
-def to_float(value, default=None):
+def clean_number(val):
     """
-    Safely convert lab values like '88.0%', '11.6 g/dL', '4.2*' → float.
-    Returns default if conversion fails.
+    Safely convert lab values like '88.0%', '11,6 g/dL', '4.2*' → float.
+    Returns None if conversion fails.
     """
-    if value is None:
-        return default
-    if isinstance(value, (int, float)):
-        return float(value)
-    if not isinstance(value, str):
-        return default
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
 
-    # Replace comma decimal, keep first number we see
-    text = value.replace(",", ".")
-    match = re.findall(r"-?\d+\.?\d*", text)
-    if not match:
-        return default
+    s = str(val)
+    # Replace comma decimal + remove percent/star/units
+    s = s.replace(",", ".")
+    nums = re.findall(r"-?\d+\.?\d*", s)
+    if not nums:
+        return None
     try:
-        return float(match[0])
+        return float(nums[0])
     except Exception:
-        return default
-
-
-def index_tests_from_ai(ai_json: dict) -> dict:
-    """
-    Build a lookup dict: name_lower -> row
-    Accepts multiple possible keys to be robust to different AI formats.
-    """
-    rows = []
-
-    for key in ["cbc", "cbc_values", "chemistry", "chemistry_values", "labs", "lab_values"]:
-        val = ai_json.get(key)
-        if isinstance(val, list):
-            rows.extend(val)
-        elif isinstance(val, dict):
-            for name, sub in val.items():
-                if isinstance(sub, dict):
-                    row = sub.copy()
-                    row.setdefault("analyte", name)
-                    rows.append(row)
-
-    index = {}
-    for row in rows:
-        name = (
-            row.get("analyte")
-            or row.get("test")
-            or row.get("name")
-            or row.get("analyte_name")
-        )
-        if not name:
-            continue
-        index[name.strip().lower()] = row
-
-    return index
-
-
-def get_row(index: dict, *names):
-    for n in names:
-        if not n:
-            continue
-        row = index.get(n.strip().lower())
-        if row:
-            return row
-    return {}
-
-
-def get_val(index: dict, *names, default=None):
-    row = get_row(index, *names)
-    return to_float(row.get("value"), default)
-
-
-def get_flag(index: dict, *names):
-    row = get_row(index, *names)
-    return (row.get("flag") or "").lower()
+        return None
 
 
 # ======================================================
 #   VISION OCR: EXTRACT CBC TABLE FROM SCANNED IMAGE
+#   (FIXED FOR NEW OPENAI API)
 # ======================================================
 
 def extract_cbc_from_image(image_bytes: bytes) -> dict:
@@ -196,31 +146,39 @@ def extract_cbc_from_image(image_bytes: bytes) -> dict:
         "Do not summarise, do not interpret – just the table."
     )
 
-    resp = client.chat.completions.create(
+    resp = client.responses.create(
         model="gpt-4o",
         response_format={"type": "json_object"},
-        temperature=0.1,
-        messages=[
-            {"role": "system", "content": system_prompt},
+        input=[
+            {
+                "role": "system",
+                "content": system_prompt
+            },
             {
                 "role": "user",
                 "content": [
                     {
-                        "type": "input_image",
+                        "type": "image_url",
                         "image_url": {
                             "url": f"data:image/png;base64,{base64_image}"
-                        },
+                        }
                     }
-                ],
+                ]
             },
         ],
     )
 
-    content = resp.choices[0].message.content
-    if not content:
-        raise ValueError("OCR model returned empty content")
+    # For response_format=json_object, this is already a Python dict
+    try:
+        raw = resp.output[0].content[0].json
+    except Exception as e:
+        print("❌ Unexpected OCR response structure:", e, getattr(resp, "output", None))
+        raise
 
-    return json.loads(content)
+    if not isinstance(raw, dict):
+        raise ValueError("OCR result is not a dict JSON object")
+
+    return raw
 
 
 # ======================================================
@@ -241,264 +199,275 @@ def call_ai_on_report(text: str) -> dict:
         "You do NOT diagnose or prescribe. You only describe patterns and possible routes.\n\n"
         "Return STRICT JSON with at least these fields:\n"
         "{\n"
-        '  "patient": { "age": null, "sex": null },\n'
-        '  "cbc": [ { "analyte": "", "value": "", "units": "", '
-        '"reference_low": "", "reference_high": "", "flag": "low|normal|high" } ],\n'
-        '  "summary": {\n'
-        '      "impression": "",\n'
-        '      "suggested_follow_up": ""\n'
+        '  \"patient\": { \"name\": null, \"age\": null, \"sex\": \"Unknown\" },\n'
+        '  \"cbc\": [ { \"analyte\": \"\", \"value\": \"\", \"units\": \"\", '
+        '\"reference_low\": \"\", \"reference_high\": \"\", \"flag\": \"low|normal|high|unknown\" } ],\n'
+        '  \"summary\": {\n'
+        '      \"impression\": \"\",\n'
+        '      \"suggested_follow_up\": \"\"\n'
         "  }\n"
         "}\n"
         "If you cannot find some values, just omit them – never invent numbers."
     )
 
-    resp = client.chat.completions.create(
+    resp = client.responses.create(
         model="gpt-4o-mini",
         response_format={"type": "json_object"},
-        temperature=0.1,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": text},
+        input=[
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": text
+            },
         ],
     )
 
-    content = resp.choices[0].message.content
-    if not content:
-        raise ValueError("Interpretation model returned empty content")
+    try:
+        ai_json = resp.output[0].content[0].json
+    except Exception as e:
+        print("❌ Unexpected interpretation response structure:", e, getattr(resp, "output", None))
+        raise
 
-    return json.loads(content)
+    if not isinstance(ai_json, dict):
+        raise ValueError("Interpretation result is not a dict JSON object")
+
+    return ai_json
 
 
 # ======================================================
-#   AMI CLINICAL ROUTE ENGINE
+#   BUILD CANONICAL CBC VALUE DICT FOR ROUTES
 # ======================================================
 
-def generate_clinical_routes_from_ai(ai_json: dict) -> list[str]:
+def build_cbc_value_dict(ai_json: dict) -> dict:
     """
-    High-level wrapper: build test index and generate routes.
+    Turn ai_json["cbc"] (list) into a dict like:
+    {
+      "Hb": {"value": "...", ...},
+      "WBC": {...},
+      "MCV": {...},
+      ...
+    }
+    so the route engine can work on consistent names.
     """
-    index = index_tests_from_ai(ai_json)
-    if not index:
-        return []
+    cbc_values = {}
 
-    routes: list[str] = []
+    rows = ai_json.get("cbc") or []
+    if not isinstance(rows, list):
+        return cbc_values
 
-    # ---------- CORE CBC VALUES ----------
-    Hb = get_val(index, "haemoglobin", "hemoglobin", "hb")
-    Hb_flag = get_flag(index, "haemoglobin", "hemoglobin", "hb")
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = (row.get("analyte") or row.get("test") or "").lower()
+        if not name:
+            continue
 
-    MCV = get_val(index, "mcv")
-    MCV_flag = get_flag(index, "mcv")
+        def put(key):
+            if key not in cbc_values:
+                cbc_values[key] = row
 
-    MCH = get_val(index, "mch")
-    MCH_flag = get_flag(index, "mch")
+        # Red cells
+        if "haemoglobin" in name or "hemoglobin" in name or name == "hb":
+            put("Hb")
+        elif name.startswith("mcv"):
+            put("MCV")
+        elif name.startswith("mch"):
+            put("MCH")
+        elif "red cell" in name or "rbc" in name:
+            put("RBC")
 
-    RDW = get_val(index, "rdw")
-    RDW_flag = get_flag(index, "rdw")
+        # White cells
+        elif "white cell" in name or "wbc" in name or "leucocyte" in name or "leukocyte" in name:
+            put("WBC")
+        elif "neutrophil" in name:
+            put("Neutrophils")
+        elif "lymphocyte" in name:
+            put("Lymphocytes")
 
-    RBC = get_val(index, "erythrocyte count", "red cell count", "rbc")
-    RBC_flag = get_flag(index, "erythrocyte count", "red cell count", "rbc")
+        # Platelets
+        elif "platelet" in name or "plt" in name:
+            put("Platelets")
 
-    WBC = get_val(index, "leucocyte count", "white cell count", "wbc")
-    WBC_flag = get_flag(index, "leucocyte count", "white cell count", "wbc")
+        # Renal
+        elif "creatinine" in name:
+            put("Creatinine")
+        elif name.startswith("urea"):
+            put("Urea")
 
-    Neut = get_val(index, "neutrophils", "neutrophils %", "neutrophils count")
-    Neut_flag = get_flag(index, "neutrophils", "neutrophils %", "neutrophils count")
+        # LFT
+        elif name == "alt" or "alanine aminotransferase" in name:
+            put("ALT")
+        elif name == "ast" or "aspartate aminotransferase" in name:
+            put("AST")
+        elif name == "alp" or "alkaline phosphatase" in name:
+            put("ALP")
+        elif "ggt" in name or "gamma glutamyl" in name:
+            put("GGT")
+        elif "bilirubin" in name:
+            put("Bilirubin")
 
-    Lymph = get_val(index, "lymphocytes", "lymphocytes %", "lymphocyte count")
-    Lymph_flag = get_flag(index, "lymphocytes", "lymphocytes %", "lymphocyte count")
+        # Muscle
+        elif name == "ck" or "creatine kinase" in name:
+            put("CK")
+        elif "ck-mb" in name or "ck mb" in name:
+            put("CK-MB")
 
-    Plt = get_val(index, "platelets", "platelet count")
-    Plt_flag = get_flag(index, "platelets", "platelet count")
+        # Electrolytes
+        elif "sodium" in name or name == "na":
+            put("Sodium")
+        elif "potassium" in name or name == "k":
+            put("Potassium")
+        elif "calcium" in name or name.startswith("ca"):
+            put("Calcium")
 
-    CRP = get_val(index, "crp", "c-reactive protein", "crp (c-reactive protein)")
-    CRP_flag = get_flag(index, "crp", "c-reactive protein", "crp (c-reactive protein)")
+        # Inflammation
+        elif name.startswith("crp") or "c-reactive" in name:
+            put("CRP")
 
-    Bicarb = get_val(index, "st-co2", "bicarbonate", "total co2")
-    Na = get_val(index, "s-sodium", "sodium")
-    K = get_val(index, "s-potassium", "potassium")
-    Urea = get_val(index, "s-urea", "urea")
-    Creat = get_val(index, "s-creatinine", "creatinine")
+    return cbc_values
 
-    ALT = get_val(index, "alt", "alanine aminotransferase")
-    AST = get_val(index, "ast", "aspartate aminotransferase")
-    ALP = get_val(index, "alp", "alkaline phosphatase")
-    GGT = get_val(index, "ggt", "gamma glutamyl transferase")
-    Bili = get_val(index, "bilirubin", "total bilirubin")
 
-    # ---------- 1. ANAEMIA ROUTES ----------
-    if Hb_flag == "low":
-        # microcytic
-        if MCV_flag == "low" or (MCV and MCV < 80):
-            if MCH_flag == "low" or RDW_flag == "high":
-                routes.append(
-                    "Low haemoglobin with microcytosis and hypochromia "
-                    "(low MCV/MCH and/or high RDW) – route suggests iron deficiency "
-                    "pattern. Consider ferritin, transferrin saturation and "
-                    "reticulocyte count; screen for chronic blood loss "
-                    "(GI, gynaecological) and dietary iron intake."
-                )
+# ======================================================
+#   CBC + CHEMISTRY ROUTE ENGINE
+# ======================================================
+
+def generate_clinical_routes(cbc_values: dict):
+    """
+    Takes parsed CBC + chemistry values → generates diagnostic routes (roetes).
+    """
+
+    routes = []
+
+    # Helper getter
+    def val(name):
+        return clean_number(cbc_values.get(name, {}).get("value"))
+
+    # CBC values
+    Hb  = val("Hb")
+    MCV = val("MCV")
+    MCH = val("MCH")
+    WBC = val("WBC")
+    Plt = val("Platelets")
+    Neut = val("Neutrophils")
+    Lymph = val("Lymphocytes")
+
+    # Chemistry
+    Cr   = val("Creatinine")
+    Urea = val("Urea")
+    ALT  = val("ALT")
+    AST  = val("AST")
+    ALP  = val("ALP")
+    GGT  = val("GGT")
+    Bili = val("Bilirubin")
+    CK   = val("CK")
+    CKMB = val("CK-MB")
+
+    Na = val("Sodium")
+    K  = val("Potassium")
+    Ca = val("Calcium")
+    CRP = val("CRP")
+
+    # -----------------------------
+    # ANAEMIA ENGINE
+    # -----------------------------
+    if Hb is not None and Hb < 13:
+        routes.append("🔻 Hb low → anaemia route triggered.")
+
+        if MCV is not None:
+            if MCV < 80:
+                routes.append("➡️ Low MCV → microcytic anaemia pattern.")
+                routes.append("   • Suggest ferritin, iron studies and reticulocyte count.")
+            elif 80 <= MCV <= 100:
+                routes.append("➡️ Normal MCV → normocytic anaemia pattern.")
+                routes.append("   • Consider chronic inflammation, renal disease, early iron deficiency.")
             else:
-                routes.append(
-                    "Low haemoglobin with low MCV but normal MCH/RDW – consider "
-                    "iron deficiency, thalassaemia trait or anaemia of chronic disease. "
-                    "Route: request ferritin, CRP and, if indicated, haemoglobinopathy screen."
-                )
+                routes.append("➡️ High MCV → macrocytic anaemia pattern.")
+                routes.append("   • Suggest B12, folate, liver function tests and medication review.")
 
-        # normocytic
-        elif (MCV_flag == "normal" or (MCV and 80 <= MCV <= 100)) and RBC_flag != "low":
-            routes.append(
-                "Normocytic anaemia – route suggests checking for chronic disease, "
-                "renal impairment, endocrine causes or early blood loss. "
-                "Consider urea/creatinine/eGFR, CRP/ESR and reticulocyte count."
-            )
+    # -----------------------------
+    # WBC ROUTES
+    # -----------------------------
+    if WBC is not None:
+        if WBC > 12:
+            routes.append("🔺 WBC raised → inflammatory / infective route.")
+            if Neut and Neut > 70:
+                routes.append("   • Neutrophils high → bacterial pattern more likely.")
+            if Lymph and Lymph > 45:
+                routes.append("   • Lymphocytes high → viral pattern or recovery phase.")
+        elif WBC < 4:
+            routes.append("🔻 WBC low → consider viral suppression, bone marrow issues or medication effect.")
 
-        # macrocytic
-        elif MCV_flag == "high" or (MCV and MCV > 100):
-            routes.append(
-                "Low haemoglobin with macrocytosis (high MCV) – route suggests "
-                "B12/folate deficiency, alcohol excess, liver disease or "
-                "bone marrow disorder. Consider serum B12, folate, liver "
-                "function tests and review medications (e.g. chemotherapy, "
-                "anticonvulsants)."
-            )
+    # -----------------------------
+    # PLATELETS
+    # -----------------------------
+    if Plt is not None:
+        if Plt < 150:
+            routes.append("🔻 Platelets low → bleeding risk assessment route.")
+        elif Plt > 450:
+            routes.append("🔺 Platelets high → reactive thrombocytosis (infection/inflammation/iron deficiency) vs primary process.")
 
-        # safety
-        if Hb is not None and Hb < 8:
-            routes.append(
-                "Very low haemoglobin – consider urgent same-day clinical review, "
-                "repeat FBC and assessment for haemodynamic instability or rapid blood loss."
-            )
+    # -----------------------------
+    # KIDNEY FUNCTION ROUTES
+    # -----------------------------
+    if Cr is not None:
+        if Cr > 120:
+            routes.append("🔺 Creatinine high → renal function route. Suggest repeat U&E, review medications and hydration status.")
+        else:
+            routes.append("✔ Creatinine within expected range (interpret with eGFR and clinical context).")
 
-    # ---------- 2. ERYTHROCYTOSIS ----------
-    if Hb_flag == "high" or RBC_flag == "high":
-        routes.append(
-            "Raised haemoglobin and/or red cell count – route suggests assessing "
-            "for dehydration, smoking, chronic hypoxia (lung/cardiac disease) or "
-            "primary polycythaemia. Check history, oxygen saturation and consider "
-            "repeat FBC when well hydrated."
-        )
+    # -----------------------------
+    # LIVER FUNCTION ROUTES
+    # -----------------------------
+    liver_markers = [ALT, AST, ALP, GGT, Bili]
+    if any(x is not None and x > 1.5 for x in liver_markers):
+        routes.append("🔺 Liver enzymes / bilirubin abnormal → liver pattern route.")
+        if ALT and ALT > 3 * 40:
+            routes.append("   • ALT markedly raised → hepatocellular injury pattern.")
+        if ALP and ALP > 120:
+            routes.append("   • ALP raised → cholestatic/obstructive pattern.")
+        if Bili and Bili > 20:
+            routes.append("   • Bilirubin raised → jaundice evaluation (haemolytic, hepatic or obstructive).")
 
-    # ---------- 3. INFECTION / INFLAMMATION ROUTES ----------
-    if (WBC_flag == "high" or Neut_flag == "high") and (CRP_flag == "high" or (CRP and CRP > 10)):
-        routes.append(
-            "Neutrophilia with elevated CRP – route suggests acute infection or "
-            "inflammatory process. Correlate with symptoms (fever, focal pain, "
-            "respiratory or urinary symptoms) and consider source-directed work-up."
-        )
+    # -----------------------------
+    # MUSCLE INJURY ROUTES
+    # -----------------------------
+    if CK and CK > 300:
+        routes.append("🔺 CK elevated → muscle injury route.")
+        if CK > 2000:
+            routes.append("   • Very high CK → consider rhabdomyolysis physiology; check renal function and hydration.")
 
-    if WBC_flag == "high" and Lymph_flag == "high" and (Neut_flag != "high"):
-        routes.append(
-            "Leucocytosis with relative lymphocytosis – route suggests viral infection, "
-            "post-viral state or possible lymphoproliferative disease if persistent. "
-            "Consider repeat FBC in 4–6 weeks and clinical correlation."
-        )
+    # -----------------------------
+    # ELECTROLYTES
+    # -----------------------------
+    if K is not None:
+        if K < 3.3:
+            routes.append("⚠️ Potassium low → arrhythmia risk. Urgent clinical review advised if symptomatic.")
+        elif K > 5.5:
+            routes.append("⚠️ Potassium high → significant arrhythmia risk. Consider urgent ECG & review.")
 
-    if WBC_flag == "low" or Neut_flag == "low":
-        routes.append(
-            "Low white cell / neutrophil count – route suggests reviewing recent "
-            "viral illness, medications (especially chemotherapy, immunosuppressants) "
-            "and nutritional status. If febrile or clinically unwell, "
-            "consider urgent assessment for neutropenic sepsis."
-        )
+    if Na is not None:
+        if Na < 133:
+            routes.append("🔻 Sodium low → hyponatraemia route. Assess fluid status, medications and endocrine causes.")
+        elif Na > 146:
+            routes.append("🔺 Sodium high → hypernatraemia route. Often dehydration or water loss; assess mental status and fluids.")
 
-    # ---------- 4. PLATELET / BLEEDING ROUTES ----------
-    if Plt_flag == "low":
-        routes.append(
-            "Thrombocytopenia – route suggests reviewing medications (e.g. heparin, "
-            "antibiotics), alcohol intake, viral infections and autoimmune history. "
-            "Consider repeat FBC, blood film and review for bleeding or bruising."
-        )
+    # -----------------------------
+    # INFLAMMATION
+    # -----------------------------
+    if CRP is not None:
+        if CRP > 10:
+            routes.append("🔺 CRP raised → active inflammation/infection route. Correlate with clinical picture and WBC pattern.")
+        else:
+            routes.append("✔ CRP not raised → significant systemic inflammation less likely (within limits of test).")
 
-    if Plt_flag == "high":
-        routes.append(
-            "Thrombocytosis – can be reactive to infection, inflammation or iron "
-            "deficiency, but may rarely reflect a myeloproliferative process. "
-            "Correlate with CRP, iron status and clinical context; consider repeat "
-            "count once acute illness has settled."
-        )
-
-    # ---------- 5. PANCYTOPENIA / MARROW RED FLAGS ----------
-    low_lineages = 0
-    if Hb_flag == "low":
-        low_lineages += 1
-    if WBC_flag == "low":
-        low_lineages += 1
-    if Plt_flag == "low":
-        low_lineages += 1
-
-    if low_lineages >= 2:
-        routes.append(
-            "More than one cell line is reduced (e.g. anaemia with leukopenia and/or "
-            "thrombocytopenia) – route suggests possible bone marrow suppression, "
-            "infiltration or severe systemic illness. Consider urgent haematology "
-            "discussion, blood film and repeat FBC."
-        )
-
-    # ---------- 6. RENAL / ELECTROLYTE ROUTES ----------
-    if (Urea and Urea > 8) or (Creat and Creat > 100):
-        routes.append(
-            "Raised urea and/or creatinine – route suggests assessing renal function "
-            "trend, hydration status, blood pressure and medication list "
-            "(ACE-inhibitors, NSAIDs, diuretics). Consider eGFR and urinalysis."
-        )
-
-    if Na is not None and (Na < 135 or Na > 145):
-        routes.append(
-            "Abnormal sodium – route suggests checking fluid balance, medications "
-            "(diuretics, antidepressants), adrenal/thyroid status and serum/urine osmolality "
-            "if significantly deranged or symptomatic."
-        )
-
-    if K is not None and (K < 3.3 or K > 5.3):
-        routes.append(
-            "Abnormal potassium – route suggests urgent ECG if significantly high or low, "
-            "review of medications (ACE-inhibitors, ARBs, diuretics) and assessment for "
-            "renal impairment or acid–base disturbance."
-        )
-
-    if Bicarb is not None and Bicarb < 21:
-        routes.append(
-            "Low bicarbonate / total CO₂ – route suggests metabolic acidosis. "
-            "Correlate with lactate, ketones, renal function and clinical state "
-            "to distinguish sepsis, renal failure, ketoacidosis or toxin ingestion."
-        )
-
-    # ---------- 7. LIVER PATTERN ROUTES ----------
-    if (ALT and ALT > 50) or (AST and AST > 50) or (ALP and ALP > 130) or (GGT and GGT > 60) or (Bili and Bili > 20):
-        routes.append(
-            "Abnormal liver biochemistry – route suggests pattern analysis "
-            "(hepatocellular vs cholestatic) and correlation with alcohol use, "
-            "medications, viral hepatitis risk and metabolic risk factors. "
-            "Consider hepatitis screen, ultrasound and repeat testing if persistent."
-        )
-
-    # ---------- 8. INTEGRATED ANAEMIA + INFLAMMATION ROUTE ----------
-    if Hb_flag == "low" and (CRP_flag == "high" or (CRP and CRP > 10)):
-        routes.append(
-            "Anaemia with raised CRP – route suggests anaemia of inflammation / chronic disease "
-            "or iron deficiency in the context of chronic inflammatory conditions. "
-            "Consider ferritin, transferrin saturation, CRP trend and evaluation for "
-            "chronic infection, autoimmune disease or malignancy."
-        )
-
-    # ---------- 9. SAFETY CATCH-ALL ----------
+    # END
     if not routes:
-        routes.append(
-            "No major route-level abnormalities detected from the available results. "
-            "Interpretation should still be correlated with the patient’s symptoms, "
-            "history and prior results."
-        )
+        routes.append("No major route-level abnormalities triggered from available results. Correlate with symptoms and prior results.")
 
-    # De-duplicate while preserving order
-    seen = set()
-    unique_routes = []
-    for r in routes:
-        if r not in seen:
-            seen.add(r)
-            unique_routes.append(r)
-
-    return unique_routes
+    return routes
 
 
 # ======================================================
@@ -519,7 +488,7 @@ def process_report(job: dict) -> dict:
             ).eq("id", report_id).execute()
             return {"error": err}
 
-        # Download original PDF
+        # Download PDF
         pdf_bytes = supabase.storage.from_(BUCKET).download(file_path)
         if hasattr(pdf_bytes, "data"):
             pdf_bytes = pdf_bytes.data
@@ -549,7 +518,6 @@ def process_report(job: dict) -> dict:
             if not combined_rows:
                 raise ValueError("Vision OCR could not extract CBC values")
 
-            # Use OCR JSON as text input for interpreter
             merged_text = json.dumps({"cbc": combined_rows}, ensure_ascii=False)
 
         # ------- DIGITAL PDF → DIRECT TEXT -------
@@ -565,7 +533,8 @@ def process_report(job: dict) -> dict:
 
         # ------- ROUTE ENGINE -------
         try:
-            routes = generate_clinical_routes_from_ai(ai_json)
+            cbc_values = build_cbc_value_dict(ai_json)
+            routes = generate_clinical_routes(cbc_values)
             ai_json["routes"] = routes
         except Exception as e:
             print("Route engine error:", e)
