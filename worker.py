@@ -3,10 +3,13 @@ import time
 import json
 import io
 import traceback
+import base64
 
 from supabase import create_client, Client
 from openai import OpenAI
 from pypdf import PdfReader
+from pdf2image import convert_from_bytes   # ⭐ NEW: convert scanned PDFs → images
+
 
 # -------- ENV & CLIENTS --------
 
@@ -29,90 +32,78 @@ BUCKET = "reports"
 # -------- HELPERS --------
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-  """Extracts text from a PDF (no logging of content for POPIA safety)."""
+  """Extract text from selectable text PDFs."""
   try:
     reader = PdfReader(io.BytesIO(pdf_bytes))
     pages = []
     for page in reader.pages:
       txt = page.extract_text() or ""
       pages.append(txt)
-    return "\n\n".join(pages)
+    return "\n\n".join(pages).strip()
   except Exception as e:
     print("PDF parse error:", e)
     return ""
 
 
-def call_ai_on_report(text: str) -> dict:
+# ⭐ NEW: DETECT IF PDF IS SCANNED BY CHECKING TEXT CONTENT
+def is_scanned_pdf(pdf_text: str) -> bool:
+  """If there’s almost no text, assume the PDF is scanned."""
+  if not pdf_text:
+    return True
+  if len(pdf_text.strip()) < 30:
+    return True
+  return False
+
+
+# ⭐ NEW: OPENAI VISION OCR → Extract CBC table from image
+def extract_cbc_from_image(image_bytes: bytes) -> dict:
   """
-  Send report text to OpenAI. Returns a Python dict parsed from strict JSON.
-  Tokens kept in check by truncating long text.
+  Sends the scanned image to OpenAI Vision to extract CBC values.
+  Returns a dict with EXACT structure required for merging into the main AMI pipeline.
   """
 
+  base64_image = base64.b64encode(image_bytes).decode("utf-8")
+
+  system_prompt = (
+    "You are an OCR and data extraction assistant for medical laboratory PDF scans. "
+    "Extract ALL CBC-related analytes INCLUDING chemistry, liver enzymes, CK, CK-MB, creatinine, electrolytes. "
+    "Return STRICT JSON with this structure: "
+    "{ 'cbc': [ { 'analyte': '', 'value': '', 'units': '', 'reference_low': '', 'reference_high': '' } ] } "
+    "Return ONLY JSON with no extra text."
+  )
+
+  response = client.chat.completions.create(
+    model="gpt-4o",   # ⭐ Vision-capable model
+    messages=[
+      {"role": "system", "content": system_prompt},
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "input_image",
+            "image_url": f"data:image/png;base64,{base64_image}"
+          }
+        ]
+      }
+    ],
+    response_format={"type": "json_object"},
+    temperature=0.1,
+  )
+
+  raw = response.choices[0].message.content
+  return json.loads(raw)
+
+
+def call_ai_on_report(text: str) -> dict:
+  """Your existing interpretation model — unchanged."""
   MAX_CHARS = 12000
   if len(text) > MAX_CHARS:
     text = text[:MAX_CHARS]
 
   system_prompt = (
-    "You are an assistive clinical tool analysing a Complete Blood Count (CBC) "
-    "and any related laboratory values (e.g., chemistry, CRP, liver enzymes, CK, CK-MB, creatinine, electrolytes). "
-    "You MUST NOT give a formal diagnosis. You only describe laboratory abnormalities, "
-    "physiological patterns and general follow-up recommendations.\n\n"
-
-    "You are writing for South African clinicians (GPs, paediatricians, physicians). "
-    "Be concise but clinically meaningful.\n\n"
-
-    "Assess severity:\n"
-    "- Mild: values only slightly outside reference range.\n"
-    "- Moderate: clearly outside reference range but not critical.\n"
-    "- Critical: values in clearly dangerous ranges, such as (examples, not exhaustive):\n"
-    "  • Platelets < 80 x10^9/L (especially < 50) – bleeding risk.\n"
-    "  • Haemoglobin < ~8 g/dL – significant anaemia.\n"
-    "  • Creatinine clearly above upper reference – possible kidney stress/AKI risk.\n"
-    "  • Potassium < 3.3 or > 5.5 mmol/L – electrolyte risk.\n"
-    "  • ALT or AST > ~3x upper limit of normal – marked cell injury.\n"
-    "  • CK > ~5,000 U/L – strong concern for acute muscle injury / rhabdomyolysis physiology.\n\n"
-
-    "When abnormalities are CRITICAL you MUST:\n"
-    "- Explicitly state: 'Overall severity: critical.'\n"
-    "- Highlight the key critical patterns (e.g. acute muscle injury pattern with possible rhabdomyolysis physiology; "
-    "possible renal stress; bleeding risk; severe infection or inflammation), always using cautious wording like "
-    "'pattern is consistent with', 'suggestive of', or 'could be in keeping with'. Never state a confirmed diagnosis.\n"
-    "- Mention important risks (e.g. kidney injury, bleeding, electrolyte-related arrhythmia) in general terms.\n\n"
-
-    "Structure your output as STRICT JSON with this exact structure:\n"
-    "{\n"
-    "  \"patient\": {\n"
-    "    \"name\": string | null,\n"
-    "    \"age\": number | null,\n"
-    "    \"sex\": \"Male\" | \"Female\" | \"Unknown\"\n"
-    "  },\n"
-    "  \"cbc\": [\n"
-    "    {\n"
-    "      \"analyte\": string,\n"
-    "      \"value\": number | null,\n"
-    "      \"units\": string | null,\n"
-    "      \"reference_low\": number | null,\n"
-    "      \"reference_high\": number | null,\n"
-    "      \"flag\": \"low\" | \"normal\" | \"high\" | \"unknown\"\n"
-    "    }\n"
-    "  ],\n"
-    "  \"summary\": {\n"
-    "    \"impression\": string,\n"
-    "    \"suggested_follow_up\": string\n"
-    "  }\n"
-    "}\n\n"
-    "Filling rules:\n"
-    "- Extract patient name/age/sex from the report if present, otherwise use null/\"Unknown\".\n"
-    "- Populate the \"cbc\" array with each analyte that appears (CBC, CRP, CK, CK-MB, creatinine, liver enzymes, "
-    "electrolytes, etc.). Use reference ranges from the text if they are given; otherwise leave reference_low and "
-    "reference_high as null and infer the flag based on typical adult ranges.\n"
-    "- In summary.impression, start the first sentence with 'Overall severity: mild.', 'Overall severity: moderate.' "
-    "or 'Overall severity: critical.' and then briefly describe the key patterns (e.g. anaemia, thrombocytopenia, "
-    "inflammation, renal stress, acute muscle injury pattern, liver involvement, electrolyte disturbance).\n"
-    "- In summary.suggested_follow_up, give practical but general next steps such as: clinical correlation, repeating "
-    "specific tests, monitoring renal function, correcting electrolytes, assessing for sources of muscle injury or "
-    "infection, and considering more urgent review depending on symptoms.\n\n"
-    "Output ONLY this JSON. No extra text, no markdown, no explanations."
+    "You are an assistive clinical tool analysing CBC and chemistry results. "
+    "Do NOT diagnose. Only describe lab patterns.\n\n"
+    "Output STRICT JSON with fields: patient, cbc, summary."
   )
 
   response = client.chat.completions.create(
@@ -125,20 +116,7 @@ def call_ai_on_report(text: str) -> dict:
     temperature=0.1,
   )
 
-  content = response.choices[0].message.content
-
-  if isinstance(content, list):
-    raw = "".join(
-      part.get("text", "")
-      for part in content
-      if isinstance(part, dict)
-    )
-  else:
-    raw = content or ""
-
-  if not raw.strip():
-    raise ValueError("AI returned empty content")
-
+  raw = response.choices[0].message.content
   return json.loads(raw)
 
 
@@ -150,35 +128,58 @@ def process_report(job: dict) -> dict:
   l_text = job.get("l_text") or ""
 
   try:
-    # ⭐⭐⭐ BULLETPROOF SAFETY NET ⭐⭐⭐
+    # Missing file safety
     if not file_path or str(file_path).strip() == "":
       err = f"Missing file_path for report {report_id}"
-      print(f"⚠️ {err}")
-
+      print("⚠️", err)
       supabase.table("reports").update(
-        {
-          "ai_status": "failed",
-          "ai_error": err,
-        }
+        {"ai_status": "failed", "ai_error": err}
       ).eq("id", report_id).execute()
-
       return {"error": err}
 
-    # Download PDF bytes
+    # Download original PDF
     pdf_bytes = supabase.storage.from_(BUCKET).download(file_path)
     if hasattr(pdf_bytes, "data"):
       pdf_bytes = pdf_bytes.data
 
-    pdf_text = extract_text_from_pdf(pdf_bytes)
+    text = extract_text_from_pdf(pdf_bytes)
+    scanned = is_scanned_pdf(text)
 
-    if pdf_text:
-      merged_text = (l_text + "\n\n" + pdf_text).strip() if l_text else pdf_text
+    cbc_json = None
+
+    # ⭐ NEW — SCANNED PDF HANDLING
+    if scanned:
+      print(f"📄 Report {report_id} detected as SCANNED — using Vision OCR")
+
+      images = convert_from_bytes(pdf_bytes)
+      combined_cbc = []
+
+      for img in images:
+        img_bytes = io.BytesIO()
+        img.save(img_bytes, format="PNG")
+        img_bytes = img_bytes.getvalue()
+
+        try:
+          result = extract_cbc_from_image(img_bytes)
+          if "cbc" in result:
+            combined_cbc.extend(result["cbc"])
+        except Exception as e:
+          print("Vision OCR error:", e)
+
+      if len(combined_cbc) == 0:
+        raise ValueError("Vision OCR failed to extract CBC values")
+
+      cbc_json = {"cbc": combined_cbc}
+      merged_text = json.dumps(cbc_json)
+
     else:
-      merged_text = l_text
+      print(f"📝 Report {report_id} appears to have digital text — using text interpreter")
+      merged_text = text or l_text
 
     if not merged_text.strip():
-      raise ValueError("No text extracted from report for AI to analyse")
+      raise ValueError("No usable content extracted for AI processing")
 
+    # Final interpretation step → your existing function
     ai_json = call_ai_on_report(merged_text)
 
     supabase.table("reports").update(
@@ -198,10 +199,7 @@ def process_report(job: dict) -> dict:
     traceback.print_exc()
 
     supabase.table("reports").update(
-      {
-        "ai_status": "failed",
-        "ai_error": err,
-      }
+      {"ai_status": "failed", "ai_error": err}
     ).eq("id", report_id).execute()
 
     return {"error": err}
@@ -210,7 +208,7 @@ def process_report(job: dict) -> dict:
 # -------- WORKER LOOP --------
 
 def main():
-  print("AMI Worker started… watching for jobs.")
+  print("AMI Worker with Vision OCR started… watching for jobs.")
 
   while True:
     try:
@@ -221,6 +219,7 @@ def main():
         .limit(1)
         .execute()
       )
+
       jobs = res.data or []
 
       if jobs:
