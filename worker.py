@@ -1,16 +1,13 @@
 # worker.py
 """
-AMI Health Worker V5 - single-file worker.py (Max-accuracy mode: local OCR preferred)
+AMI Health Worker V4 (pypdf + pytesseract OCR only) - single-file worker.py
 
-Features:
-- pypdf for digital text extraction
-- pdf2image + pytesseract for scanned PDFs (preferred)
-- OpenAI Vision fallback (only if OPENAI_API_KEY is set and pytesseract fails)
-- Robust regex parsing for CBC & chemistry, canonical mapping
-- Route Engine V5 with ferritin route, stronger microcytic logic, sepsis/high NLR detection
-- Trend analysis when previous results exist for same patient_id
-- Saves ai_results into Supabase table (env SUPABASE_TABLE)
-- Color-coded severity map (Green/Yellow/Orange/Red)
+Notes:
+- Uses pypdf (PdfReader) for digital PDFs.
+- Uses pdf2image -> pytesseract for scanned PDFs.
+- No OpenAI calls for OCR (option A chosen).
+- Saves ai_results into Supabase table (ai_status -> 'completed').
+- Run with: python worker.py --test-pdf sample.pdf
 """
 
 import os
@@ -19,885 +16,793 @@ import re
 import time
 import json
 import math
-import base64
 import logging
-import traceback
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 
-# HTTP client for fallback / downloads
-import requests
-
-# PDF and OCR libs
+from dotenv import load_dotenv
 from pypdf import PdfReader
 from pdf2image import convert_from_bytes
-from PIL import Image
+from PIL import Image, ImageFilter, ImageOps
 
-# Optional local OCR
+# optional imports
 try:
     import pytesseract
     HAS_PYTESSERACT = True
 except Exception:
+    pytesseract = None
     HAS_PYTESSERACT = False
 
-# Supabase client
 try:
     from supabase import create_client
     HAS_SUPABASE = True
 except Exception:
+    create_client = None
     HAS_SUPABASE = False
-
-# OpenAI client (the OpenAI class, used as fallback for OCR or model completion if configured)
-try:
-    from openai import OpenAI
-    HAS_OPENAI = True
-except Exception:
-    HAS_OPENAI = False
-
-from dotenv import load_dotenv
 
 # ---------- config & logging ----------
 load_dotenv()
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "reports")
-SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "reports")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "6"))
-PDF_RENDER_DPI = int(os.getenv("PDF_RENDER_DPI", "200"))
-TEXT_LENGTH_THRESHOLD = int(os.getenv("TEXT_LENGTH_THRESHOLD", "80"))
-OCR_PAGE_LIMIT = int(os.getenv("OCR_PAGE_LIMIT", "8"))  # limit pages to OCR for speed
-MAX_AI_INPUT_CHARS = int(os.getenv("MAX_AI_INPUT_CHARS", "12000"))
+SUPABASE_URL = os.getenv('SUPABASE_URL')
+SUPABASE_KEY = os.getenv('SUPABASE_KEY')
+SUPABASE_TABLE = os.getenv('SUPABASE_TABLE', 'reports')
+POLL_INTERVAL = int(os.getenv('POLL_INTERVAL', '6'))
+PDF_RENDER_DPI = int(os.getenv('PDF_RENDER_DPI', '200'))
+TEXT_LENGTH_THRESHOLD = int(os.getenv('TEXT_LENGTH_THRESHOLD', '80'))
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("ami-worker-v5")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+logger = logging.getLogger('ami-worker')
 
-# Initialize Supabase & OpenAI clients
-supabase = None
 if HAS_SUPABASE and SUPABASE_URL and SUPABASE_KEY:
-    try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        logger.info("Connected to Supabase")
-    except Exception as e:
-        logger.exception("Failed to create supabase client: %s", e)
-        supabase = None
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 else:
-    logger.warning("Supabase not configured or client missing")
+    supabase = None
+    if not HAS_SUPABASE:
+        logger.warning("supabase package not available - saving disabled.")
+    else:
+        logger.warning("SUPABASE_URL or SUPABASE_KEY missing - saving disabled.")
 
-openai_client = None
-if HAS_OPENAI and OPENAI_API_KEY:
-    try:
-        openai_client = OpenAI(api_key=OPENAI_API_KEY)
-        logger.info("OpenAI client initialized")
-    except Exception as e:
-        logger.exception("Failed to initialize OpenAI client: %s", e)
-        openai_client = None
-elif OPENAI_API_KEY:
-    logger.warning("OpenAI package not available; OpenAI fallback disabled")
+# ---------- PDF reading & scanned detection ----------
 
-# ---------- Utilities: PDF download / digital extraction ----------
-
-def download_pdf_bytes_from_record(record: Dict[str, Any]) -> bytes:
-    """Download PDF bytes either from Supabase storage or an external URL in the record."""
-    # Priority: file_path in Supabase storage, then pdf_url
-    if record.get("file_path") and supabase:
-        path = record["file_path"]
-        # supabase.storage.from_(bucket).download returns a response-like object
-        res = supabase.storage.from_(SUPABASE_BUCKET).download(path)
-        if hasattr(res, "data"):
-            return res.data
-        # some SDKs return bytes directly
-        return res
-    elif record.get("pdf_url"):
-        url = record["pdf_url"]
+def download_pdf_from_record(record: Dict[str, Any]) -> bytes:
+    """Download PDF binary. Supports 'pdf_url' or Supabase storage 'file_path'."""
+    if 'pdf_url' in record and record['pdf_url']:
+        import requests
+        url = record['pdf_url']
         r = requests.get(url, timeout=30)
         r.raise_for_status()
         return r.content
+    elif 'file_path' in record and supabase:
+        bucket = os.getenv('SUPABASE_BUCKET', 'reports')
+        path = record['file_path']
+        res = supabase.storage.from_(bucket).download(path)
+        # supabase-python returns a StorageFileResponse-like; try .data or raw bytes
+        if hasattr(res, 'data'):
+            return res.data
+        return res
     else:
-        raise ValueError("No file_path or pdf_url available on record")
+        raise ValueError("No 'pdf_url' or 'file_path' in record, or supabase not configured.")
 
-def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
-    """Try to extract selectable text using pypdf."""
+
+def extract_text_with_pypdf(pdf_bytes: bytes) -> str:
+    """Extract text using pypdf (digital text)."""
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
-        pages_text = []
-        for p in reader.pages:
-            try:
-                t = p.extract_text() or ""
-            except Exception:
-                t = ""
-            pages_text.append(t)
-        joined = "\n\n".join(pages_text).strip()
-        return joined
     except Exception as e:
-        logger.warning("pypdf failed: %s", e)
-        return ""
+        logger.debug("PdfReader failed: %s", e)
+        return ''
+    parts = []
+    for i, p in enumerate(reader.pages):
+        try:
+            txt = p.extract_text() or ''
+            parts.append(txt)
+        except Exception as e:
+            logger.debug("pypdf page extract failed %d: %s", i, e)
+            parts.append('')
+    joined = '\n'.join(parts)
+    return joined
 
-def is_scanned_pdf_by_text(pdf_text: str) -> bool:
-    """Heuristic: if extracted text length is below threshold, treat as scanned."""
-    if not pdf_text:
+
+def is_scanned_pdf(pdf_bytes: bytes) -> bool:
+    txt = extract_text_with_pypdf(pdf_bytes)
+    if len(txt.strip()) < TEXT_LENGTH_THRESHOLD:
+        logger.info("PDF appears scanned (text len %d)", len(txt))
         return True
-    return len(pdf_text.strip()) < TEXT_LENGTH_THRESHOLD
+    return False
 
-# ---------- OCR: pytesseract preferred, OpenAI Vision fallback ----------
 
-def pdf_bytes_to_images(pdf_bytes: bytes, dpi: int = PDF_RENDER_DPI, max_pages: int = OCR_PAGE_LIMIT) -> List[Image.Image]:
+# ---------- OCR via pytesseract ----------
+
+def preprocess_image_for_ocr(img: Image.Image) -> Image.Image:
+    """Simple preprocessing to improve OCR: convert to grayscale, increase contrast, median filter."""
+    try:
+        # convert to L (grayscale)
+        img = img.convert('L')
+        # increase contrast if needed
+        img = ImageOps.autocontrast(img, cutoff=2)
+        # slight sharpen and reduce noise
+        img = img.filter(ImageFilter.MedianFilter(size=3))
+        # optionally resize small images up
+        w, h = img.size
+        if max(w, h) < 1200:
+            factor = int(1200 / max(1, max(w, h)))
+            new_size = (w * factor, h * factor)
+            img = img.resize(new_size, Image.LANCZOS)
+        return img
+    except Exception:
+        return img
+
+
+def ocr_image_pytesseract(img: Image.Image, lang: str = 'eng') -> str:
+    if not HAS_PYTESSERACT:
+        raise RuntimeError("pytesseract is not available in this environment.")
+    img2 = preprocess_image_for_ocr(img)
+    # Use OEM/LSTM and psm modes if desired
+    custom_oem_psm_config = r'--oem 3 --psm 6'
+    text = pytesseract.image_to_string(img2, lang=lang, config=custom_oem_psm_config)
+    return text
+
+
+def pdf_to_images(pdf_bytes: bytes, dpi: int = PDF_RENDER_DPI) -> List[Image.Image]:
     imgs = convert_from_bytes(pdf_bytes, dpi=dpi)
-    if max_pages and len(imgs) > max_pages:
-        imgs = imgs[:max_pages]
     return imgs
 
-def ocr_image_with_pytesseract(img: Image.Image) -> str:
-    if not HAS_PYTESSERACT:
-        raise RuntimeError("pytesseract not available")
-    # Preprocess image (grayscale + thresholding can help)
-    gray = img.convert("L")
-    w, h = gray.size
-    # upscale small images for better OCR
-    if max(w, h) < 1200:
-        factor = int(max(1, 1200 / max(w, h)))
-        gray = gray.resize((w * factor, h * factor), Image.LANCZOS)
-    try:
-        txt = pytesseract.image_to_string(gray, lang="eng")
-    except Exception as e:
-        logger.exception("pytesseract error: %s", e)
-        txt = ""
-    return txt or ""
-
-def openai_vision_ocr_image(img: Image.Image) -> str:
-    """Fallback OCR using OpenAI image -> text. Uses OpenAI client if available."""
-    if not openai_client:
-        raise RuntimeError("OpenAI client not configured")
-    # Resize to reasonable width
-    max_w = 1200
-    w, h = img.size
-    if w > max_w:
-        ratio = max_w / float(w)
-        img = img.resize((max_w, int(h * ratio)), Image.LANCZOS)
-    buff = io.BytesIO()
-    img.convert("RGB").save(buff, format="JPEG", quality=85)
-    b64 = base64.b64encode(buff.getvalue()).decode("utf-8")
-    # Compose a clear prompt asking for plain extracted text
-    system_prompt = "You are an OCR assistant. Extract all visible plain text from the supplied image. Return only the raw extracted text."
-    # Use the OpenAI Chat Completions via the OpenAI client (chat capable)
-    try:
-        resp = openai_client.chat.completions.create(
-            model="gpt-4o-mini",  # choose an image-capable chat model if available
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": [{"type": "text", "text": "Extract text from this image (return only text)."},
-                                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}
-            ],
-            temperature=0,
-            max_tokens=5000,
-        )
-        content = resp.choices[0].message.content
-        if isinstance(content, list):
-            # sometimes content streaming
-            return "".join(part.get("text", "") for part in content if isinstance(part, dict))
-        return content or ""
-    except Exception as e:
-        logger.exception("OpenAI OCR failed: %s", e)
-        raise
 
 def do_ocr_on_pdf(pdf_bytes: bytes) -> str:
-    """Run OCR on the PDF pages: prefer pytesseract, fallback to OpenAI vision if configured."""
+    """Render scanned PDF to images and OCR each page with pytesseract, returning concatenated text."""
     try:
-        images = pdf_bytes_to_images(pdf_bytes)
+        images = pdf_to_images(pdf_bytes)
     except Exception as e:
         logger.exception("Failed to render PDF to images: %s", e)
         raise
 
-    page_texts: List[str] = []
+    texts = []
     for i, img in enumerate(images):
-        page_text = ""
-        # try pytesseract first
-        if HAS_PYTESSERACT:
-            try:
-                page_text = ocr_image_with_pytesseract(img)
-                logger.info("OCR page %d via pytesseract length=%d", i, len(page_text))
-            except Exception as e:
-                logger.warning("pytesseract failed on page %d: %s", i, e)
-                page_text = ""
-        # fallback to OpenAI vision if pytesseract missing or returned nothing
-        if not page_text and openai_client:
-            try:
-                page_text = openai_vision_ocr_image(img)
-                logger.info("OCR page %d via OpenAI length=%d", i, len(page_text))
-            except Exception as e:
-                logger.warning("OpenAI OCR failed page %d: %s", i, e)
-                page_text = ""
-        page_texts.append(page_text)
-    return "\n---PAGE_BREAK---\n".join(page_texts)
+        page_text = ''
+        try:
+            page_text = ocr_image_pytesseract(img)
+            logger.info("OCR page %d length %d", i, len(page_text))
+        except Exception as e:
+            logger.exception("pytesseract failed on page %d: %s", i, e)
+            page_text = ''
+        texts.append(page_text)
+    return '\n\n---PAGE_BREAK---\n\n'.join(texts)
 
-# ---------- Parsing: robust regex extraction ----------
 
-VALUE_RE = r'(-?\d+(?:\.\d+)?)'
-UNIT_RE = r'([a-zA-Z/%\^\-\u00B2\u00B30-9\s\.]+)?'  # allow degree symbols and superscripts
-REF_RE = r'\(?(?:ref(?:erence)?[:\s]*)?([0-9\.\-\–to\s/]+)\)?'
+# ---------- Parsing: extract lab values robustly ----------
+
+# pattern search helpers
+VALUE_RE = r'(-?\d+\.\d+|-?\d+)'
+UNIT_RE = r'([a-zA-Z/%\^\d\-\s\.\u00b3\u00b2]*)'  # extended to include superscript chars
+REF_RE = r'(?:\(?(?:ref|reference|range)[:\s]*([^\)]*)\)?)?'
 
 COMMON_KEYS = {
-    "hb": ["hb", "haemoglobin", "hemoglobin"],
-    "rbc": ["rbc", "erythrocyte", "erythrocyte count"],
-    "hct": ["hct", "haematocrit", "hematocrit"],
-    "mcv": ["mcv", "mean corpuscular volume"],
-    "mch": ["mch", "mean corpuscular haemoglobin", "mean corpuscular hemoglobin"],
-    "mchc": ["mchc"],
-    "rdw": ["rdw"],
-    "wbc": ["wbc", "white cell", "white blood cell", "leukocyte", "leucocyte"],
-    "neutrophils_pc": ["neutrophils %", "neutrophils%", "neutrophil%","neutrophils"],
-    "neutrophils_abs": ["neutrophils absolute", "neutrophil count", "neutrophils x10"],
-    "lymphocytes_pc": ["lymphocytes %", "lymphocytes"],
-    "monocytes_pc": ["monocytes %", "monocytes"],
-    "eosinophils_pc": ["eosinophils %", "eosinophils"],
-    "basophils_pc": ["basophils %", "basophils"],
-    "platelets": ["platelets", "thrombocytes", "platelet count", "plt"],
-    "crp": ["crp", "c-reactive protein", "c reactive protein"],
-    "creatinine": ["creatinine", "creat"],
-    "sodium": ["sodium", "na"],
-    "potassium": ["potassium", "k"],
-    "chloride": ["chloride", "cl"],
-    "urea": ["urea"],
-    "ck": ["ck", "creatine kinase"],
-    "alt": ["alt", "alanine aminotransferase", "alanine transaminase"],
-    "ast": ["ast", "aspartate aminotransferase"],
-    "ferritin": ["ferritin"],
+    'hb': ['hb', 'haemoglobin', 'hemoglobin'],
+    'rbc': ['rbc', 'erythrocyte count', 'erythrocyte'],
+    'hct': ['hct', 'haematocrit', 'hematocrit'],
+    'mcv': ['mcv', 'mean corpuscular volume'],
+    'mch': ['mch', 'mean corpuscular haemoglobin', 'mean corpuscular hemoglobin'],
+    'mchc': ['mchc'],
+    'rdw': ['rdw'],
+    'wbc': ['wbc', 'white cell count', 'leukocyte', 'leucocyte', 'leukocytes'],
+    'neutrophils_pc': ['neutrophils %', 'neutrophils%','neutrophils percent','neutrophil%','neutrophils'],
+    'neutrophils_abs': ['neutrophils absolute','neutrophil count','neutrophil absolute'],
+    'lymphocytes_pc': ['lymphocytes %','lymphocytes'],
+    'monocytes_pc': ['monocytes %','monocytes'],
+    'eosinophils_pc': ['eosinophils %','eosinophils'],
+    'basophils_pc': ['basophils %','basophils'],
+    'platelets': ['platelets','thrombocytes','platelet count'],
+    'crp': ['crp','c-reactive protein','c reactive protein'],
+    'creatinine': ['creatinine','creat'],
+    'sodium': ['sodium','na'],
+    'potassium': ['potassium','k'],
+    'chloride': ['chloride','cl'],
+    'urea': ['urea','bun'],
+    'alt': ['alt','alanine aminotransferase'],
+    'ast': ['ast','aspartate aminotransferase'],
+    'ck': ['ck','creatine kinase'],
 }
 
 LABEL_TO_KEY = {}
 for k, labels in COMMON_KEYS.items():
-    for lbl in labels:
-        LABEL_TO_KEY[lbl.lower()] = k
+    for l in labels:
+        LABEL_TO_KEY[l.lower()] = k
 
-def normalize_label(label: str) -> str:
-    l = re.sub(r'[^a-z0-9% ]', ' ', label.lower())
-    l = re.sub(r'\s+', ' ', l).strip()
-    return l
 
 def find_key_for_label(label: str) -> Optional[str]:
-    l = normalize_label(label)
+    l = re.sub(r'[^a-z0-9 ]', '', label.lower()).strip()
     if l in LABEL_TO_KEY:
         return LABEL_TO_KEY[l]
-    for lbl, key in LABEL_TO_KEY.items():
-        if lbl in l or l in lbl:
+    for lab, key in LABEL_TO_KEY.items():
+        if lab in l or l in lab:
             return key
     return None
 
+
 def find_values_in_text(text: str) -> Dict[str, Dict[str, Any]]:
-    """Scan text lines for analyte labels, values, units and optional reference ranges."""
     results: Dict[str, Dict[str, Any]] = {}
-    # split into lines but preserve table-like formats
-    lines = [ln.strip() for ln in re.split(r'\r\n|\n|\r', text) if ln.strip()]
+    # normalize whitespace; split lines
+    lines = [ln.strip() for ln in re.split(r'\n|\r', text) if ln.strip()]
+    # first pass: direct labelled matches
     for line in lines:
-        ln = line.strip()
-        ln_lower = ln.lower()
-        # label + value common pattern: "Hb 11.6 g/dL (ref: 12.4-16.7)"
-        m_generic = re.findall(r'([A-Za-z\%\.\-/ ]{2,30})\s*[:\s]\s*' + VALUE_RE + r'\s*' + UNIT_RE + r'(?:.*' + REF_RE + r')?', ln)
-        if m_generic:
-            for grp in m_generic:
-                label_raw = grp[0].strip()
-                val = grp[1]
-                unit = grp[2].strip() if grp[2] else None
-                ref = grp[3].strip() if len(grp) > 3 and grp[3] else None
-                key = find_key_for_label(label_raw)
-                if key:
-                    try:
-                        v = float(val)
-                    except:
-                        try:
-                            v = float(val.replace(",", "."))
-                        except:
-                            v = None
-                    results.setdefault(key, {})['value'] = v
-                    if unit:
-                        results.setdefault(key, {})['unit'] = unit
-                    if ref:
-                        results.setdefault(key, {})['ref'] = ref
-                    results.setdefault(key, {})['raw_line'] = ln
-        # direct lookups for known labels
+        ln = line.lower()
         for label, key in LABEL_TO_KEY.items():
-            if label in ln_lower:
-                # find number following label
-                pat = re.compile(re.escape(label) + r'.{0,25}?(' + VALUE_RE + r')', re.IGNORECASE)
-                mm = pat.search(ln_lower)
-                if mm:
-                    raw_val = mm.group(1)
-                    try:
-                        val = float(raw_val)
-                    except:
-                        try:
-                            val = float(raw_val.replace(",", "."))
-                        except:
-                            val = None
-                    unit_match = re.search(r'(' + UNIT_RE + r')', ln)
-                    unit = unit_match.group(1).strip() if unit_match else None
+            if label in ln:
+                # search for numeric near label
+                # allow formats like "Hb 11.6 g/dL (ref: 12.4-16.7)" or "HB: 11.6"
+                # build generic pattern allowing optional units and refs
+                try:
+                    pat = re.compile(rf'{re.escape(label)}[^\d\n\r\-]{{0,25}}({VALUE_RE})', flags=re.IGNORECASE)
+                    m = pat.search(line)
+                    if m:
+                        val = float(m.group(1))
+                        unit_m = re.search(rf'{re.escape(label)}[^\d\n\r]*{VALUE_RE}\s*({UNIT_RE})', line, flags=re.IGNORECASE)
+                        unit = unit_m.group(1).strip() if unit_m else None
+                        results.setdefault(key, {})['value'] = val
+                        if unit:
+                            results.setdefault(key, {})['unit'] = unit
+                        results.setdefault(key, {})['raw_line'] = line
+                        continue
+                except Exception:
+                    pass
+        # generic label + value extraction fallback
+        gen = re.findall(rf'([A-Za-z\-/ ]{{2,30}})\s*[:\-]?\s*{VALUE_RE}\s*{UNIT_RE}', line)
+        for g in gen:
+            label_raw = g[0].strip()
+            val_s = g[1]
+            unit = g[2].strip() if g[2] else None
+            key = find_key_for_label(label_raw)
+            if key:
+                try:
+                    val = float(val_s)
                     results.setdefault(key, {})['value'] = val
                     if unit:
                         results.setdefault(key, {})['unit'] = unit
-                    results.setdefault(key, {})['raw_line'] = ln
-    # special parsing for neutrophils percentages and absolute x10^9/L forms
+                    results.setdefault(key, {})['raw_line'] = line
+                except:
+                    continue
+
+    # second pass: special handling for percentages and neutrophil absolute
     for line in lines:
-        if 'neutrophil' in line.lower():
-            p = re.search(r'([0-9]{1,3}(?:\.\d+)?)\s*%', line)
+        ln = line.lower()
+        if 'neutrophil' in ln:
+            p = re.search(r'([0-9]{1,3}\.\d+|[0-9]{1,3})\s*%+', line)
             if p:
                 try:
                     results.setdefault('neutrophils_pc', {})['value'] = float(p.group(1))
                 except:
                     pass
-            abs_match = re.search(r'([0-9]{1,3}\.\d{1,3})\s*(?:x10\^?\d?\/?L|x10\^?9\/L|x10\^?9\/L|10\^9\/L|/L)', line)
-            if abs_match:
+            # absolute like "17.08 x10^9/L" or "17.08 x10^9/L"
+            a = re.search(r'([0-9]{1,3}\.\d+)\s*x\s*10\^?\d?\/?l', line, flags=re.IGNORECASE)
+            if a:
                 try:
-                    results.setdefault('neutrophils_abs', {})['value'] = float(abs_match.group(1))
+                    results.setdefault('neutrophils_abs', {})['value'] = float(a.group(1))
                 except:
                     pass
-    # fallback: simple Hb patterns anywhere
-    fallback = re.search(r'\b(hb|haemoglobin|hemoglobin)\b[^\d\n\r]{0,20}(' + VALUE_RE + r')', text, re.IGNORECASE)
-    if fallback:
+            # simpler absolute numeric
+            a2 = re.search(r'([0-9]{1,3}\.\d+)\s*/?L', line, flags=re.IGNORECASE)
+            if a2 and 'neutrophil' in ln and 'x' not in line:
+                try:
+                    results.setdefault('neutrophils_abs', {})['value'] = float(a2.group(1))
+                except:
+                    pass
+
+    # fallback: search for Hb explicitly anywhere
+    fh = re.findall(r'\b(hb|haemoglobin|haemoglobin)\b[^\d\n\r]{0,20}('+VALUE_RE+')', text, flags=re.IGNORECASE)
+    for m in fh:
         try:
-            results.setdefault('hb', {})['value'] = float(fallback.group(2))
+            results.setdefault('hb', {})['value'] = float(m[1])
         except:
             pass
 
     return results
 
+
 # ---------- Canonical mapping ----------
 
-CANONICAL_KEYS = [
-    "Hb","RBC","HCT","MCV","MCH","MCHC","RDW","WBC","Neutrophils","Lymphocytes","Monocytes","Eosinophils","Basophils",
-    "NLR","Platelets","Creatinine","CRP","Sodium","Potassium","Chloride","Urea","CK","ALT","AST","Ferritin"
-]
+CANONICAL_KEYS = ['Hb', 'MCV', 'MCH', 'MCHC', 'RDW', 'WBC', 'Neutrophils', 'Lymphocytes', 'Monocytes', 'Eosinophils', 'Basophils', 'NLR', 'Platelets', 'Creatinine', 'CRP', 'Sodium', 'Potassium', 'Chloride', 'Urea', 'RBC', 'HCT', 'ALT', 'AST', 'CK']
 
 def canonical_map(parsed: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    map_rules = {
-        "hb":"Hb","rbc":"RBC","hct":"HCT","mcv":"MCV","mch":"MCH","mchc":"MCHC","rdw":"RDW",
-        "wbc":"WBC","neutrophils_pc":"Neutrophils","neutrophils_abs":"Neutrophils",
-        "lymphocytes_pc":"Lymphocytes","monocytes_pc":"Monocytes","eosinophils_pc":"Eosinophils",
-        "basophils_pc":"Basophils","platelets":"Platelets","creatinine":"Creatinine","crp":"CRP",
-        "sodium":"Sodium","potassium":"Potassium","chloride":"Chloride","urea":"Urea","ck":"CK",
-        "alt":"ALT","ast":"AST","ferritin":"Ferritin"
-    }
     out: Dict[str, Dict[str, Any]] = {}
+    map_rules = {
+        'hb': 'Hb',
+        'mcv': 'MCV',
+        'mch': 'MCH',
+        'mchc': 'MCHC',
+        'rdw': 'RDW',
+        'wbc': 'WBC',
+        'neutrophils_pc': 'Neutrophils',
+        'neutrophils_abs': 'Neutrophils',
+        'lymphocytes_pc': 'Lymphocytes',
+        'monocytes_pc': 'Monocytes',
+        'eosinophils_pc': 'Eosinophils',
+        'basophils_pc': 'Basophils',
+        'platelets': 'Platelets',
+        'creatinine': 'Creatinine',
+        'crp': 'CRP',
+        'sodium': 'Sodium',
+        'potassium': 'Potassium',
+        'chloride': 'Chloride',
+        'urea': 'Urea',
+        'rbc': 'RBC',
+        'hct': 'HCT',
+        'alt': 'ALT',
+        'ast': 'AST',
+        'ck': 'CK',
+    }
     for k, v in parsed.items():
         if k in map_rules:
             canon = map_rules[k]
             out.setdefault(canon, {})
-            # prefer numeric conversions
             try:
-                out[canon]['value'] = float(v.get('value')) if v.get('value') is not None else None
-            except:
+                out[canon]['value'] = float(v.get('value'))
+            except Exception:
                 out[canon]['value'] = None
             if v.get('unit'):
                 out[canon]['unit'] = v.get('unit')
+            if v.get('raw_line'):
+                out[canon]['raw'] = v.get('raw_line')
             if v.get('ref'):
                 out[canon]['ref'] = v.get('ref')
-            out[canon]['raw'] = v.get('raw_line')
-    # calculate NLR if percentages or absolute values available
+
+    # compute NLR if percentages or absolute provided
     try:
-        neut = out.get('Neutrophils', {}).get('value')
-        lymph = out.get('Lymphocytes', {}).get('value')
-        if neut is not None and lymph is not None and lymph != 0:
-            out['NLR'] = {'value': round(float(neut) / float(lymph), 2), 'unit': None}
+        n = out.get('Neutrophils', {}).get('value')
+        l = out.get('Lymphocytes', {}).get('value')
+        if n is not None and l is not None and l != 0:
+            out['NLR'] = {'value': round(float(n) / float(l), 2)}
     except Exception:
         pass
+
     return out
 
-# ---------- Route Engine V5: rules, routes, ddx, next steps, severity ----------
 
-# severity map: 1 green / 2 yellow / 3 orange / 4 red / 5 deep red (critical)
-SEVERITY_MAP = {
-    1: {"label":"LOW","color":"#10B981","tw":"bg-green-500","urgency":"low"},
-    2: {"label":"BORDERLINE","color":"#FACC15","tw":"bg-yellow-300","urgency":"low"},
-    3: {"label":"MEDIUM","color":"#F59E0B","tw":"bg-orange-400","urgency":"medium"},
-    4: {"label":"HIGH","color":"#F97316","tw":"bg-orange-600","urgency":"high"},
-    5: {"label":"CRITICAL","color":"#B91C1C","tw":"bg-red-700","urgency":"high"},
+# ---------- Route Engine V4 (rules, routes, ddx, severity) ----------
+
+# severity color map: 1 green, 2 yellow, 3 orange, 4 red, 5 deep red
+COLOR_MAP = {
+    5: {'label': 'critical', 'color': '#b91c1c', 'tw': 'bg-red-700', 'urgency': 'high'},
+    4: {'label': 'high', 'color': '#ef4444', 'tw': 'bg-red-500', 'urgency': 'high'},
+    3: {'label': 'moderate', 'color': '#f59e0b', 'tw': 'bg-yellow-400', 'urgency': 'medium'},
+    2: {'label': 'borderline', 'color': '#facc15', 'tw': 'bg-yellow-300', 'urgency': 'low'},
+    1: {'label': 'normal', 'color': '#10b981', 'tw': 'bg-green-500', 'urgency': 'low'},
 }
 
 def age_group_from_age(age: Optional[float]) -> str:
+    if age is None:
+        return 'adult'
     try:
-        if age is None:
-            return "adult"
         a = float(age)
-        if a < (1/12):
-            return "neonate"
-        if a < 1:
-            return "infant"
-        if a < 13:
-            return "child"
-        if a < 18:
-            return "teen"
-        if a < 65:
-            return "adult"
-        return "elderly"
     except:
-        return "adult"
+        return 'adult'
+    if a < (1/12):
+        return 'neonate'
+    if a < 1:
+        return 'infant'
+    if a < 13:
+        return 'child'
+    if a < 18:
+        return 'teen'
+    if a < 65:
+        return 'adult'
+    return 'elderly'
+
 
 def score_severity_for_abnormality(key: str, value: Optional[float], age_group: str, sex: str) -> int:
-    """Heuristic severity scoring for individual analytes"""
+    """Heuristic severity scoring."""
     if value is None:
         return 1
     try:
         v = float(value)
     except:
         return 1
-    # Hb
-    if key == "Hb":
-        low_cut = 13.0 if sex and sex.lower() == "male" else 12.0
-        if age_group in ["child","infant","neonate"]:
-            # use pediatric heuristics (simplified)
-            if v < 8:
-                return 5
-            if v < 10:
-                return 4
-            if v < low_cut:
-                return 3
-            return 1
-        if v < low_cut - 4:
-            return 5
-        if v < low_cut - 2:
-            return 4
-        if v < low_cut:
-            return 3
-        return 1
-    # WBC
-    if key == "WBC":
-        if v > 30:
-            return 5
-        if v > 20:
-            return 4
-        if v > 11:
-            return 3
-        if v < 3:
-            return 3
-        return 1
-    # CRP
-    if key == "CRP":
-        if v > 200:
-            return 5
-        if v > 100:
-            return 4
-        if v > 50:
-            return 3
-        if v > 10:
-            return 2
-        return 1
-    # Platelets
-    if key == "Platelets":
-        if v < 10:
-            return 5
-        if v < 50:
-            return 4
-        if v < 100:
-            return 3
-        if v > 1000:
-            return 4
-        return 1
-    # Creatinine (very rough: adult μmol/L)
-    if key == "Creatinine":
-        if v > 400:
-            return 5
-        if v > 250:
-            return 4
-        if v > 120:
-            return 3
-        return 1
-    # CK (rhabdomyolysis)
-    if key == "CK":
-        if v > 10000:
-            return 5
-        if v > 5000:
-            return 4
-        if v > 1000:
-            return 3
-        return 1
-    # Sodium
-    if key == "Sodium":
-        if v < 120 or v > 160:
-            return 5
-        if v < 125 or v > 155:
-            return 4
-        if v < 130 or v > 150:
-            return 3
-        return 1
-    return 1
 
-def route_engine_v5(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[str, Any], previous: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    Produce patterns, routes, next_steps, ddx, severity and urgency.
-    This is intentionally explicit and medical-minded (heuristics).
-    """
-    age = patient_meta.get("age")
-    sex = (patient_meta.get("sex") or "unknown").lower()
+    score = 1
+    key_l = key.lower()
+    if key_l == 'hb':
+        # sex-aware thresholds
+        low_cut = 12.0 if sex.lower() == 'female' else 13.0
+        if age_group in ['neonate','infant']:
+            low_cut = 14.0
+        if v < low_cut - 4:
+            score = 5
+        elif v < low_cut - 2:
+            score = 4
+        elif v < low_cut:
+            score = 3
+    elif key_l == 'wbc':
+        if v > 30:
+            score = 5
+        elif v > 20:
+            score = 4
+        elif v > 11:
+            score = 3
+    elif key_l == 'crp':
+        if v > 200:
+            score = 5
+        elif v > 100:
+            score = 4
+        elif v > 50:
+            score = 3
+        elif v > 10:
+            score = 2
+    elif key_l == 'neutrophils' or key_l == 'nlr':
+        # high NLR or neutrophilia -> significant
+        if v > 10:
+            score = 5
+        elif v > 6:
+            score = 4
+        elif v > 3:
+            score = 3
+    elif key_l == 'creatinine':
+        if v > 400:
+            score = 5
+        elif v > 200:
+            score = 4
+        elif v > 120:
+            score = 3
+    elif key_l == 'platelets':
+        if v < 10:
+            score = 5
+        elif v < 30:
+            score = 4
+        elif v < 100:
+            score = 3
+    elif key_l in ['sodium', 'potassium']:
+        # severe electrolyte derangement
+        if key_l == 'sodium':
+            if v < 120 or v > 160:
+                score = 5
+            elif v < 125 or v > 155:
+                score = 4
+            elif v < 130 or v > 150:
+                score = 3
+        if key_l == 'potassium':
+            if v < 2.8 or v > 6.5:
+                score = 5
+            elif v < 3.2 or v > 6.0:
+                score = 4
+            elif v < 3.5 or v > 5.5:
+                score = 3
+    else:
+        score = 1
+    return score
+
+
+def route_engine_v4(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[str, Any], previous: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    age = patient_meta.get('age')
+    sex = patient_meta.get('sex', 'unknown')
     ag = age_group_from_age(age)
 
     patterns = []
     routes = []
     next_steps = []
     ddx = []
-    scores = []
-    urgency_levels = []
+    severity_scores = []
 
-    def add_pattern(name: str, reason: str, score: int):
-        patterns.append({"pattern": name, "reason": reason})
-        scores.append(score)
+    def add_find(name, reason, score):
+        patterns.append({'pattern': name, 'reason': reason})
+        severity_scores.append(score)
 
-    # Helper to append ddx unique
-    def add_ddx(items: List[str]):
-        for it in items:
-            if it not in ddx:
-                ddx.append(it)
+    # pull canonical values
+    hb = canonical.get('Hb', {}).get('value')
+    mcv = canonical.get('MCV', {}).get('value')
+    mch = canonical.get('MCH', {}).get('value')
+    rdw = canonical.get('RDW', {}).get('value')
+    wbc = canonical.get('WBC', {}).get('value')
+    crp = canonical.get('CRP', {}).get('value')
+    neut = canonical.get('Neutrophils', {}).get('value')
+    nlr = canonical.get('NLR', {}).get('value')
+    plate = canonical.get('Platelets', {}).get('value')
+    creat = canonical.get('Creatinine', {}).get('value')
+    sodium = canonical.get('Sodium', {}).get('value')
+    alt = canonical.get('ALT', {}).get('value')
+    ast = canonical.get('AST', {}).get('value')
+    ck = canonical.get('CK', {}).get('value')
 
-    # Hb / anemia
-    hb = canonical.get("Hb", {}).get("value")
-    mcv = canonical.get("MCV", {}).get("value")
-    mch = canonical.get("MCH", {}).get("value")
-    rdw = canonical.get("RDW", {}).get("value")
-    wbc = canonical.get("WBC", {}).get("value")
-    crp = canonical.get("CRP", {}).get("value")
-    plate = canonical.get("Platelets", {}).get("value")
-    creat = canonical.get("Creatinine", {}).get("value")
-    nlr = canonical.get("NLR", {}).get("value")
-    sodium = canonical.get("Sodium", {}).get("value")
-    ck = canonical.get("CK", {}).get("value")
-    ferritin = canonical.get("Ferritin", {}).get("value")
-
-    # anemia detection & microcytic algorithm
+    # ANEMIA
     if hb is not None:
-        score = score_severity_for_abnormality("Hb", hb, ag, sex)
-        if score > 1:
-            add_pattern("anemia", f"Hb {hb} g/dL", score)
-            # microcytic path
+        hb_score = score_severity_for_abnormality('Hb', hb, ag, sex)
+        if hb_score > 1:
+            add_find('anemia', f'Hb {hb} g/dL', hb_score)
+            # microcytic
             if mcv is not None and mcv < 80:
-                add_pattern("microcytic anemia", f"MCV {mcv} fL", max(score,3))
-                routes.append("Iron Deficiency Route")
-                add_ddx(["Iron deficiency anemia", "Thalassemia trait", "Chronic blood loss"])
-                next_steps.append("Order ferritin and reticulocyte count; check for blood loss (stool/menstrual history)")
-                # Ferritin route explicit
-                if ferritin is not None:
-                    if ferritin < 30:
-                        add_pattern("low ferritin", f"Ferritin {ferritin} ng/mL", 4)
-                        next_steps.append("Treat or investigate iron deficiency urgently")
-                else:
-                    next_steps.append("If ferritin not available: order ferritin (essential for microcytic workup)")
+                add_find('microcytic anemia', f'MCV {mcv} fL', max(3, hb_score))
+                routes.append('Iron deficiency route (Ferritin + reticulocyte)')
+                ddx.extend(['Iron deficiency anemia', 'Thalassaemia trait', 'Chronic blood loss'])
+                next_steps.append('Order ferritin, reticulocyte count, and peripheral smear. Consider stool occult blood if adult.')
             elif mcv is not None and mcv > 100:
-                add_pattern("macrocytic anemia", f"MCV {mcv} fL", max(score,3))
-                routes.append("Macrocytic Route")
-                add_ddx(["Vitamin B12 deficiency", "Folate deficiency", "Alcohol-related","Myelodysplasia"])
-                next_steps.append("Order B12, folate, reticulocyte count; review meds and alcohol use")
+                add_find('macrocytic anemia', f'MCV {mcv} fL', max(3, hb_score))
+                routes.append('Macrocytic route (B12/folate)')
+                ddx.extend(['Vitamin B12 deficiency', 'Folate deficiency', 'Alcohol-related'])
+                next_steps.append('Order B12 and folate; review meds.')
             else:
-                add_pattern("normocytic anemia", "MCV normal or missing", max(2, score))
-                routes.append("Normocytic Route")
-                add_ddx(["Acute blood loss", "Hemolysis", "Anaemia of chronic disease"])
-                next_steps.append("Order reticulocyte, LDH, peripheral smear; consider inflammation-driven anaemia")
+                add_find('normocytic anemia', 'MCV normal or missing', max(2, hb_score))
+                routes.append('Normocytic anemia route')
+                ddx.extend(['Acute blood loss', 'Hemolysis', 'Anaemia of inflammation'])
+                next_steps.append('Order reticulocyte count, LDH, peripheral smear.')
 
-    # Infection / inflammation / sepsis suspicion
-    if wbc is not None:
-        wscore = score_severity_for_abnormality("WBC", wbc, ag, sex)
-        if wscore > 1:
-            add_pattern("leukocytosis", f"WBC {wbc} x10^9/L", wscore)
-            routes.append("Leukocytosis Route")
-            add_ddx(["Bacterial infection", "Acute inflammation", "Stress/trauma"])
-            # if neutrophilic predominance (we may have absolute or percent)
-            neut = canonical.get("Neutrophils", {}).get("value")
-            if neut is not None:
-                try:
-                    n = float(neut)
-                    # if percent
-                    if n > 70:
-                        add_pattern("neutrophilic predominance", f"Neutrophils {n}%", max(3, wscore))
-                        routes.append("Bacterial infection route")
-                        next_steps.append("Assess clinically for source; consider sepsis workup if unwell; blood cultures if febrile")
-                except:
-                    pass
-    # CRP
-    if crp is not None:
-        cscore = score_severity_for_abnormality("CRP", crp, ag, sex)
-        if cscore > 1:
-            add_pattern("elevated inflammatory marker", f"CRP {crp} mg/L", cscore)
-            routes.append("Inflammation Route")
-            add_ddx(["Bacterial infection","Severe inflammatory state"])
-            if crp > 50:
-                next_steps.append("Consider urgent clinical review and sepsis pathway if symptomatic")
+    # INFECTION / INFLAMMATION
+    if wbc is not None and wbc > 11:
+        wbc_score = score_severity_for_abnormality('WBC', wbc, ag, sex)
+        add_find('leukocytosis', f'WBC {wbc} x10^9/L', wbc_score)
+        if neut is not None and neut > 70:
+            add_find('neutrophilic predominance', f'Neutrophils {neut}%', max(3, wbc_score))
+            routes.append('Bacterial infection / Sepsis route')
+            ddx.extend(['Bacterial infection', 'Sepsis', 'Acute inflammation'])
+            next_steps.append('Clinical assessment for sepsis; consider blood cultures, IV fluids, empiric antibiotics if unstable.')
 
-    # NLR high -> amplify suspicion
+    if crp is not None and crp > 10:
+        crp_score = score_severity_for_abnormality('CRP', crp, ag, sex)
+        add_find('elevated CRP', f'CRP {crp} mg/L', crp_score)
+        if crp > 50:
+            routes.append('Significant inflammatory response')
+            ddx.extend(['Severe infection', 'Inflammatory disease'])
+            next_steps.append('Consider urgent review; blood cultures if febrile; procalcitonin if available.')
+
+    # NLR
     if nlr is not None:
-        try:
-            nlr_v = float(nlr)
-            if nlr_v > 10:
-                add_pattern("very high NLR", f"NLR {nlr_v}", 5)
-                routes.append("High NLR (sepsis) Route")
-                add_ddx(["Severe bacterial infection","Critical inflammatory response"])
-                next_steps.append("High suspicion for severe bacterial infection or sepsis; urgent clinical assessment")
-            elif nlr_v > 5:
-                add_pattern("high NLR", f"NLR {nlr_v}", 4)
-                routes.append("High NLR Route")
-                next_steps.append("Consider bacterial infection; clinical correlation required")
-        except:
-            pass
+        if nlr > 10:
+            add_find('very high NLR', f'NLR {nlr}', 5)
+            routes.append('High NLR / Sepsis route')
+            next_steps.append('Urgent clinical review for sepsis; consider admission and sepsis pathway.')
+        elif nlr > 5:
+            add_find('high NLR', f'NLR {nlr}', 4)
+            routes.append('High NLR route')
+            next_steps.append('Assess severity and source of infection.')
 
-    # Platelets
+    # PLATELETS
     if plate is not None:
-        pscore = score_severity_for_abnormality("Platelets", plate, ag, sex)
+        pscore = score_severity_for_abnormality('Platelets', plate, ag, sex)
         if plate < 150:
-            add_pattern("thrombocytopenia", f"Platelets {plate} x10^9/L", pscore)
-            routes.append("Platelet: low route")
-            add_ddx(["Immune thrombocytopenia","DIC","Bone marrow suppression"])
-            next_steps.append("Check peripheral smear; repeat platelet count; evaluate bleeding risk")
+            add_find('thrombocytopenia', f'Platelets {plate}', pscore)
+            ddx.extend(['Immune thrombocytopenia', 'DIC', 'Bone marrow suppression'])
+            next_steps.append('Repeat platelet count; check smear; assess bleeding.')
         elif plate > 450:
-            add_pattern("thrombocytosis", f"Platelets {plate} x10^9/L", 2)
-            routes.append("Platelet: high route")
-            add_ddx(["Reactive thrombocytosis","Myeloproliferative disease"])
-            next_steps.append("Consider reactive causes; repeat and consider haematology referral if persistent")
+            add_find('thrombocytosis', f'Platelets {plate}', max(2, pscore))
+            next_steps.append('Consider reactive thrombocytosis; repeat and investigate inflammation/iron status.')
 
-    # Creatinine (renal)
+    # RENAL / AKI
     if creat is not None:
-        cscore = score_severity_for_abnormality("Creatinine", creat, ag, sex)
+        cscore = score_severity_for_abnormality('Creatinine', creat, ag, sex)
         if cscore >= 3:
-            add_pattern("elevated creatinine", f"Creatinine {creat} umol/L", cscore)
-            routes.append("Renal / AKI route")
-            add_ddx(["Acute kidney injury","Chronic kidney disease"])
-            next_steps.append("Assess urine output; review nephrotoxins; repeat creatinine urgently and check electrolytes")
+            add_find('elevated creatinine', f'Creatinine {creat} umol/L', cscore)
+            routes.append('AKI route')
+            ddx.extend(['Acute kidney injury', 'Chronic kidney disease'])
+            next_steps.append('Repeat creatinine urgently; check urine output and electrolytes; review meds.')
 
-    # CK / rhabdo
-    if ck is not None:
-        cks = score_severity_for_abnormality("CK", ck, ag, sex)
-        if cks >= 3:
-            add_pattern("elevated CK (rhabdomyolysis physiology)", f"CK {ck} U/L", cks)
-            routes.append("Rhabdomyolysis route")
-            add_ddx(["Acute muscle injury","Rhabdomyolysis"])
-            next_steps.append("Assess for muscle pain/urine changes; check creatinine, urine myoglobin; hydrate and monitor renal function")
+    # ELECTROLYTE & RHabdo
+    if ck is not None and ck > 1000:
+        add_find('rhabdomyolysis signal', f'CK {ck}', 4)
+        routes.append('Rhabdomyolysis route')
+        next_steps.append('Assess for muscle pain/urine colour; check creatinine and electrolytes; consider urgent fluids.')
 
-    # Sodium disturbances (neurologic risk)
-    if sodium is not None:
-        sscore = score_severity_for_abnormality("Sodium", sodium, ag, sex)
-        if sscore >= 3:
-            add_pattern("sodium disturbance", f"Na {sodium}", sscore)
-            routes.append("Electrolyte route")
-            next_steps.append("Assess neurologic status; correct sodium carefully; consider admission if severe")
+    # LIVER indicators
+    if (alt is not None and alt > 200) or (ast is not None and ast > 200):
+        add_find('transaminitis', f'ALT {alt} AST {ast}', 3)
+        routes.append('Hepatic route')
+        next_steps.append('Review hepatotoxins, viral hepatitis risk; consider LFT panel.')
 
-    # Combined patterns
+    # COMBINED PATTERNS
     if hb is not None and crp is not None and wbc is not None:
-        try:
-            if float(hb) < 12 and float(crp) > 20 and float(wbc) > 11:
-                add_pattern("anemia with inflammatory/infectious response", "Low Hb with high CRP and leukocytosis", 4)
-                routes.append("Inflammation-related anemia route")
-                next_steps.append("Treat source of infection; reassess Hb after infection controlled; do ferritin when CRP falls")
-        except:
-            pass
+        if hb < 12 and crp > 20 and wbc > 11:
+            add_find('anemia with inflammatory/infective response', 'Low Hb + high CRP + leukocytosis', 4)
+            routes.append('Infection with anemia route')
+            next_steps.append('Treat source of infection; reassess Hb after control; do ferritin when CRP falls.')
 
-    # Age/sex notes
-    age_note = ""
-    if ag == "teen" and sex == "female":
-        age_note = "Teenage female — consider menstrual blood loss and iron deficiency as high-likelihood causes."
-        next_steps.append("Assess menstrual history; consider urgent ferritin + reticulocyte count")
-    elif ag == "elderly":
-        age_note = "Elderly patient — broaden differential to include chronic disease and possible malignancy."
+    # AGE / SEX modifiers
+    if ag == 'teen' and sex.lower() == 'female':
+        # teenage female — high likelihood of menstrual blood loss causing microcytic anemia
+        next_steps.append('Assess menstrual history; consider urgent ferritin and reticulocyte count.')
 
-    combined_score = max(scores) if scores else 1
-    color_entry = SEVERITY_MAP.get(combined_score, SEVERITY_MAP[1])
-    urgency_flag = color_entry["urgency"]
+    combined_score = max(severity_scores) if severity_scores else 1
+    color_entry = COLOR_MAP.get(combined_score, COLOR_MAP[1])
+    urgency = color_entry['urgency']
 
-    # Build succinct summary lines
+    # build human-friendly summary
     summary_lines = []
     if patterns:
-        summary_lines.append("Patterns: " + "; ".join([f"{p['pattern']}" for p in patterns]))
+        summary_lines.append('Patterns: ' + '; '.join([p['pattern'] for p in patterns]))
     if routes:
-        summary_lines.append("Primary routes: " + "; ".join(routes))
+        summary_lines.append('Primary routes: ' + '; '.join(routes))
     if ddx:
-        summary_lines.append("Top differentials: " + ", ".join(ddx))
+        summary_lines.append('Top differential diagnoses: ' + ', '.join(dict.fromkeys(ddx)))
     if next_steps:
-        summary_lines.append("Immediate actions: " + " | ".join(next_steps))
+        summary_lines.append('Immediate suggested actions: ' + ' | '.join(next_steps))
+
+    age_note = ''
+    if ag == 'teen' and sex.lower() == 'female':
+        age_note = 'Teenage female — consider menstrual blood loss and iron deficiency.'
+    elif ag == 'elderly':
+        age_note = 'Elderly – broaden differential for chronic disease and malignancy.'
 
     final = {
-        "patterns": patterns,
-        "routes": routes,
-        "next_steps": next_steps,
-        "differential": ddx,
-        "severity_score": combined_score,
-        "urgency_flag": urgency_flag,
-        "color": color_entry["color"],
-        "tw_class": color_entry["tw"],
-        "age_group": ag,
-        "age_note": age_note,
-        "summary": "\n".join(summary_lines[:8]) if summary_lines else "No significant abnormalities detected."
+        'patterns': patterns,
+        'routes': routes,
+        'next_steps': next_steps,
+        'differential': list(dict.fromkeys(ddx)),
+        'severity_score': combined_score,
+        'urgency_flag': urgency,
+        'color': color_entry['color'],
+        'tw_class': color_entry['tw'],
+        'age_group': ag,
+        'age_note': age_note,
+        'summary': '\n'.join(summary_lines[:10]) if summary_lines else 'No significant abnormalities detected.'
     }
     return final
+
 
 # ---------- Trend analysis ----------
 
 def trend_analysis(current: Dict[str, Dict[str, Any]], previous: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not previous:
-        return {"trend": "no_previous"}
+        return {'trend': 'no_previous'}
     diffs = {}
     for k, v in current.items():
-        prev_val = previous.get("canonical", {}).get(k, {}).get("value") if previous else None
-        cur_val = v.get("value")
+        prev_val = None
+        if isinstance(previous, dict):
+            prev_val = previous.get(k, {}).get('value')
+        cur_val = v.get('value')
         if prev_val is None or cur_val is None:
             continue
         try:
             delta = cur_val - prev_val
             pct = (delta / prev_val) * 100 if prev_val != 0 else None
-            diffs[k] = {"previous": prev_val, "current": cur_val, "delta": delta, "pct_change": pct}
+            diffs[k] = {'previous': prev_val, 'current': cur_val, 'delta': delta, 'pct_change': pct}
         except Exception:
             pass
-    return {"trend": diffs}
+    return {'trend': diffs}
 
-# ---------- Supabase save helper ----------
+
+# ---------- Supabase update ----------
 
 def save_ai_results_to_supabase(report_id: str, ai_results: Dict[str, Any]) -> None:
     if not supabase:
-        logger.warning("Supabase not configured; skipping save")
+        logger.warning("Supabase client not available; skipping save.")
         return
     try:
-        payload = {"ai_status": "completed", "ai_results": ai_results, "ai_error": None}
-        res = supabase.table(SUPABASE_TABLE).update(payload).eq("id", report_id).execute()
-        logger.info("Saved ai_results for %s", report_id)
-    except Exception:
-        logger.exception("Failed to save ai_results for %s", report_id)
-
-# ---------- Core processing ----------
-
-def process_report(record: Dict[str, Any]) -> Dict[str, Any]:
-    report_id = record.get("id") or record.get("report_id")
-    logger.info("Processing report %s (path=%s)", report_id, record.get("file_path"))
-    try:
-        pdf_bytes = download_pdf_bytes_from_record(record)
+        payload = {'ai_status': 'completed', 'ai_results': ai_results, 'ai_error': None}
+        res = supabase.table(SUPABASE_TABLE).update(payload).eq('id', report_id).execute()
+        logger.info("Saved ai_results for report %s", report_id)
     except Exception as e:
-        logger.exception("Download error: %s", e)
+        logger.exception("Failed to save ai_results: %s", e)
+
+
+# ---------- Full processing ----------
+
+def process_report(record: Dict[str, Any]) -> None:
+    report_id = record.get('id') or record.get('report_id') or '<unknown>'
+    logger.info("Processing report %s", report_id)
+    try:
+        pdf_bytes = download_pdf_from_record(record)
+    except Exception as e:
+        logger.exception("Failed to download PDF: %s", e)
         if supabase:
-            supabase.table(SUPABASE_TABLE).update({"ai_status": "failed", "ai_error": str(e)}).eq("id", report_id).execute()
-        return {"error": str(e)}
+            supabase.table(SUPABASE_TABLE).update({'ai_status': 'failed', 'ai_error': str(e)}).eq('id', report_id).execute()
+        return
 
-    # Extract digital text first
-    pdf_text = extract_text_from_pdf_bytes(pdf_bytes)
-    scanned = is_scanned_pdf_by_text(pdf_text)
-    logger.info("Report %s scanned=%s (extracted_text_len=%d)", report_id, scanned, len(pdf_text or ""))
-
-    if scanned:
-        # Run OCR (local preferred)
-        try:
-            ocr_text = do_ocr_on_pdf(pdf_bytes)
-            merged_text = ocr_text or ""
-            logger.info("OCR produced %d chars", len(merged_text))
-        except Exception as e:
-            logger.exception("OCR failed: %s", e)
-            merged_text = ""
+    scanned = is_scanned_pdf(pdf_bytes)
+    if not scanned:
+        text = extract_text_with_pypdf(pdf_bytes)
     else:
-        # Use digital text
-        merged_text = pdf_text or ""
+        if not HAS_PYTESSERACT:
+            err = "Detected scanned PDF but pytesseract not available."
+            logger.error(err)
+            if supabase:
+                supabase.table(SUPABASE_TABLE).update({'ai_status': 'failed', 'ai_error': err}).eq('id', report_id).execute()
+            return
+        text = do_ocr_on_pdf(pdf_bytes)
 
-    # If still empty, mark failure
-    if not merged_text.strip():
-        err = "No text extracted after OCR and PDF extraction"
-        logger.warning(err)
-        if supabase:
-            supabase.table(SUPABASE_TABLE).update({"ai_status":"failed", "ai_error": err}).eq("id", report_id).execute()
-        return {"error": err}
-
-    # Parse values
-    parsed = find_values_in_text(merged_text)
+    # parse
+    parsed = find_values_in_text(text)
     canonical = canonical_map(parsed)
 
-    # Fetch previous ai_results for trend analysis (by patient_id)
+    # fetch previous results (latest by patient_id) for trend
     previous = None
-    try:
-        if supabase and record.get("patient_id"):
-            q = supabase.table(SUPABASE_TABLE).select("ai_results").eq("patient_id", record.get("patient_id")).order("created_at", desc=True).limit(1).execute()
-            rows = q.data if hasattr(q, "data") else q
-            if rows:
-                previous = rows[0].get("ai_results")
-    except Exception:
-        logger.debug("Failed to fetch previous results", exc_info=True)
+    if supabase:
+        try:
+            pid = record.get('patient_id')
+            if pid:
+                prev_q = supabase.table(SUPABASE_TABLE).select('ai_results').eq('patient_id', pid).order('created_at', desc=True).limit(1).execute()
+                rows = prev_q.data if hasattr(prev_q, 'data') else prev_q
+                if rows:
+                    previous = rows[0].get('ai_results')
+        except Exception as e:
+            logger.debug("Failed fetch previous: %s", e)
 
     trends = trend_analysis(canonical, previous)
 
-    # Run route engine
-    patient_meta = {"age": record.get("age"), "sex": record.get("sex")}
-    routes = route_engine_v5(canonical, patient_meta, previous)
-
-    # Decorated flags per analyte
-    decorated = {}
-    for key, meta in canonical.items():
-        val = meta.get("value")
-        score = score_severity_for_abnormality(key, val, age_group_from_age(record.get("age")), record.get("sex", "unknown"))
-        cmap = SEVERITY_MAP.get(score, SEVERITY_MAP[1])
-        decorated[key] = {"raw": meta, "decorated": {"severity": score, "urgency": cmap["urgency"], "color": cmap["color"], "tw_class": cmap["tw"]}}
+    patient_meta = {'age': record.get('age'), 'sex': record.get('sex', 'unknown')}
+    routes = route_engine_v4(canonical, patient_meta, previous)
 
     ai_results = {
-        "canonical": canonical,
-        "parsed": parsed,
-        "routes": routes,
-        "trends": trends,
-        "decorated": decorated,
-        "raw_text_excerpt": merged_text[:4000],
-        "scanned": scanned,
-        "processed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        'canonical': canonical,
+        'parsed': parsed,
+        'routes': routes,
+        'trends': trends,
+        'raw_text_excerpt': text[:5000],
+        'scanned': scanned,
+        'processed_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
     }
+
+    # add per-key decorated flags
+    decorated = {}
+    for key, val in canonical.items():
+        value = val.get('value')
+        score = score_severity_for_abnormality(key, value, age_group_from_age(record.get('age')), record.get('sex', 'unknown'))
+        cmap = COLOR_MAP.get(score, COLOR_MAP[1])
+        decorated[key] = {
+            'raw': val,
+            'decorated': {
+                'severity': score,
+                'urgency': cmap['urgency'],
+                'color': cmap['color'],
+                'tw_class': cmap['tw']
+            }
+        }
+    ai_results['decorated'] = decorated
 
     try:
         save_ai_results_to_supabase(report_id, ai_results)
-    except Exception:
-        logger.exception("Save failed for %s", report_id)
+    except Exception as e:
+        logger.exception("Failed to save results: %s", e)
 
-    logger.info("✅ Report %s processed successfully", report_id)
-    return {"success": True, "data": ai_results}
 
 # ---------- Poll loop ----------
 
-def poll_and_process_once(limit: int = 5) -> None:
+def poll_and_process():
     if not supabase:
-        logger.error("Supabase client not available - poll loop not started")
+        logger.error("Supabase client not configured. Exiting.")
         return
-    logger.info("AMI Worker V5 polling for pending reports...")
-    try:
-        res = supabase.table(SUPABASE_TABLE).select("*").eq("ai_status","pending").limit(limit).execute()
-        rows = res.data if hasattr(res, "data") else res
-        if not rows:
-            logger.debug("No pending reports")
-            return
-        for r in rows:
-            try:
-                rid = r.get("id")
-                logger.info("Found job: %s", rid)
-                # mark processing
-                supabase.table(SUPABASE_TABLE).update({"ai_status":"processing"}).eq("id", rid).execute()
-                process_report(r)
-            except Exception:
-                logger.exception("Failed processing record %s", r.get("id"))
-    except Exception:
-        logger.exception("Polling error")
-
-def main_loop():
-    if not supabase:
-        logger.error("Supabase not configured - exiting")
-        return
-    logger.info("Starting poll loop (interval %ds)", POLL_INTERVAL)
+    logger.info("Starting poll loop (interval %ds) table=%s", POLL_INTERVAL, SUPABASE_TABLE)
     while True:
         try:
-            poll_and_process_once(limit=5)
-        except Exception:
-            logger.exception("Unexpected loop error")
+            res = supabase.table(SUPABASE_TABLE).select('*').eq('ai_status', 'pending').limit(10).execute()
+            rows = res.data if hasattr(res, 'data') else res
+            if rows:
+                for r in rows:
+                    try:
+                        # mark processing
+                        supabase.table(SUPABASE_TABLE).update({'ai_status': 'processing'}).eq('id', r.get('id')).execute()
+                        process_report(r)
+                    except Exception as e:
+                        logger.exception("Record processing failed %s: %s", r.get('id'), e)
+                        try:
+                            supabase.table(SUPABASE_TABLE).update({'ai_status': 'failed', 'ai_error': str(e)}).eq('id', r.get('id')).execute()
+                        except:
+                            pass
+            else:
+                logger.debug("No pending reports.")
+        except Exception as e:
+            logger.exception("Polling error: %s", e)
         time.sleep(POLL_INTERVAL)
 
-if __name__ == "__main__":
+
+# ---------- CLI / test ----------
+
+if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--once", action="store_true", help="Poll once then exit")
-    parser.add_argument("--test-pdf", help="Path to local PDF for testing")
+    parser = argparse.ArgumentParser(description="AMI Health Worker V4 (pypdf + pytesseract)")
+    parser.add_argument('--test-pdf', help='Path to local PDF for testing')
+    parser.add_argument('--once', action='store_true', help='Poll once then exit (if not test)')
     args = parser.parse_args()
 
     if args.test_pdf:
-        # local test harness
-        path = args.test_pdf
-        with open(path, "rb") as f:
+        with open(args.test_pdf, 'rb') as f:
             pdfb = f.read()
-        dummy = {"id":"local-test","file_path":None,"pdf_url":None,"patient_id":"local-test-patient","age":17,"sex":"female"}
-        # override download fn
-        def _dl_override(rec):
+        dummy = {
+            'id': 'local-test',
+            'patient_id': 'local-patient',
+            'age': 17,
+            'sex': 'female',
+            'file_path': args.test_pdf,
+        }
+        # override downloader
+        def dl_override(rec):
             return pdfb
-        download_pdf_bytes_from_record = _dl_override  # type: ignore
-        out = process_report(dummy)
-        print(json.dumps(out, indent=2))
+        globals()['download_pdf_from_record'] = dl_override
+        process_report(dummy)
+        print("Test run complete.")
     else:
         if args.once:
-            poll_and_process_once()
+            poll_and_process()
         else:
-            main_loop()
+            poll_and_process()
