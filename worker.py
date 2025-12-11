@@ -1,18 +1,7 @@
-#!/usr/bin/env python3
-"""
-AMI Worker v4+ (Pattern → Route → Next Steps)
-Features:
-- Scanned PDF OCR (OpenAI) -> structured CBC + chemistry extraction
-- Text PDF parsing
-- AI interpretation (GPT-4o-mini style)
-- Route engine (Patterns -> Route -> Next Steps)
-- Urgency flags & Severity grading
-- Differential diagnosis trees (safe, non-prescriptive)
-- Trend comparison with prior completed reports (by patient name)
-- Robust error handling and defensive parsing
-"""
+# worker.py  — AMI Worker v4 (Patterns -> Route -> Next Steps)
+# Paste/replace your existing worker.py with this file.
 
-print(">>> AMI Worker v4 starting — Pattern → Route → Next Steps (with urgency, severity, differential, trends)")
+print(">>> AMI Worker v4 starting — Pattern → Route → Next Steps")
 
 import os
 import time
@@ -23,196 +12,213 @@ import base64
 import re
 from datetime import datetime
 
-# Third-party
+# 3rd party imports
 from supabase import create_client, Client
 from openai import OpenAI
 from pypdf import PdfReader
 from pdf2image import convert_from_bytes
+from PIL import Image  # pillow is in requirements
 
-# ---------------------------
-# Environment / clients
-# ---------------------------
+# -------------------------
+# ENV + CLIENTS
+# -------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_KEY is missing")
-
 if not OPENAI_API_KEY:
-    print("⚠️ OPENAI_API_KEY not set — OpenAI requests will likely fail (but code will still run).")
+    print("⚠️ OPENAI_API_KEY not set — vision/AI calls will fail.")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 BUCKET = "reports"
 
-# ---------------------------
+# -------------------------
 # Utilities
-# ---------------------------
-def safe_get_parsed_from_choice(choice):
-    """Helper: get parsed JSON from various SDK response shapes."""
+# -------------------------
+def safe_get_api_data(res):
+    """
+    supabase client .execute() can return object shapes depending on sdk version.
+    Prefer res.data, fallback to dict-like get.
+    """
     try:
-        # Preferred: parsed property (SDK may populate .message.parsed)
-        msg = getattr(choice, "message", None)
-        if msg:
-            parsed = getattr(msg, "parsed", None)
-            if parsed is not None:
-                return parsed
-            # fallback to content
-            content = getattr(msg, "content", None)
-            if isinstance(content, dict):
-                return content
-            if isinstance(content, list):
-                # search for dict/json in list
-                for item in content:
-                    if isinstance(item, dict) and "json" in item:
-                        return item.get("json")
-                # fallback join strings
-                txt = "".join(part.get("text", "") for part in content if isinstance(part, dict))
-                try:
-                    return json.loads(txt)
-                except:
-                    return txt
-            if isinstance(content, str):
-                try:
-                    return json.loads(content)
-                except:
-                    return content
-
-        # older fallback: choice.get("text")
-        if hasattr(choice, "text"):
-            txt = getattr(choice, "text")
-            try:
-                return json.loads(txt)
-            except:
-                return txt
-
+        data = getattr(res, "data", None)
+        if data is not None:
+            return data
     except Exception:
         pass
-    return None
+    try:
+        return res.get("data")  # if res is a dict-like
+    except Exception:
+        return None
 
 def clean_number(val):
-    """Convert things like '88.0%', '11,6 g/dL', '4.2*' -> float or None."""
+    """
+    Convert a variety of lab number formats into float (or None).
+    Accepts strings like '88.0%', '11,6 g/dL', '<5.0', '≥ 2.0', '4.2*'
+    """
     if val is None:
         return None
     if isinstance(val, (int, float)):
         return float(val)
-    s = str(val)
+    s = str(val).strip()
+    # Remove common non-numeric tokens
     s = s.replace(",", ".")
-    # remove percent sign, trailing stars and words, then regex first number
-    nums = re.findall(r"-?\d+\.?\d*", s)
-    if not nums:
+    s = s.replace("%", "")
+    s = s.replace("*", "")
+    s = s.replace("≥", "")
+    s = s.replace(">", "")
+    s = s.replace("<", "-")  # keep marker to check later
+    # extract first number-looking token
+    m = re.search(r"-?\d+\.?\d*", s)
+    if not m:
         return None
     try:
-        return float(nums[0])
+        return float(m.group())
     except:
         return None
 
-def iso_now():
-    return datetime.utcnow().isoformat() + "Z"
+def severity_label_from_score(score):
+    if score >= 8:
+        return "Critical"
+    if score >= 5:
+        return "High"
+    if score >= 3:
+        return "Moderate"
+    return "Low"
 
-# ---------------------------
-# PDF helpers
-# ---------------------------
+# -------------------------
+# PDF text extraction
+# -------------------------
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """Extract text from selectable PDFs using pypdf."""
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
-        pages = []
-        for p in reader.pages:
-            txt = p.extract_text() or ""
-            pages.append(txt)
-        return "\n\n".join(pages).strip()
+        texts = []
+        for page in reader.pages:
+            try:
+                txt = page.extract_text() or ""
+            except Exception:
+                txt = ""
+            texts.append(txt)
+        return "\n\n".join(texts).strip()
     except Exception as e:
         print("PDF parse error:", e)
         return ""
 
-def is_scanned_pdf(text: str) -> bool:
-    """Very simple heuristic: nearly no text means scanned image PDF."""
-    if not text:
+def is_scanned_pdf(pdf_text: str) -> bool:
+    if not pdf_text:
         return True
-    return len(text.strip()) < 30
+    if len(pdf_text.strip()) < 40:
+        return True
+    return False
 
-# ---------------------------
-# OCR: Image -> structured CBC (OpenAI Vision via chat completions)
-# ---------------------------
-def extract_cbc_from_image(image_bytes: bytes) -> dict:
+# -------------------------
+# OpenAI Vision OCR helper (best-effort)
+# - Uses chat completions with image embedded as data URI in a user message.
+# - Some OpenAI client versions / model settings may not accept images in this style.
+# - If your environment supports the newer Responses API, replace this function accordingly.
+# -------------------------
+def send_image_ocr_to_openai(image_bytes: bytes) -> dict:
     """
-    Send an image to OpenAI (vision-capable chat completions) to extract CBC/chemistry.
-    Returns: dict with {"cbc": [{analyte, value, units, reference_low, reference_high}, ...]}
-    Defensive: returns {"cbc": []} on failure.
+    Send the image to OpenAI & ask it to extract lab analyte table rows.
+    Returns a dict like { "cbc": [ { "analyte": "...", "value": "...", "units": "...", "reference_low":"", "reference_high":"" }, ... ] }
+    If the call fails or response cannot be parsed, returns {"cbc": []}.
     """
     try:
         b64 = base64.b64encode(image_bytes).decode("utf-8")
-        system_prompt = (
-            "You are an OCR assistant extracting laboratory values from a scanned blood report. "
-            "Return ONLY strict JSON with this structure:\n"
-            "{ 'cbc': [ { 'analyte':'', 'value':'', 'units':'', 'reference_low':'', 'reference_high':'' } ] }\n"
-            "Include CBC analytes, differential, platelets, electrolytes, urea, creatinine, LFTs, CK, CRP if present. "
-            "Do not add explanatory text."
+        user_text = (
+            "OCR the image below and extract any laboratory analytes (CBC, diff, platelets, "
+            "electrolytes, urea, creatinine, liver enzymes, CK, CK-MB, CRP, ESR, etc.).\n\n"
+            "Return STRICT JSON with the structure:\n"
+            "{ 'cbc': [ { 'analyte': '', 'value': '', 'units': '', 'reference_low': '', 'reference_high': '' } ] }\n"
+            "Return only JSON with no additional text.\n\n"
+            "Image (data URI) below:\n"
+            f"![lab]({f'data:image/png;base64,{b64}'})"
         )
 
-        # Use chat completions create with image_url object payload (SDK format)
+        # Use chat completion — this worked for you earlier. Keep temperature low.
         resp = client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{b64}"}
-                        }
-                    ],
-                },
+                {"role": "system", "content": "You are a precise OCR and data extraction assistant."},
+                {"role": "user", "content": user_text}
             ],
             response_format={"type": "json_object"},
             temperature=0.0,
         )
 
-        # defensive parsing
-        choice = resp.choices[0]
-        parsed = safe_get_parsed_from_choice(choice)
-        if isinstance(parsed, dict) and "cbc" in parsed:
-            return parsed
-        # if we got a string containing JSON, try loads
-        if isinstance(parsed, str):
+        # Try a few possible response shapes
+        raw = None
+        try:
+            # new style: resp.choices[0].message.content (string or object)
+            content = resp.choices[0].message.content
+            if isinstance(content, dict):
+                raw = content
+            else:
+                # content may be a JSON string
+                raw = json.loads(content)
+        except Exception:
             try:
-                loaded = json.loads(parsed)
-                if isinstance(loaded, dict) and "cbc" in loaded:
-                    return loaded
-            except:
-                pass
+                # some SDKs expose parsed
+                raw = getattr(resp.choices[0].message, "parsed", None)
+            except Exception:
+                raw = None
 
-        print("OCR: unexpected structure, returning empty CBC. Raw parsed:", parsed)
+        if isinstance(raw, dict) and "cbc" in raw:
+            return raw
+        # fallback: if resp.output exists (Responses API style), attempt to use it
+        try:
+            # Attempt Responses-style extraction (if available)
+            out = getattr(resp, "output", None)
+            if out and isinstance(out, list):
+                for item in out:
+                    # find .content text or json
+                    if isinstance(item, dict):
+                        # try item['content'][0]['json'] style
+                        for c in item.get("content", []):
+                            if isinstance(c, dict) and "json" in c:
+                                return c["json"]
+        except Exception:
+            pass
+
+        # If nothing parsed, attempt to parse text fallback
+        try:
+            txt = resp.choices[0].message.content
+            if isinstance(txt, str):
+                parsed = json.loads(txt)
+                if isinstance(parsed, dict) and "cbc" in parsed:
+                    return parsed
+        except Exception:
+            pass
+
+        print("⚠️ OCR: Unable to parse OpenAI response; returning empty cbc.")
         return {"cbc": []}
 
     except Exception as e:
-        print("OCR error:", e)
-        traceback.print_exc()
+        # Do not crash on OCR; just report and return empty cbc
+        print("OCR call failed:", type(e).__name__, e)
         return {"cbc": []}
 
-# ---------------------------
-# AI interpretation (text) -> structured ai_json
-# ---------------------------
+# -------------------------
+# AI interpretation (text)
+# -------------------------
 def call_ai_on_report(text: str) -> dict:
     """
-    Ask model to interpret a JSON-like CBC content or plain text and return a structured JSON with:
-    patient, cbc[], summary (impression, suggested_follow_up).
-    Defensive parsing similar to OCR.
+    Call OpenAI to structure the lab results into JSON (patient, cbc list, summary).
+    Returns a dict. On failure, raises or returns basic structure.
     """
     try:
         system_prompt = (
-            "You are AMI, a medical lab interpreter for clinicians. "
-            "You MUST NOT give a formal diagnosis or prescribe. Return STRICT JSON with at least:\n"
-            "{\n"
-            '  "patient": {"name": null, "age": null, "sex": "Unknown"},\n'
-            '  "cbc": [ { "analyte":"", "value":"", "units":"", "reference_low":"", "reference_high":"", "flag":"normal|low|high|unknown" } ],\n'
-            '  "summary": { "impression":"", "suggested_follow_up":"" }\n'
-            "}\n"
-            "If input is already JSON with cbc rows, parse those and add concise clinical impression and follow-up."
+            "You are a clinical lab assistant. Receive lab data (either JSON {cbc:[..]} or free text). "
+            "Return STRICT JSON object with keys: patient, cbc, summary.\n\n"
+            "cbc should be a list of {analyte, value, units, reference_low, reference_high, flag}.\n"
+            "flag should be one of 'low', 'normal', 'high', or 'unknown'.\n"
+            "Patient object should have name, age, sex if known (or nulls).\n"
+            "Summary should include short 'impression' and 'suggested_follow_up' fields.\n"
+            "If you cannot find a numeric value for an analyte, do not invent it — skip it."
         )
 
         resp = client.chat.completions.create(
@@ -222,468 +228,320 @@ def call_ai_on_report(text: str) -> dict:
                 {"role": "user", "content": text},
             ],
             response_format={"type": "json_object"},
-            temperature=0.05,
+            temperature=0.0,
         )
 
-        choice = resp.choices[0]
-        parsed = safe_get_parsed_from_choice(choice)
-        if isinstance(parsed, dict):
-            return parsed
-        # fallback: if it's a string that looks like JSON
-        if isinstance(parsed, str):
+        # Parse many possible shapes
+        try:
+            content = resp.choices[0].message.content
+            if isinstance(content, dict):
+                return content
+            else:
+                return json.loads(content)
+        except Exception:
             try:
-                return json.loads(parsed)
-            except:
+                parsed = getattr(resp.choices[0].message, "parsed", None)
+                if parsed:
+                    return parsed
+            except Exception:
                 pass
 
-        # Last fallback: return minimal wrapper
-        return {
-            "patient": {"name": None, "age": None, "sex": "Unknown"},
-            "cbc": [],
-            "summary": {"impression": "No structured interpretation produced.", "suggested_follow_up": ""}
-        }
+        # last fallback: try to get text and parse
+        try:
+            rawtext = resp.choices[0].message.content
+            if isinstance(rawtext, str):
+                return json.loads(rawtext)
+        except Exception:
+            pass
+
+        raise ValueError("Could not parse AI interpretation response")
 
     except Exception as e:
-        print("AI interpretation error:", e)
-        traceback.print_exc()
-        return {
-            "patient": {"name": None, "age": None, "sex": "Unknown"},
-            "cbc": [],
-            "summary": {"impression": f"AI error: {e}", "suggested_follow_up": ""}
-        }
+        print("AI interpretation error:", type(e).__name__, e)
+        # Return a minimal structure so the worker can continue
+        return {"patient": {"name": None, "age": None, "sex": "Unknown"}, "cbc": [], "summary": {"impression": "", "suggested_follow_up": ""}}
 
-# ---------------------------
-# Build canonical CBC dict for the route engine
-# ---------------------------
+# -------------------------
+# Build canonical cbc dict
+# -------------------------
 def build_cbc_value_dict(ai_json: dict) -> dict:
     """
-    Convert ai_json['cbc'] list into canonical dictionary keyed by common names (Hb, MCV, MCH, WBC, Neutrophils, etc.)
+    Turn ai_json['cbc'] list into canonical dict keyed by common analyte names.
     """
-    out = {}
+    mapping = {}
     rows = ai_json.get("cbc") or []
     for r in rows:
         if not isinstance(r, dict):
             continue
-        name = (r.get("analyte") or r.get("test") or "").strip().lower()
+        name = (r.get("analyte") or r.get("test") or "").lower()
+        val = r.get("value")
+        units = r.get("units")
         if not name:
             continue
 
-        def put(k):
-            if k not in out:
-                out[k] = r
-
-        if "haemo" in name or name == "hb" or "hemoglobin" in name:
-            put("Hb")
+        # Map flexible names to canonical keys
+        if "haemoglobin" in name or "hemoglobin" in name or name in ("hb", "hgb"):
+            mapping["Hb"] = {"raw": r, "value": clean_number(val), "units": units}
         elif name.startswith("mcv"):
-            put("MCV")
-        elif name.startswith("mch"):
-            put("MCH")
-        elif "red cell" in name or name == "rbc":
-            put("RBC")
-        elif "white" in name or "wbc" in name or "leucocyte" in name or "leukocyte" in name:
-            put("WBC")
-        elif "neut" in name:
-            put("Neutrophils")
+            mapping["MCV"] = {"raw": r, "value": clean_number(val), "units": units}
+        elif name.startswith("mch") and "mchc" not in name:
+            mapping["MCH"] = {"raw": r, "value": clean_number(val), "units": units}
+        elif "mchc" in name:
+            mapping["MCHC"] = {"raw": r, "value": clean_number(val), "units": units}
+        elif "rdw" in name:
+            mapping["RDW"] = {"raw": r, "value": clean_number(val), "units": units}
+        elif "white cell" in name or "wbc" in name or "leucocyte" in name or "leukocyte" in name:
+            mapping["WBC"] = {"raw": r, "value": clean_number(val), "units": units}
+        elif "neutrophil" in name:
+            mapping["Neutrophils"] = {"raw": r, "value": clean_number(val), "units": units}
         elif "lymph" in name:
-            put("Lymphocytes")
-        elif "platelet" in name or "plt" in name:
-            put("Platelets")
+            mapping["Lymphocytes"] = {"raw": r, "value": clean_number(val), "units": units}
+        elif "monocyte" in name:
+            mapping["Monocytes"] = {"raw": r, "value": clean_number(val), "units": units}
+        elif "platelet" in name or name.startswith("plt"):
+            mapping["Platelets"] = {"raw": r, "value": clean_number(val), "units": units}
         elif "creatinine" in name:
-            put("Creatinine")
-        elif name.startswith("urea"):
-            put("Urea")
-        elif "alt" in name and "alanine" in name:
-            put("ALT")
-        elif name == "alt":
-            put("ALT")
-        elif "ast" in name:
-            put("AST")
-        elif "alp" in name or "alkaline phosphatase" in name:
-            put("ALP")
-        elif "ggt" in name or "gamma" in name:
-            put("GGT")
-        elif "biliru" in name:
-            put("Bilirubin")
-        elif "creatine kinase" in name or name == "ck":
-            put("CK")
-        elif "ck-mb" in name or "ck mb" in name:
-            put("CK-MB")
+            mapping["Creatinine"] = {"raw": r, "value": clean_number(val), "units": units}
+        elif "urea" in name:
+            mapping["Urea"] = {"raw": r, "value": clean_number(val), "units": units}
         elif "sodium" in name or name == "na":
-            put("Sodium")
+            mapping["Sodium"] = {"raw": r, "value": clean_number(val), "units": units}
         elif "potassium" in name or name == "k":
-            put("Potassium")
-        elif "calcium" in name:
-            put("Calcium")
+            mapping["Potassium"] = {"raw": r, "value": clean_number(val), "units": units}
         elif "crp" in name:
-            put("CRP")
+            mapping["CRP"] = {"raw": r, "value": clean_number(val), "units": units}
+        elif "alt" in name or "alanine aminotransferase" in name:
+            mapping["ALT"] = {"raw": r, "value": clean_number(val), "units": units}
+        elif "ast" in name or "aspartate aminotransferase" in name:
+            mapping["AST"] = {"raw": r, "value": clean_number(val), "units": units}
+        elif "alkaline phosphatase" in name or name.startswith("alp"):
+            mapping["ALP"] = {"raw": r, "value": clean_number(val), "units": units}
+        elif "bilirubin" in name:
+            mapping["Bilirubin"] = {"raw": r, "value": clean_number(val), "units": units}
+        elif "ck-mb" in name or "ck mb" in name:
+            mapping["CKMB"] = {"raw": r, "value": clean_number(val), "units": units}
+        elif name == "ck" or "creatine kinase" in name:
+            mapping["CK"] = {"raw": r, "value": clean_number(val), "units": units}
+        else:
+            # keep other analytes under their raw name
+            key = r.get("analyte", name)
+            mapping[key] = {"raw": r, "value": clean_number(val), "units": units}
+    return mapping
 
-    return out
+# -------------------------
+# Route Engine v4 — Patterns → Route → Next Steps
+# - SA-friendly thresholds (defaults)
+# - Age-aware: basic child/adult split
+# - Urgency and severity scoring
+# - Differential branches
+# - Trend comparison (if prior results found)
+# -------------------------
+# Default reference ranges (very conservative defaults; tune by site)
+DEFAULTS = {
+    "Hb": {"male": (13.0, 17.5), "female": (12.0, 15.5), "child": (11.5, 15.5)},
+    "MCV": (80.0, 100.0),
+    "MCH": (27.0, 34.0),
+    "WBC": (4.0, 11.0),
+    "Platelets": (150, 450),
+    "Creatinine": (44, 110),  # umol/L typical adult range, adjust by lab
+    "CRP": (0, 5),
+    "Sodium": (136, 145),
+    "Potassium": (3.5, 5.1),
+}
 
-# ---------------------------
-# Severity grading & urgency flags
-# ---------------------------
-def evaluate_severity_and_urgency(cdict: dict) -> dict:
+def grade_severity_and_urgency(score):
+    return severity_label_from_score(score), ("urgent" if score >= 7 else "semi-urgent" if score >= 4 else "routine")
+
+def compare_trends(current, previous):
     """
-    Returns:
-    {
-      "severity": "low|moderate|high|critical",
-      "urgency_flags": [ { "reason": "...", "level": "urgent|immediate|monitor" } ],
-      "key_issues": [ "...brief strings..." ]
-    }
+    Very simple trend comparator:
+    current & previous are canonical dicts (from build_cbc_value_dict).
+    Returns a short list of trend statements.
     """
-    sev_score = 0
-    flags = []
-    key_issues = []
+    trends = []
+    if not previous:
+        return trends
+    for key in ["Hb", "WBC", "Neutrophils", "Platelets", "CRP", "Creatinine"]:
+        cur = current.get(key, {}).get("value")
+        prev = previous.get(key, {}).get("value")
+        if cur is None or prev is None:
+            continue
+        delta = cur - prev
+        if abs(delta) / (abs(prev) + 1e-6) > 0.15:  # >15% change
+            direction = "↑" if delta > 0 else "↓"
+            trends.append(f"{key} {direction} by {abs(delta):.2f} (prev {prev}, now {cur})")
+    return trends
 
-    # helper value extraction
-    v = lambda k: clean_number(cdict.get(k, {}).get("value"))
+def generate_clinical_routes(cdict: dict, patient_age=None, patient_sex=None, prior_cdict=None):
+    """
+    Returns routes list and meta with severity/urgency/differentials/trends.
+    """
+    routes = []
+    score = 0  # internal severity score
+
+    # helper getter
+    def v(k):
+        return cdict.get(k, {}).get("value") if cdict.get(k) else None
 
     Hb = v("Hb")
-    Plt = v("Platelets")
+    MCV = v("MCV")
+    MCH = v("MCH")
     WBC = v("WBC")
     Neut = v("Neutrophils")
-    K = v("Potassium")
-    Cr = v("Creatinine")
-    CK = v("CK")
+    Lymph = v("Lymphocytes")
+    Platelets = v("Platelets")
+    Creatinine = v("Creatinine")
+    CRP = v("CRP")
+    Sodium = v("Sodium")
+    Potassium = v("Potassium")
 
-    # Critical thresholds (conservative)
-    if Hb is not None:
-        if Hb < 6.5:
-            sev_score += 5; flags.append({"reason": f"Hb {Hb} g/dL — severe anaemia", "level": "immediate"}); key_issues.append(f"Hb {Hb}")
-        elif Hb < 8:
-            sev_score += 3; flags.append({"reason": f"Hb {Hb} g/dL — significant anaemia", "level": "urgent"}); key_issues.append(f"Hb {Hb}")
-        elif Hb < 11:
-            sev_score += 1; key_issues.append(f"Hb {Hb} (mild-moderate)")
-
-    if Plt is not None:
-        if Plt < 20:
-            sev_score += 5; flags.append({"reason": f"Platelets {Plt} x10^9/L — very high bleeding risk", "level": "immediate"}); key_issues.append(f"Platelets {Plt}")
-        elif Plt < 50:
-            sev_score += 3; flags.append({"reason": f"Platelets {Plt} x10^9/L — bleeding risk", "level": "urgent"}); key_issues.append(f"Platelets {Plt}")
-
-    if K is not None:
-        if K < 3.0 or K > 6.0:
-            sev_score += 5; flags.append({"reason": f"Potassium {K} mmol/L — arrhythmia risk", "level": "immediate"}); key_issues.append(f"K {K}")
-        elif K < 3.3 or K > 5.5:
-            sev_score += 3; flags.append({"reason": f"Potassium {K} mmol/L — significant", "level": "urgent"}); key_issues.append(f"K {K}")
-
-    if Cr is not None:
-        if Cr > 250:
-            sev_score += 4; flags.append({"reason": f"Creatinine {Cr} µmol/L — possible AKI", "level": "urgent"}); key_issues.append(f"Cr {Cr}")
-        elif Cr > 120:
-            sev_score += 2; key_issues.append(f"Cr {Cr}")
-
-    if CK is not None and CK > 5000:
-        sev_score += 4; flags.append({"reason": f"CK {CK} U/L — possible rhabdomyolysis physiology", "level": "urgent"}); key_issues.append(f"CK {CK}")
-
-    if WBC is not None:
-        if WBC > 25 or WBC < 1:
-            sev_score += 4; flags.append({"reason": f"WBC {WBC} x10^9/L — severe leukocyte abnormality", "level": "urgent"}); key_issues.append(f"WBC {WBC}")
-        elif WBC > 12:
-            sev_score += 1; key_issues.append(f"WBC {WBC}")
-
-    # Map score -> severity
-    if sev_score >= 8:
-        severity = "critical"
-    elif sev_score >= 4:
-        severity = "high"
-    elif sev_score >= 2:
-        severity = "moderate"
-    else:
-        severity = "low"
-
-    return {"severity": severity, "urgency_flags": flags, "key_issues": key_issues}
-
-# ---------------------------
-# Differential diagnosis trees (safe)
-# ---------------------------
-def generate_differential_trees(cdict: dict) -> dict:
-    """
-    Return a safe, non-prescriptive differential suggestion tree keyed by patterns.
-    Example:
-    {
-      "Microcytic anaemia": ["Iron deficiency", "Chronic inflammation", "Thalassemia trait (less likely)"],
-      "Macrocytic anaemia": [...]
-    }
-    """
-    out = {}
-    v = lambda k: clean_number(cdict.get(k, {}).get("value"))
-
-    Hb = v("Hb"); MCV = v("MCV"); WBC = v("WBC"); Plt = v("Platelets"); Cr = v("Creatinine"); CRP = v("CRP")
-
-    # Anaemia differentials
-    if Hb is not None and Hb < 13:
-        if MCV is not None and MCV < 80:
-            out["Microcytic anaemia"] = [
-                "Iron deficiency (common) — check ferritin & iron studies",
-                "Anaemia of chronic disease/inflammation",
-                "Thalassaemia trait (consider if ferritin normal and family history)"
-            ]
-        elif MCV is not None and MCV > 100:
-            out["Macrocytic anaemia"] = [
-                "Vitamin B12 or folate deficiency",
-                "Drug or alcohol effect",
-                "Bone marrow disorder (less common)"
-            ]
-        else:
-            out["Normocytic anaemia"] = [
-                "Early iron deficiency",
-                "Renal disease / reduced EPO",
-                "Acute blood loss or chronic disease"
-            ]
-
-    # Thrombocytopenia
-    if Plt is not None and Plt < 150:
-        out.setdefault("Thrombocytopenia", []).extend([
-            "Immune-mediated thrombocytopenia (ITP)",
-            "Drug-induced",
-            "Bone marrow suppression / infiltration",
-            "Sepsis or consumptive processes"
-        ])
-
-    # Leukocytosis
-    if WBC is not None and WBC > 12:
-        if CRP and CRP > 10:
-            out.setdefault("Raised WBC (with inflammation)", []).extend([
-                "Bacterial infection (common)",
-                "Severe inflammatory response (e.g., pancreatitis, large tissue injury)"
-            ])
-        else:
-            out.setdefault("Raised WBC", []).extend([
-                "Inflammation or stress leucocytosis",
-                "Haematologic process (if very high or blasts present) — specialist review"
-            ])
-
-    # Renal / metabolic
-    if Cr is not None and Cr > 120:
-        out.setdefault("Renal impairment", []).extend([
-            "AKI (pre-renal dehydration, sepsis, nephrotoxic drugs)",
-            "Chronic kidney disease (look at past creatinine/eGFR)"
-        ])
-
-    if not out:
-        out["No specific differential patterns triggered"] = ["Correlate clinically and review prior results"]
-
-    return out
-
-# ---------------------------
-# Trend comparison (search prior completed reports by patient name)
-# ---------------------------
-def trend_comparison(patient_name: str, current_cdict: dict) -> dict:
-    """
-    Fetch the last N completed reports and compare main analytes to produce a short trend summary.
-    If patient_name is None or no previous reports, returns informative message.
-    """
-    if not patient_name:
-        return {"note": "No patient name available; trend comparison skipped.", "trends": []}
-
+    # Age group
+    age_group = "adult"
     try:
-        # Fetch recent completed reports (limit 20) and filter in Python by patient name match
-        res = supabase.table("reports").select("*").eq("ai_status", "completed").order("created_at", {"ascending": False}).limit(20).execute()
-        prior = res.model or []
-        matches = []
-        for r in prior:
-            try:
-                ai = r.get("ai_results") or r.get("ai_results_raw") or {}
-                # ai could be a string or dict
-                if isinstance(ai, str):
-                    try:
-                        ai = json.loads(ai)
-                    except:
-                        ai = {}
-                pname = None
-                if isinstance(ai, dict):
-                    pname = (ai.get("patient") or {}).get("name")
-                if pname and patient_name and pname.strip().lower() == patient_name.strip().lower():
-                    matches.append({"created_at": r.get("created_at"), "ai": ai})
-            except Exception:
-                continue
-
-        if not matches:
-            return {"note": "No prior completed reports found for this patient.", "trends": []}
-
-        # For each analyte of interest, create tiny trend strings comparing most recent prior value to current
-        analytes = ["Hb", "WBC", "Platelets", "Neutrophils", "MCV", "Creatinine", "CRP", "Potassium", "Sodium"]
-        trends = []
-        # take the most recent prior (first in matches)
-        for m in matches[:3]:
-            pass  # we will compute pairwise below
-
-        # Build a mapping of analyte -> list of (date, value)
-        series = {}
-        for m in matches:
-            ai = m["ai"] or {}
-            cbc_list = ai.get("cbc") or []
-            row_map = {}
-            for row in cbc_list:
-                if not isinstance(row, dict): continue
-                analyte = (row.get("analyte") or "").strip()
-                if analyte:
-                    row_map[analyte.lower()] = row
-            created = m.get("created_at") or m.get("createdAt") or ""
-            for a in analytes:
-                # try find by canonical keys too
-                val = None
-                # check canonical keys in ai (some reports may store canonical)
-                if isinstance(ai, dict) and ai.get("cbc"):
-                    for row in ai.get("cbc"):
-                        name = (row.get("analyte") or "").lower()
-                        if a.lower() in name or name == a.lower():
-                            val = clean_number(row.get("value"))
-                            break
-                # append if found
-                if val is not None:
-                    series.setdefault(a, []).append({"date": created, "value": val})
-
-        # Compare most recent prior value to current for each analyte with data
-        for a, points in series.items():
-            # sort by date descending if possible
-            points_sorted = [p for p in points]
-            # if current_cdict contains a key, compare
-            cur_val = clean_number(current_cdict.get(a, {}).get("value"))
-            if cur_val is None:
-                continue
-            # find most recent prior (first point)
-            prior_val = points_sorted[0]["value"] if points_sorted else None
-            if prior_val is None:
-                continue
-            if cur_val > prior_val:
-                trends.append(f"{a}: increased from {prior_val} → {cur_val}")
-            elif cur_val < prior_val:
-                trends.append(f"{a}: decreased from {prior_val} → {cur_val}")
-            else:
-                trends.append(f"{a}: stable at {cur_val}")
-
-        note = f"Compared to {len(matches)} prior completed report(s)."
-        return {"note": note, "trends": trends}
-
-    except Exception as e:
-        print("Trend comparison error:", e)
-        traceback.print_exc()
-        return {"note": "Trend comparison failed: " + str(e), "trends": []}
-
-# ---------------------------
-# Route engine aggregator: Patterns -> Route -> Next Steps
-# also includes severity/urgency/differential/trends
-# ---------------------------
-def build_full_clinical_report(ai_json: dict) -> dict:
-    """
-    Given ai_json (from call_ai_on_report), add:
-    - canonical cdict
-    - routes (list of pattern dicts)
-    - severity & urgency
-    - differential_trees
-    - trend_comparison (if patient name found)
-    """
-    # canonical dict
-    cdict = build_cbc_value_dict(ai_json)
-
-    # routes (reuse earlier generate_routes logic but return rich objects)
-    routes = []
-    # simple mapping to reuse code above (we'll implement inline)
-    v = lambda k: clean_number(cdict.get(k, {}).get("value"))
-
-    Hb = v("Hb"); MCV = v("MCV"); WBC = v("WBC"); Neut = v("Neutrophils"); Lymph = v("Lymphocytes")
-    Plt = v("Platelets"); Cr = v("Creatinine"); CRP = v("CRP"); CK = v("CK"); Na = v("Sodium"); K = v("Potassium")
-
-    # Anaemia
-    if Hb is not None and Hb < 13:
-        if MCV is not None:
-            if MCV < 80:
-                routes.append({
-                    "pattern": "Microcytic anaemia",
-                    "route": "Likely iron deficiency / chronic disease pattern",
-                    "next_steps": ["Order ferritin & iron studies", "Reticulocyte count", "Consider inflammation markers (CRP)"]
-                })
-            elif 80 <= MCV <= 100:
-                routes.append({
-                    "pattern": "Normocytic anaemia",
-                    "route": "Possible chronic disease, renal, or early iron deficiency",
-                    "next_steps": ["Check creatinine & eGFR", "Reticulocyte count", "Clinical correlation"]
-                })
-            else:
-                routes.append({
-                    "pattern": "Macrocytic anaemia",
-                    "route": "Possible B12/folate deficiency or hepatic/drug effect",
-                    "next_steps": ["Order B12 & folate", "Review liver enzymes", "Medication review"]
-                })
-        else:
-            routes.append({
-                "pattern": "Anaemia (MCV unknown)",
-                "route": "Low haemoglobin — further classification needed",
-                "next_steps": ["Obtain MCV/MCH", "Order ferritin & reticulocytes"]
-            })
-
-    # WBC
-    if WBC is not None:
-        if WBC > 12:
-            detail = "Inflammatory/infective physiology"
-            nexts = []
-            if Neut and Neut > 70:
-                detail = "Neutrophil-predominant — bacterial pattern more likely"
-                nexts.append("Correlate with fever, localising signs; consider antibiotics per clinical context")
-            if Lymph and Lymph > 45:
-                nexts.append("Consider viral causes; review symptom timeline")
-            if not nexts:
-                nexts.append("Correlate clinically; consider CRP and cultures if indicated")
-            routes.append({"pattern": "Leucocytosis", "route": detail, "next_steps": nexts})
-
-        elif WBC < 4:
-            routes.append({"pattern": "Leukopenia", "route": "Viral suppression, bone marrow effect, or drugs", "next_steps": ["Medication review", "Repeat CBC", "Consider specialist review if persistent"]})
-
-    # Platelets
-    if Plt is not None:
-        if Plt < 150:
-            routes.append({"pattern": "Thrombocytopenia", "route": "Bleeding risk assessment", "next_steps": ["Assess bleeding symptoms", "Review drugs and previous CBCs", "Consider haematology review if <50"]})
-        elif Plt > 450:
-            routes.append({"pattern": "Thrombocytosis", "route": "Reactive vs primary thrombocytosis", "next_steps": ["Check CRP/INFLAMMATION", "Repeat CBC", "Consider iron studies"]})
-
-    # Kidney / LFT / CK
-    if Cr is not None and Cr > 120:
-        routes.append({"pattern": "Renal impairment physiology", "route": "Assess for AKI or CKD", "next_steps": ["Repeat U&E", "Review meds & hydration", "Consider eGFR"]})
-
-    if CK is not None and CK > 1000:
-        routes.append({"pattern": "High CK", "route": "Muscle injury / rhabdomyolysis physiology", "next_steps": ["Check creatinine", "Assess for muscle pain/trauma", "Urgent review if creatinine rising"]})
-
-    # Electrolytes urgency included separately in severity function
-
-    if not routes:
-        routes.append({"pattern": "No major patterns detected", "route": "Results within expected ranges", "next_steps": ["Correlate clinically and review prior results"]})
-
-    # severity & urgency
-    sev = evaluate_severity_and_urgency(cdict)
-
-    # differential trees
-    diffs = generate_differential_trees(cdict)
-
-    # trend comparison
-    patient_name = None
-    try:
-        patient_name = (ai_json.get("patient") or {}).get("name")
+        if patient_age is not None and patient_age < 18:
+            age_group = "child"
     except:
-        patient_name = None
-    trends = trend_comparison(patient_name, cdict)
+        pass
 
-    # Compose final augmented report
-    augmented = dict(ai_json)  # shallow copy
-    augmented["_canonical_cbc"] = cdict
-    augmented["_routes"] = routes
-    augmented["_severity"] = sev
-    augmented["_differential_trees"] = diffs
-    augmented["_trend_comparison"] = trends
-    augmented["_generated_at"] = iso_now()
+    # ---------- Anaemia routes ----------
+    if Hb is not None:
+        # pick reference based on sex & age
+        if patient_sex and patient_sex.lower().startswith("m"):
+            low_hb = DEFAULTS["Hb"]["male"][0]
+        elif patient_sex and patient_sex.lower().startswith("f"):
+            low_hb = DEFAULTS["Hb"]["female"][0]
+        else:
+            low_hb = DEFAULTS["Hb"]["female"][0]
+        if age_group == "child":
+            low_hb = DEFAULTS["Hb"]["child"][0]
 
-    return augmented
+        if Hb < low_hb:
+            score += 3
+            routes.append({"pattern": "Anaemia (Hb low)", "detail": f"Hb {Hb} g/dL — below expected for age/sex (threshold {low_hb})"})
+            # microcytic?
+            if MCV is not None:
+                if MCV < DEFAULTS["MCV"][0]:
+                    score += 1
+                    routes.append({"route": "Microcytic anaemia pattern", "next_steps": ["Ferritin (iron stores)", "Iron studies (Fe/TIBC)", "Reticulocyte count", "Consider GI blood loss if applicable"]})
+                    routes.append({"differentials": ["Iron deficiency", "Thalassaemia trait (check MCV vs RBC)", "Anaemia of chronic disease (less likely in microcytic)"]})
+                elif MCV > DEFAULTS["MCV"][1]:
+                    score += 1
+                    routes.append({"route": "Macrocytic anaemia pattern", "next_steps": ["B12 and folate levels", "LFTs", "Medication review (e.g., methotrexate)"]})
+                    routes.append({"differentials": ["B12/folate deficiency", "Alcohol, liver disease", "Myelodysplasia (in older patients)"]})
+                else:
+                    routes.append({"route": "Normocytic anaemia pattern", "next_steps": ["Consider chronic disease, early iron deficiency, renal disease — check CRP, Creatinine, ferritin"]})
+            else:
+                routes.append({"route": "Anaemia pattern unknown - need red cell indices (MCV/MCH) to subtype", "next_steps": ["Order MCV/MCH if absent; Ferritin if microcytosis suspected"]})
 
-# ---------------------------
-# Main report processing
-# ---------------------------
+    # ---------- WBC / Infection routes ----------
+    if WBC is not None:
+        if WBC > DEFAULTS["WBC"][1]:
+            score += 2
+            routes.append({"pattern": "Leukocytosis", "detail": f"WBC {WBC}"})
+            if Neut is not None and Neut > 70:
+                score += 2
+                routes.append({"route": "Neutrophil-predominant leukocytosis → bacterial infection favored", "next_steps": ["Correlate clinically for source", "Consider blood cultures if systemic", "Start/adjust antibiotics as per clinical judgement"]})
+            if Lymph is not None and Lymph > 45:
+                routes.append({"route": "Lymphocytosis → viral / viral-reactive pattern", "next_steps": ["Consider viral tests", "Observe vs specific therapy"]})
+        elif WBC < DEFAULTS["WBC"][0]:
+            score += 2
+            routes.append({"pattern": "Leukopenia", "detail": f"WBC {WBC}", "next_steps": ["Consider viral suppression, bone marrow suppression, cytotoxic drugs, or sepsis with margination"]})
+
+    # ---------- Platelets ----------
+    if Platelets is not None:
+        if Platelets < DEFAULTS["Platelets"][0]:
+            score += 2
+            routes.append({"pattern": "Thrombocytopenia", "detail": f"Platelets {Platelets}", "next_steps": ["Assess bleeding/clotting risk", "Repeat platelet count", "Consider causes: immune, sepsis, marrow failure, DIC"]})
+        elif Platelets > DEFAULTS["Platelets"][1]:
+            routes.append({"pattern": "Thrombocytosis", "detail": f"Platelets {Platelets}", "next_steps": ["Reactive thrombocytosis (infection/inflammation/iron deficiency) vs primary; correlate with CRP, iron studies"]})
+
+    # ---------- Renal ----------
+    if Creatinine is not None:
+        if Creatinine > DEFAULTS["Creatinine"][1]:
+            score += 3
+            routes.append({"pattern": "Renal impairment", "detail": f"Creatinine {Creatinine} umol/L", "next_steps": ["Repeat U&E urgently", "Assess urine output/hydration, review nephrotoxic meds", "Calculate eGFR if available"]})
+        else:
+            routes.append({"note": "Creatinine within typical limits (interpret with eGFR/age/sex)"})
+
+    # ---------- Electrolytes ----------
+    if Potassium is not None:
+        if Potassium < DEFAULTS["Potassium"][0]:
+            score += 4
+            routes.append({"pattern": "Hypokalaemia", "detail": f"K {Potassium}", "urgency": "urgent", "next_steps": ["Assess ECG if symptomatic", "Replete potassium carefully"]})
+        elif Potassium > DEFAULTS["Potassium"][1]:
+            score += 5
+            routes.append({"pattern": "Hyperkalaemia", "detail": f"K {Potassium}", "urgency": "urgent", "next_steps": ["ECG", "Immediate hyperkalaemia pathway (calcium, insulin+dextrose, consider ion-exchange, dialysis) if severe"]})
+
+    if Sodium is not None:
+        if Sodium < DEFAULTS["Sodium"][0]:
+            routes.append({"pattern": "Hyponatraemia", "detail": f"Na {Sodium}", "next_steps": ["Assess fluid status, consider SIADH, diuretics, adrenal causes"]})
+        elif Sodium > DEFAULTS["Sodium"][1]:
+            routes.append({"pattern": "Hypernatraemia", "detail": f"Na {Sodium}", "next_steps": ["Assess dehydration/water loss; manage carefully"]})
+
+    # ---------- CRP / Inflammation ----------
+    if CRP is not None:
+        if CRP > 100:
+            score += 4
+            routes.append({"pattern": "High CRP", "detail": f"CRP {CRP} mg/L — strong inflammation/infection signal", "next_steps": ["Consider sepsis workup if clinical signs present", "Source control & empirical antibiotics as per protocol"]})
+        elif CRP > 10:
+            score += 2
+            routes.append({"pattern": "Elevated CRP", "detail": f"CRP {CRP}", "next_steps": ["Correlate with WBC and clinical findings; consider infection/inflammation"]})
+        else:
+            routes.append({"note": "CRP not substantially elevated"})
+
+    # ---------- CK ----------
+    # (simple)
+    CK = cdict.get("CK", {}).get("value")
+    if CK and CK > 1000:
+        score += 3
+        routes.append({"pattern": "Very high CK → possible rhabdomyolysis", "next_steps": ["Check renal function urgently", "Aggressive fluids, monitor urine/myoglobin"]})
+
+    # ---------- Differential diagnoses (simple trees) ----------
+    differentials = []
+    # Microcytic anemia tree
+    if Hb and Hb < (DEFAULTS["Hb"]["female"][0] if not patient_sex or not patient_sex.lower().startswith("m") else DEFAULTS["Hb"]["male"][0]) and MCV and MCV < DEFAULTS["MCV"][0]:
+        differentials.append({"problem": "Microcytic anaemia", "likely_causes": ["Iron deficiency (most common)", "Thalassaemia trait", "Chronic blood loss (GI, menstruation)"], "tests_to_distinguish": ["Ferritin", "Iron studies (Fe/TIBC)", "Peripheral smear", "Hb electrophoresis if microcytosis with normal ferritin"]})
+
+    # Leukocytosis tree
+    if WBC and WBC > DEFAULTS["WBC"][1]:
+        if Neut and Neut > 70:
+            differentials.append({"problem": "Neutrophil-predominant leukocytosis", "likely_causes": ["Bacterial infection", "Stress response, steroids"], "distinguish_by": ["CRP, cultures, clinical signs"]})
+        elif Lymph and Lymph > 45:
+            differentials.append({"problem": "Lymphocytosis", "likely_causes": ["Viral infection", "Pertussis", "Chronic lymphocytic states"], "distinguish_by": ["Viral PCRs, clinical course"]})
+
+    # ---------- Trend comparison ----------
+    trends = compare_trends(cdict, prior_cdict)
+
+    # ---------- Severity & urgency ----------
+    severity_label, urgency = grade_severity_and_urgency(score)
+
+    # if high CRP + high WBC + neutrophilia escalate
+    if (CRP and CRP > 80) and (WBC and WBC > 12) and (Neut and Neut > 70):
+        severity_label = "Critical"
+        urgency = "urgent"
+        score = max(score, 9)
+
+    meta = {
+        "severity_score": score,
+        "severity_label": severity_label,
+        "urgency": urgency,
+        "differentials": differentials,
+        "trends": trends,
+    }
+
+    return routes, meta
+
+# -------------------------
+# Worker core: process a single report job
+# -------------------------
 def process_report(job: dict) -> dict:
     report_id = job.get("id")
     file_path = job.get("file_path")
     l_text = job.get("l_text") or ""
+    patient_age = None
+    patient_sex = None
 
-    print(f"Processing report {report_id} ...")
+    print(f"🔎 Processing report {report_id} (file_path={file_path})")
 
     if not file_path:
         err = f"Missing file_path for report {report_id}"
@@ -691,93 +549,155 @@ def process_report(job: dict) -> dict:
         supabase.table("reports").update({"ai_status": "failed", "ai_error": err}).eq("id", report_id).execute()
         return {"error": err}
 
-    # download file bytes
-    pdf_res = supabase.storage.from_(BUCKET).download(file_path)
-    if hasattr(pdf_res, "data"):
-        pdf_bytes = pdf_res.data
+    # Download file bytes
+    pdf_download = supabase.storage.from_(BUCKET).download(file_path)
+    if hasattr(pdf_download, "data"):
+        pdf_bytes = pdf_download.data
     else:
-        pdf_bytes = pdf_res
+        # Some SDK versions return dict-like
+        try:
+            pdf_bytes = pdf_download.get("data")
+        except Exception:
+            pdf_bytes = pdf_download
 
+    # Extract text
     text = extract_text_from_pdf(pdf_bytes)
     scanned = is_scanned_pdf(text)
-    print(f"Report {report_id}: scanned={scanned}, extracted_text_len={len(text)}")
+    print(f"Report {report_id}: scanned={scanned}, text_length={len(text)}")
 
-    merged_text_for_ai = ""
-    extracted_rows = []
+    combined_rows = []
 
-    try:
-        if scanned:
-            print("SCANNED PDF -> running OCR per page")
-            pages = convert_from_bytes(pdf_bytes)
-            for i, page_img in enumerate(pages, start=1):
-                print(f" OCR page {i} ...")
+    if scanned:
+        print(f"📄 Report {report_id}: SCANNED PDF detected → running OCR pipeline")
+        try:
+            images = convert_from_bytes(pdf_bytes, dpi=200)
+        except Exception as e:
+            print("pdf2image convert_from_bytes error:", e)
+            images = []
+
+        for i, pil_img in enumerate(images, start=1):
+            try:
+                print(f"OCR page {i} ...")
+                # Convert to PNG bytes
                 buf = io.BytesIO()
-                page_img.save(buf, format="PNG")
-                page_bytes = buf.getvalue()
-                ocr_out = extract_cbc_from_image(page_bytes)
-                if isinstance(ocr_out, dict) and "cbc" in ocr_out and ocr_out["cbc"]:
-                    extracted_rows.extend(ocr_out["cbc"])
+                pil_img.save(buf, format="PNG")
+                img_bytes = buf.getvalue()
+
+                # Attempt OpenAI OCR
+                ocr_result = send_image_ocr_to_openai(img_bytes)
+                rows = ocr_result.get("cbc", []) if isinstance(ocr_result, dict) else []
+                if rows:
+                    print(f" → OCR extracted {len(rows)} rows on page {i}")
+                    combined_rows.extend(rows)
                 else:
-                    print(f"  → no cbc rows found on page {i}")
-            if not extracted_rows:
-                raise ValueError("No CBC extracted from any page via OCR")
-            merged_text_for_ai = json.dumps({"cbc": extracted_rows}, ensure_ascii=False)
-        else:
-            # digital/text PDF
-            merged_text_for_ai = text or l_text
-            if not merged_text_for_ai.strip():
-                raise ValueError("No usable text extracted from digital PDF")
+                    print(f" → No CBC rows on page {i}")
+            except Exception as e:
+                print("OCR page exception:", e)
+                traceback.print_exc()
+    else:
+        # Not scanned — attempt to extract structured lines from text
+        print("📝 Digital PDF — using text parsing")
+        # If the PDF text is in a "CBC Results" block, pass the whole text to AI interpreter
+        combined_rows = text
 
-        # 1) call AI interpretation
-        print("Calling AI interpretation...")
-        ai_json = call_ai_on_report(merged_text_for_ai)
-
-        # 2) build augmented clinical report (routes, severity, diffs, trends)
-        print("Building clinical augmentation...")
-        augmented = build_full_clinical_report(ai_json)
-
-        # 3) store results
-        supabase.table("reports").update({
-            "ai_status": "completed",
-            "ai_results": augmented,
-            "ai_error": None
-        }).eq("id", report_id).execute()
-
-        print(f"✅ Report {report_id} processed successfully")
-        return {"success": True, "data": augmented}
-
-    except Exception as e:
-        err = f"{type(e).__name__}: {e}"
-        print(f"❌ Error processing report {report_id}: {err}")
-        traceback.print_exc()
-        supabase.table("reports").update({"ai_status": "failed", "ai_error": err}).eq("id", report_id).execute()
+    if (isinstance(combined_rows, list) and len(combined_rows) == 0) or combined_rows is None:
+        err = "No usable CBC data extracted"
+        print("❌", err)
+        supabase.table("reports").update({"ai_status":"failed", "ai_error": err}).eq("id", report_id).execute()
         return {"error": err}
 
-# ---------------------------
-# Main worker loop (fixed .model handling)
-# ---------------------------
+    # Build merged_text for AI interpreter
+    if isinstance(combined_rows, list):
+        merged_text = json.dumps({"cbc": combined_rows}, ensure_ascii=False)
+    else:
+        merged_text = combined_rows
+
+    # AI interpretation
+    ai_json = call_ai_on_report(merged_text)
+
+    # Extract patient age/sex if AI provided
+    try:
+        p = ai_json.get("patient", {})
+        if isinstance(p, dict):
+            patient_age = p.get("age")
+            patient_sex = p.get("sex")
+    except Exception:
+        pass
+
+    # Build canonical cdict
+    cdict = build_cbc_value_dict(ai_json)
+
+    # Try to load prior report for trend comparison (best-effort)
+    prior_cdict = None
+    try:
+        # Try to find previous completed report for same patient (if patient name provided)
+        pat_name = (ai_json.get("patient") or {}).get("name")
+        if pat_name:
+            res_prev = supabase.table("reports").select("ai_results, created_at").eq("ai_status", "completed").ilike("ai_results->>patient->>name", f"%{pat_name}%").order("created_at", {"ascending": False}).limit(1).execute()
+            prev_data = safe_get_api_data(res_prev)
+            if prev_data and len(prev_data) > 0:
+                prev_ai = prev_data[0].get("ai_results") or prev_data[0].get("ai_results", {})
+                prior_cdict = build_cbc_value_dict(prev_ai)
+    except Exception as e:
+        print("Trend lookup failed:", e)
+
+    # Generate routes
+    try:
+        routes, meta = generate_clinical_routes(cdict, patient_age=patient_age, patient_sex=patient_sex, prior_cdict=prior_cdict)
+        ai_json["routes"] = routes
+        ai_json["routes_meta"] = meta
+    except Exception as e:
+        print("Route engine error:", e)
+        traceback.print_exc()
+
+    # Save results back to DB
+    try:
+        supabase.table("reports").update({
+            "ai_status": "completed",
+            "ai_results": ai_json,
+            "ai_error": None,
+            "processed_at": datetime.utcnow().isoformat()
+        }).eq("id", report_id).execute()
+        print(f"✅ Report {report_id} processed — saved results.")
+    except Exception as e:
+        print("Failed saving results back to supabase:", e)
+        traceback.print_exc()
+
+    return ai_json
+
+# -------------------------
+# Main loop
+# -------------------------
 def main():
     print("Entering main loop...")
     while True:
         try:
             res = supabase.table("reports").select("*").eq("ai_status", "pending").limit(1).execute()
-            # supabase client returns APIResponse-like object — read `.model` for rows
-            jobs = getattr(res, "model", None) or []
+            jobs = safe_get_api_data(res) or []
+
             if not jobs:
                 print("No jobs...")
                 time.sleep(1)
                 continue
 
             job = jobs[0]
-            print(f"🔎 Found job {job.get('id')}")
-            supabase.table("reports").update({"ai_status": "processing"}).eq("id", job.get("id")).execute()
+            job_id = job.get("id")
+            print("🔎 Found job:", job_id)
+            # mark processing
+            supabase.table("reports").update({"ai_status": "processing"}).eq("id", job_id).execute()
 
-            process_report(job)
+            try:
+                process_report(job)
+            except Exception as e:
+                print("Error while processing job:", e)
+                traceback.print_exc()
+                # mark failed
+                supabase.table("reports").update({"ai_status":"failed", "ai_error": str(e)}).eq("id", job_id).execute()
 
         except Exception as e:
-            print("LOOP ERROR:", e)
+            print("LOOP ERROR:", type(e).__name__, e)
             traceback.print_exc()
-            time.sleep(2)
+            time.sleep(3)
 
 if __name__ == "__main__":
     main()
