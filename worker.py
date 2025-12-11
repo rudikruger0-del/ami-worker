@@ -1,98 +1,83 @@
 #!/usr/bin/env python3
 """
-AMI Worker V4
-- Handles scanned (image) PDFs via pdf2image -> OpenAI Vision (Responses API, input_image)
-- Handles digital PDFs via pypdf text extraction
-- Uses a robust route engine: Patterns -> Routes -> Suggested Next Steps
-- Adds urgency flags, severity grading, differential suggestions, and simple trend comparison
-- Writes results back to Supabase 'reports' table as ai_results with structured JSON
+AMI Worker v4
+
+Features:
+- handles scanned & digital PDFs
+- prefers local OCR via pytesseract (if available)
+- OpenAI fallback (chat completions) for OCR if pytesseract not available
+- robust CBC + chemistry parsing (best-effort)
+- Route Engine v4: patterns -> routes -> next_steps
+- severity (1-5), urgency (low/med/high), simple differential trees, trend comparison
+- defensive logging for debugging in Railway logs
+
+Before using local OCR:
+- Add pytesseract to requirements.txt
+- Install tesseract-ocr in Dockerfile (apt-get install -y tesseract-ocr)
 """
+
+import os
+import time
+import io
+import json
+import re
+import traceback
+import base64
+from typing import Any, Dict, List, Optional, Tuple
+
+# Third-party imports (must be present in your runtime)
+from supabase import create_client, Client
+from openai import OpenAI
+from pypdf import PdfReader
+from pdf2image import convert_from_bytes
+from PIL import Image
 
 print(">>> AMI Worker v4 starting — Pattern → Route → Next Steps")
 
-# ------------------------
-# Standard imports
-# ------------------------
-import os
-import time
-import json
-import io
-import traceback
-import datetime
-import re
-from typing import Optional, List, Dict, Any
-
-# ------------------------
-# Third-party imports with defensive prints
-# ------------------------
+# Try local OCR via pytesseract if available
+USE_PYTESSACT = False
 try:
-    from supabase import create_client, Client
-    print(">>> supabase client imported")
+    import pytesseract  # type: ignore
+    USE_PYTESSACT = True
+    print(">>> pytesseract available — local OCR enabled")
 except Exception as e:
-    print("❌ Could not import supabase:", e)
-    raise
+    print(">>> pytesseract not available; will use OpenAI Vision fallback for OCR:", e)
 
-try:
-    from openai import OpenAI
-    print(">>> openai client imported")
-except Exception as e:
-    print("❌ Could not import openai:", e)
-    raise
-
-try:
-    from pypdf import PdfReader
-    print(">>> pypdf imported")
-except Exception as e:
-    print("❌ Could not import pypdf:", e)
-    raise
-
-try:
-    from pdf2image import convert_from_bytes
-    print(">>> pdf2image imported")
-except Exception as e:
-    print("⚠️ pdf2image not available or poppler not installed:", e)
-    # We'll raise later if we need to OCR scanned PDFs
-    convert_from_bytes = None
-
-# ------------------------
-# Environment + clients
-# ------------------------
+# -------------------------
+# Environment + Clients
+# -------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_KEY missing")
+    raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_KEY is missing")
+
+if not OPENAI_API_KEY:
+    print("⚠️ OPENAI_API_KEY not set — OpenAI fallback will fail if used")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-client = OpenAI(api_key=OPENAI_API_KEY)  # may provide responses API
+client = OpenAI(api_key=OPENAI_API_KEY)
+
 BUCKET = "reports"
 
-# ------------------------
-# Utility helpers
-# ------------------------
-def safe_print(*args, **kwargs):
-    try:
-        print(*args, **kwargs)
-    except Exception:
-        pass
+# -------------------------
+# Utilities
+# -------------------------
+def debug(*args, **kwargs):
+    print("DEBUG:", *args, **kwargs)
 
-def now_iso():
-    return datetime.datetime.utcnow().isoformat() + "Z"
-
-def clean_number(val) -> Optional[float]:
-    """Normalise and extract the first numeric value from strings like '88.0%', '11,6 g/dL', '<0.2' -> float"""
+def clean_number(val: Any) -> Optional[float]:
+    """Convert strings like '88.0%', '11,6 g/dL', '4.2*' to float, else None"""
     if val is None:
         return None
     if isinstance(val, (int, float)):
         return float(val)
-    s = str(val).strip()
-    if s == "":
+    s = str(val)
+    if s.strip() == "":
         return None
-    # Replace comma decimal
     s = s.replace(",", ".")
-    # Remove common trailing characters like % or *
-    # Use regex to get first float-looking token
+    # look for -?digits[.digits]
     m = re.search(r"-?\d+\.?\d*", s)
     if not m:
         return None
@@ -101,735 +86,755 @@ def clean_number(val) -> Optional[float]:
     except Exception:
         return None
 
-# ------------------------
-# PDF text extraction
-# ------------------------
+def severity_from_routes(routes: List[str]) -> int:
+    """Simple severity grading: 1 (mild) ... 5 (critical)"""
+    score = 1
+    for r in routes:
+        if "urgent" in r.lower() or "arrhythmia" in r.lower() or "rhabdomyolysis" in r.lower():
+            score = max(score, 5)
+        elif "renal" in r.lower() or "creatinine" in r.lower():
+            score = max(score, 4)
+        elif "infection" in r.lower() or "inflammation" in r.lower():
+            score = max(score, 3)
+        elif "anaemia" in r.lower() or "iron" in r.lower():
+            score = max(score, 2)
+    return score
+
+def urgency_flag_from_severity(sev: int) -> str:
+    if sev >= 5:
+        return "high"
+    if sev >= 3:
+        return "medium"
+    return "low"
+
+# -------------------------
+# PDF helpers
+# -------------------------
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """Extract text from selectable PDFs. Returns concatenated text of pages."""
+    """Extract selectable text from PDF using pypdf"""
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         pages = []
         for p in reader.pages:
-            txt = p.extract_text() or ""
+            try:
+                txt = p.extract_text() or ""
+            except Exception:
+                txt = ""
             pages.append(txt)
-        combined = "\n\n".join(pages).strip()
-        return combined
+        return "\n\n".join(pages).strip()
     except Exception as e:
-        safe_print("PDF parse error:", e)
+        debug("pypdf parse error:", e)
         return ""
 
 def is_scanned_pdf(pdf_text: str) -> bool:
-    """If very little text was extracted, assume it's a scanned PDF."""
+    """Heuristic: if no text or too short -> scanned"""
     if not pdf_text:
         return True
-    if len(pdf_text.strip()) < 30:
-        return True
-    return False
+    return len(pdf_text.strip()) < 30
 
-# ------------------------
-# OpenAI Vision OCR (Responses API, input_image) - robust wrapper
-# ------------------------
-def ocr_image_via_responses(image_bytes: bytes) -> Dict[str, Any]:
-    """
-    Perform OCR / table extraction on a single image using the OpenAI Responses API.
-    Important: This uses 'input_image' style in 'input' list (binary image bytes), preventing token explosion.
-    Returns a dict like {"cbc": [ {analyte, value, units, reference_low, reference_high} ] }
-    If failure -> returns {"cbc": []}
-    """
-    system_prompt = (
-        "You are an OCR assistant specialised in laboratory reports. "
-        "Extract ALL analytes you can see: CBC (Hb, RBC, HCT, MCV, MCH, MCHC), differential (neutrophils/lymphocytes/monocytes/eosinophils/basophils), platelets, ESR, CRP, "
-        "electrolytes (Na/K/Ca/Cl), urea, creatinine, eGFR, ALT/AST/ALP/GGT, bilirubin, CK, CK-MB and other chemistry values.\n\n"
-        "Return STRICT JSON only with this structure:\n"
-        "{ \"cbc\": [ { \"analyte\": \"\", \"value\": \"\", \"units\": \"\", \"reference_low\": \"\", \"reference_high\": \"\" } ] }\n"
-        "Do not add any extra commentary."
-    )
-
-    # Prefer Responses API if available
+# -------------------------
+# Local OCR via pytesseract
+# -------------------------
+def ocr_image_local(img: Image.Image) -> str:
+    """Use pytesseract to extract text from a PIL image"""
     try:
-        # client.responses.create should support binary `input_image` objects per 2025 API
-        resp = client.responses.create(
-            model="gpt-4o",
-            response_format={"type": "json_object"},
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": "Please extract analytes from the attached image."},
-                {
-                    # input_image block — binary image bytes and mime_type
-                    "input_image": {
-                        "data": image_bytes,
-                        "mime_type": "image/png"
+        # convert to grayscale for better OCR
+        g = img.convert("L")
+        # optionally resize if too small
+        w, h = g.size
+        if w < 800:
+            g = g.resize((int(w * 2), int(h * 2)), Image.LANCZOS)
+        text = pytesseract.image_to_string(g)
+        return text or ""
+    except Exception as e:
+        debug("pytesseract OCR error:", e)
+        return ""
+
+# -------------------------
+# OpenAI OCR fallback (chat completions)
+# -------------------------
+def ocr_image_openai_fallback(img: Image.Image) -> Optional[Dict[str, Any]]:
+    """
+    Fallback OCR that sends a resized/optimized base64 image to OpenAI chat completions.
+    Returns parsed JSON dict { 'cbc': [ {analyte, value, units, reference_low, reference_high} ] } OR None
+    NOTE: This is fallback and may be limited by token/use restrictions.
+    """
+    try:
+        # Resize to reasonable size and encode jpeg to reduce base64 length
+        MAX_DIM = 1600  # keep within limits
+        w, h = img.size
+        scale = min(1.0, float(MAX_DIM) / max(w, h))
+        if scale < 1.0:
+            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=70, optimize=True)
+        b = buf.getvalue()
+        b64 = base64.b64encode(b).decode("utf-8")
+
+        # Build compact system prompt
+        system_prompt = (
+            "You are an OCR assistant extracting laboratory analyte tables from a lab report image. "
+            "Return STRICT JSON: { 'cbc': [ { 'analyte': '', 'value': '', 'units': '', 'reference_low':'', 'reference_high':'' } ] } "
+            "Return only JSON."
+        )
+
+        # Use chat completions create (openai==1.51.0)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                # Use image_url with a data URI object (best-effort for this OpenAI lib/version).
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            # "url" key expected to be a string URI; here we pass data:image/jpeg;base64,...
+                            "url": f"data:image/jpeg;base64,{b64}"
+                        }
                     }
-                }
-            ],
-            # keep temperature low for deterministic extraction
-            temperature=0.0
-        )
+                ],
+            },
+        ]
 
-        # resp.output -> list; content[0].json should be the parsed object
-        out = None
-        try:
-            out = resp.output[0].content[0].json
-        except Exception:
-            # Some clients may expose different shapes — try safer extraction
-            # resp.output can be a list of dicts
-            safe_print("OCR: unexpected response shape, raw resp:", getattr(resp, "output", None))
-            # fallback: attempt to parse text field if present
-            try:
-                text_content = resp.output_text or ""
-                out = json.loads(text_content)
-            except Exception:
-                out = None
-
-        if isinstance(out, dict):
-            # ensure at least an empty cbc list
-            if "cbc" not in out or not isinstance(out["cbc"], list):
-                out["cbc"] = out.get("cbc", [])
-            return out
-        else:
-            safe_print("OCR: response did not yield dict JSON; returning empty")
-            return {"cbc": []}
-
-    except Exception as e:
-        safe_print("OCR call failed (Responses API):", type(e).__name__, e)
-        # Try fallback to chat.completions (older client) if available
-    # Fallback path: older openai clients used chat.completions with structured messages.
-    try:
-        # Build a plain chat-completion call that includes an image_url-like object (some clients support this)
-        # NOTE: This fallback may fail depending on client version — keep guarded.
-        resp2 = client.chat.completions.create(
+        resp = client.chat.completions.create(
             model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,<omitted>"} } ]}
-            ],
+            messages=messages,
             response_format={"type": "json_object"},
-            temperature=0.0
+            temperature=0.0,
         )
-        # If this works (rare), extract json
-        raw = resp2.choices[0].message.content
+
+        # In some returns the content JSON is in resp.choices[0].message.content
+        raw = None
+        try:
+            raw = resp.choices[0].message.content
+        except Exception:
+            try:
+                raw = resp.choices[0].message.parsed  # earlier patterns
+            except Exception:
+                # fallback to printing whole response for debugging
+                debug("OpenAI OCR resp full:", getattr(resp, "__dict__", resp))
+                return None
+
+        # raw might be string or already JSON object; try to parse safely
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+                return parsed
+            except Exception:
+                debug("Could not parse raw string OCR JSON:", raw[:200])
+                return None
         if isinstance(raw, dict):
             return raw
-        # sometimes it's string
+        # if it's a list or other structure, try to locate the json field
         try:
-            return json.loads(raw)
+            # Try common place
+            parsed = getattr(resp.choices[0].message, "parsed", None)
+            if isinstance(parsed, dict):
+                return parsed
         except Exception:
-            return {"cbc": []}
-    except Exception as e2:
-        safe_print("OCR fallback failed:", type(e2).__name__, e2)
-        return {"cbc": []}
+            pass
 
-# ------------------------
-# Text interpretation via AI (main interpretation model)
-# ------------------------
-def interpret_text_via_responses(text: str) -> Dict[str, Any]:
+        debug("OpenAI OCR returned unknown structure:", type(raw))
+        return None
+
+    except Exception as e:
+        debug("OpenAI OCR exception:", e)
+        return None
+
+# -------------------------
+# Table extraction heuristics
+# -------------------------
+def parse_cbc_rows_from_text(text: str) -> List[Dict[str, Any]]:
     """
-    Send extracted text or JSON table to the interpretation model.
-    Returns a dict with keys: patient, cbc (list), summary (impression + suggested_follow_up)
+    Heuristic parser: tries to find common analytes and values from OCR/text.
+    Returns list of dicts {analyte, value, units, reference_low, reference_high}
+    This is intentionally permissive (we then clean numbers).
     """
+    rows: List[Dict[str, Any]] = []
     if not text:
-        return {}
+        return rows
 
-    system_prompt = (
-        "You are AMI — an assistive clinical tool for interpreting blood results. Do NOT give a formal diagnosis or prescribe. "
-        "Return STRICT JSON with: patient, cbc (list of analytes with value/units/reference_low/reference_high/flag), summary (impression and suggested_follow_up).\n"
-        "If values are missing, omit them. Keep output machine-friendly and concise."
+    # normalize whitespace
+    text = text.replace("\r", "\n")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    # common analytes keywords we look for
+    analyte_keywords = [
+        "haemoglobin", "hemoglobin", "hb", "hematocrit", "hct",
+        "rbc", "erythrocyte", "mcv", "mch", "mchc", "rdw",
+        "wbc", "leucocyte", "leukocyte", "neutrophil", "lymphocyte",
+        "monocyte", "eosinophil", "basophil", "platelet", "platelets",
+        "sodium", "potassium", "chloride", "creatinine", "urea", "crp",
+        "alt", "ast", "alkaline phosphatase", "alp", "ggt", "bilirubin",
+        "ck-mb", "ck", "glucose", "bicarbonate", "co2"
+    ]
+    # Build regex to capture "name ... value (ref low - ref high)" patterns
+    # Examples we try to match:
+    # "Haemoglobin: 11.6 g/dL (ref: 12.4-16.7) — low"
+    # "MCV 78.9 fL (ref: 79−100) — low"
+    pattern = re.compile(
+        r"(?P<name>[A-Za-z %/\-\+()0-9]+?)\s*(?:[:\-])?\s*(?P<value>-?\d+[\.,]?\d*\%?)\s*(?P<units>[a-zA-Z/^\.\%\d°]*)\s*(?:\(?ref[:=]?\s*(?P<ref_low>-?\d+[\.,]?\d*)\s*[-–]\s*(?P<ref_high>-?\d+[\.,]?\d*)\)?)?",
+        re.IGNORECASE
     )
 
-    try:
-        resp = client.responses.create(
-            model="gpt-4o-mini",
-            response_format={"type": "json_object"},
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text}
-            ],
-            temperature=0.05
-        )
-        try:
-            out = resp.output[0].content[0].json
-        except Exception:
-            safe_print("Interpret: unexpected response shape; trying output_text")
-            out = None
-            try:
-                out = json.loads(resp.output_text)
-            except Exception:
-                out = None
+    # Try scanning each line for analytes or matches
+    for ln in lines:
+        # quick check whether common analyte referenced
+        low = ln.lower()
+        if any(k in low for k in analyte_keywords):
+            # try pattern
+            m = pattern.search(ln)
+            if m:
+                name = m.group("name").strip()
+                value = m.group("value").strip()
+                units = (m.group("units") or "").strip()
+                ref_low = (m.group("ref_low") or "").strip()
+                ref_high = (m.group("ref_high") or "").strip()
+                rows.append({
+                    "analyte": name,
+                    "value": value,
+                    "units": units,
+                    "reference_low": ref_low,
+                    "reference_high": ref_high
+                })
+                continue
+            # fallback: split by spaces and try to find numeric token
+            tokens = ln.split()
+            numeric = None
+            for t in tokens:
+                if re.search(r"-?\d+[\.,]?\d*\%?", t):
+                    numeric = t
+                    break
+            if numeric:
+                # approximated analyte name is first few tokens
+                name = " ".join(tokens[:min(3, len(tokens))])
+                rows.append({
+                    "analyte": name,
+                    "value": numeric,
+                    "units": "",
+                    "reference_low": "",
+                    "reference_high": ""
+                })
+    return rows
 
-        if isinstance(out, dict):
-            return out
-        else:
-            safe_print("Interpret: non-dict response, returning empty")
-            return {}
-    except Exception as e:
-        safe_print("Interpretation call failed (Responses API):", type(e).__name__, e)
-        # Fallback to chat.completions if available
-    try:
-        resp2 = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text}
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.05
-        )
-        raw = resp2.choices[0].message.content
-        if isinstance(raw, dict):
-            return raw
-        try:
-            return json.loads(raw)
-        except Exception:
-            return {}
-    except Exception as e2:
-        safe_print("Interpret fallback failed:", e2)
-        return {}
-
-# ------------------------
-# Build canonical cbc dict for routes
-# ------------------------
-def build_cbc_value_dict(ai_json: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+# -------------------------
+# Build canonical CBC dict for routing
+# -------------------------
+def build_cbc_value_dict(extracted_rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """
-    Convert ai_json['cbc'] list -> dictionary keyed by canonical names
+    Map heterogeneous analyte names to canonical keys used in route engine:
+    'Hb', 'MCV','MCH','WBC','Neutrophils','Lymphocytes','Platelets','Creatinine', etc.
     """
-    mapping = {}
-    rows = ai_json.get("cbc") or []
-    for r in rows:
-        if not isinstance(r, dict):
+    out: Dict[str, Dict[str, Any]] = {}
+    for r in extracted_rows:
+        name = (r.get("analyte") or "").lower()
+        if not name:
             continue
-        name = (r.get("analyte") or r.get("test") or "").strip().lower()
-        value = r.get("value")
-        # canonical mapping heuristics:
-        if any(k in name for k in ["hemoglobin", "haemoglobin", "hb"]):
-            mapping["Hb"] = {"raw": r, "value": clean_number(value)}
+        def put(k):
+            if k not in out:
+                out[k] = r
+
+        if "haemoglobin" in name or "hemoglobin" in name or name.strip() == "hb":
+            put("Hb")
         elif name.startswith("mcv"):
-            mapping["MCV"] = {"raw": r, "value": clean_number(value)}
+            put("MCV")
+        elif name.startswith("mchc") or "mchc" in name:
+            put("MCHC")
         elif name.startswith("mch"):
-            mapping["MCH"] = {"raw": r, "value": clean_number(value)}
-        elif "rbc" in name or "red cell" in name:
-            mapping["RBC"] = {"raw": r, "value": clean_number(value)}
-        elif "white" in name or "wbc" in name or "leucocyte" in name or "leukocyte" in name:
-            mapping["WBC"] = {"raw": r, "value": clean_number(value)}
-        elif "neutrophil" in name or name.startswith("neut"):
-            mapping["Neutrophils"] = {"raw": r, "value": clean_number(value)}
+            put("MCH")
+        elif "rdw" in name:
+            put("RDW")
+        elif "rbc" in name or "erythro" in name:
+            put("RBC")
+        elif "hematocrit" in name or "hct" in name:
+            put("Hct")
+        elif "white" in name or "wbc" in name or "leukocyte" in name or "leucocyte" in name:
+            put("WBC")
+        elif "neutroph" in name:
+            put("Neutrophils")
         elif "lymph" in name:
-            mapping["Lymphocytes"] = {"raw": r, "value": clean_number(value)}
+            put("Lymphocytes")
+        elif "monocyt" in name:
+            put("Monocytes")
+        elif "eosin" in name:
+            put("Eosinophils")
+        elif "basoph" in name:
+            put("Basophils")
         elif "platelet" in name or "plt" in name:
-            mapping["Platelets"] = {"raw": r, "value": clean_number(value)}
-        elif "creatinine" in name:
-            mapping["Creatinine"] = {"raw": r, "value": clean_number(value)}
-        elif "urea" in name:
-            mapping["Urea"] = {"raw": r, "value": clean_number(value)}
-        elif name in ("alt", "alanine aminotransferase", "sgpt"):
-            mapping["ALT"] = {"raw": r, "value": clean_number(value)}
-        elif name in ("ast", "aspartate aminotransferase", "sgot"):
-            mapping["AST"] = {"raw": r, "value": clean_number(value)}
-        elif "alp" in name:
-            mapping["ALP"] = {"raw": r, "value": clean_number(value)}
-        elif "ggt" in name or "gamma" in name:
-            mapping["GGT"] = {"raw": r, "value": clean_number(value)}
-        elif "bilirubin" in name:
-            mapping["Bilirubin"] = {"raw": r, "value": clean_number(value)}
-        elif name in ("ck", "creatine kinase"):
-            mapping["CK"] = {"raw": r, "value": clean_number(value)}
-        elif "ck-mb" in name or "ck mb" in name:
-            mapping["CK-MB"] = {"raw": r, "value": clean_number(value)}
-        elif "sodium" in name or name == "na":
-            mapping["Sodium"] = {"raw": r, "value": clean_number(value)}
-        elif "potassium" in name or name == "k":
-            mapping["Potassium"] = {"raw": r, "value": clean_number(value)}
-        elif "calcium" in name or name.startswith("ca"):
-            mapping["Calcium"] = {"raw": r, "value": clean_number(value)}
+            put("Platelets")
+        elif "creatinine" in name or name.strip() == "crea":
+            put("Creatinine")
+        elif name.startswith("urea"):
+            put("Urea")
+        elif "sodium" in name or name.strip() == "na":
+            put("Sodium")
+        elif "potassium" in name or name.strip() == "k":
+            put("Potassium")
+        elif "chloride" in name:
+            put("Chloride")
         elif "crp" in name:
-            mapping["CRP"] = {"raw": r, "value": clean_number(value)}
+            put("CRP")
+        elif "alt" in name or "alanine" in name:
+            put("ALT")
+        elif "ast" in name or "aspartate" in name:
+            put("AST")
+        elif "alkaline" in name or "alp" in name:
+            put("ALP")
+        elif "ggt" in name:
+            put("GGT")
+        elif "bilirubin" in name:
+            put("Bilirubin")
+        elif "ck-mb" in name or "ck mb" in name:
+            put("CK-MB")
+        elif name.strip() == "ck":
+            put("CK")
+        # else keep a general fallback by short name token
         else:
-            # also include any other analyte under 'other' by its raw name
-            if name:
-                mapping[name] = {"raw": r, "value": clean_number(value)}
-    return mapping
+            # small normalization: first token
+            tk = name.split()[0].upper()
+            put(tk)
+    return out
 
-# ------------------------
-# Route Engine V4: Patterns -> Routes -> Next Steps
-# ------------------------
-def route_engine_v4(cbc_values: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+# -------------------------
+# Route Engine v4
+# -------------------------
+def generate_clinical_routes_v4(cbc_values: Dict[str, Dict[str, Any]], previous: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Given canonical cbc_values, produce:
-     - patterns: short list of detected patterns
-     - routes: what to do / areas to investigate
-     - next_steps: specific practical next tests/actions (general)
-     - urgency: 'low'|'moderate'|'high'
-     - severity_score: 0..10
-     - differentials: short tree-like list of likely differentials
+    Returns dictionary:
+    {
+      "patterns": [...],
+      "routes": [...],
+      "next_steps": [...],
+      "severity": int (1-5),
+      "urgency": "low|medium|high",
+      "differential": [...],
+      "trend": "improving|worse|stable|no_data"
+    }
     """
-    patterns = []
-    routes = []
-    next_steps = []
-    differentials = []
-    urgency = "low"
-    severity = 0  # 0..10
-
-    # helper to get numeric
     def v(key):
-        val = cbc_values.get(key)
-        return None if val is None else val.get("value")
+        return clean_number(cbc_values.get(key, {}).get("value"))
 
     Hb = v("Hb")
     MCV = v("MCV")
     MCH = v("MCH")
+    MCHC = v("MCHC")
+    RDW = v("RDW")
     WBC = v("WBC")
-    Neut = v("Neutrophils") or v("Neut")
+    Neut = v("Neutrophils")
     Lymph = v("Lymphocytes")
     Plt = v("Platelets")
     Cr = v("Creatinine")
     Urea = v("Urea")
-    ALT = v("ALT")
-    AST = v("AST")
-    ALP = v("ALP")
-    Bili = v("Bilirubin")
-    CK = v("CK")
+    CRP = v("CRP")
     Na = v("Sodium")
     K = v("Potassium")
-    CRP = v("CRP")
+    ALT = v("ALT")
+    AST = v("AST")
+    Bili = v("Bilirubin")
+    CK = v("CK")
+    CKMB = v("CK-MB")
 
-    # quick helper to bump severity/urgency
-    def bump(sev_delta=1, set_urgency=None):
-        nonlocal severity, urgency
-        severity = min(10, severity + sev_delta)
-        if set_urgency:
-            if set_urgency == "high":
-                urgency = "high"
-            elif set_urgency == "moderate" and urgency != "high":
-                urgency = "moderate"
+    patterns = []
+    routes = []
+    next_steps = []
+    differential = []
 
-    # ---------- Anaemia logic ----------
+    # Anaemia patterns
     if Hb is not None:
-        # using adult male cutoff ~13 g/dL (adjust in future by sex/age)
         if Hb < 8:
             patterns.append("Severe anaemia")
-            routes.append("Immediate anaemia route — urgent clinical review recommended")
-            next_steps.append("Urgent full clinical review; transfusion threshold depends on clinical context")
-            bump(3, "high")
-            differentials.append({"Anaemia": ["Acute blood loss", "Hemolysis", "Severe iron deficiency", "Bone marrow failure"]})
+            routes.append("Urgent anaemia route - consider transfusion thresholds, haemodynamic assessment")
+            next_steps.append("Immediate clinical review; order repeat CBC, crossmatch if bleeding or symptomatic")
+            differential.extend(["Acute blood loss", "Severe iron deficiency", "haemolysis", "bone marrow failure"])
         elif Hb < 11:
-            patterns.append("Moderate anaemia")
-            routes.append("Investigate cause of anaemia (MCV-based)")
-            bump(2, "moderate")
-            # MCV patterns
+            patterns.append("Anaemia")
             if MCV is not None:
                 if MCV < 80:
-                    patterns.append("Microcytic pattern")
-                    routes.append("Likely iron-deficiency / chronic blood loss route")
-                    next_steps.append("Ferritin, iron studies (TIBC/Transferrin), reticulocyte count")
-                    differentials.append({"Microcytic anaemia": ["Iron deficiency", "Thalassaemia trait", "Chronic disease (late)"]})
-                elif MCV >= 100:
-                    patterns.append("Macrocytic pattern")
-                    routes.append("Consider B12/folate deficiency, liver disease, drugs")
-                    next_steps.append("B12, folate, LFTs, review medication list (e.g. methotrexate, anticonvulsants)")
-                    differentials.append({"Macrocytic anaemia": ["B12/folate deficiency", "Alcohol/liver disease", "Myelodysplasia"]})
-                else:
+                    patterns.append("Microcytic anaemia")
+                    routes.append("Microcytic anaemia route")
+                    next_steps.append("Order ferritin, iron studies, reticulocyte count")
+                    differential.extend(["Iron deficiency", "Thalassaemia trait", "Chronic blood loss"])
+                elif 80 <= MCV <= 100:
                     patterns.append("Normocytic anaemia")
-                    routes.append("Consider chronic disease, renal impairment, early iron deficiency")
-                    next_steps.append("Consider renal function, CRP, reticulocyte count")
-                    differentials.append({"Normocytic anaemia": ["Chronic disease", "Renal disease", "Acute blood loss", "Hemolysis"]})
+                    routes.append("Normocytic anaemia route")
+                    next_steps.append("Consider inflammation, renal disease; check renal function and CRP")
+                    differential.extend(["Anaemia of chronic disease", "early iron deficiency", "haemolysis"])
+                else:
+                    patterns.append("Macrocytic anaemia")
+                    routes.append("Macrocytic anaemia route")
+                    next_steps.append("Check B12, folate, review medications and liver function")
+                    differential.extend(["B12/folate deficiency", "alcohol/liver disease", "drugs"])
             else:
-                next_steps.append("Obtain MCV to subtype anaemia")
-        else:
-            # normal Hb
-            pass
+                next_steps.append("MCV missing — request RBC indices (MCV, MCH, MCHC)")
 
-    # ---------- White cell patterns ----------
+    # Leukocyte patterns
     if WBC is not None:
-        if WBC >= 20:
-            patterns.append("Marked leukocytosis")
-            routes.append("Severe inflammatory/infective / haematologic route")
-            next_steps.append("Clinical review, blood cultures if septic picture; consider urgent haematology review")
-            bump(3, "high")
-            differentials.append({"Marked leukocytosis": ["Severe bacterial infection", "Leukaemoid reaction", "Primary haematologic neoplasm"]})
-        elif WBC > 12:
+        if WBC > 12:
             patterns.append("Leukocytosis")
-            if Neut is not None and Neut > 70:
-                patterns.append("Neutrophilia pattern")
-                routes.append("Bacterial infection / acute inflammation route")
-                next_steps.append("Consider cultures, antibiotics guided by clinical context")
-                differentials.append({"Neutrophilia": ["Bacterial infection", "Steroids", "Stress response"]})
-            elif Lymph is not None and Lymph > 45:
-                patterns.append("Lymphocytosis pattern")
-                routes.append("Viral or recovery-phase pattern")
-                next_steps.append("Consider viral testing depending on symptoms")
-                differentials.append({"Lymphocytosis": ["Viral infection", "Pertussis", "Chronic lymphocytic leukaemia (older)"]})
-            bump(1, "moderate")
+            routes.append("Inflammatory / infective route")
+            if Neut and Neut > 70:
+                patterns.append("Neutrophil predominance")
+                routes.append("Bacterial pattern more likely")
+                differential.extend(["Bacterial infection", "stress response", "steroid effect"])
+            if Lymph and Lymph > 45:
+                patterns.append("Lymphocytosis")
+                routes.append("Consider viral infection or recovery phase")
+                differential.extend(["Viral infection", "pertussis", "chronic lymphocytic processes"])
         elif WBC < 4:
             patterns.append("Leukopenia")
-            routes.append("Consider viral suppression, bone marrow suppression or drug effect")
-            next_steps.append("Check medication list, repeat WBC, consider viral screen")
-            bump(2, "moderate")
-            differentials.append({"Leukopenia": ["Viral infection", "Drug-induced", "Bone marrow failure"]})
+            routes.append("Consider bone marrow suppression, viral, drug causes")
+            differential.extend(["Viral suppression", "bone marrow failure", "drug toxicity"])
 
-    # ---------- Platelets ----------
+    # Platelets
     if Plt is not None:
         if Plt < 50:
             patterns.append("Severe thrombocytopenia")
-            routes.append("High bleeding risk — urgent review")
-            next_steps.append("Clinical bleeding assessment, urgent haematology review; repeat platelet count")
-            bump(3, "high")
-            differentials.append({"Severe thrombocytopenia": ["Immune thrombocytopenia", "DIC", "Bone marrow failure", "Drug-induced"]})
+            routes.append("Urgent bleeding risk route")
+            next_steps.append("Immediate clinical review; check for bleeding, repeat platelet count")
+            differential.extend(["ITP", "DIC", "sepsis", "drug-induced"])
         elif Plt < 150:
-            patterns.append("Thrombocytopenia")
-            routes.append("Investigate for immune, consumptive or marrow causes")
-            next_steps.append("Review medications, assess for splenomegaly, consider peripheral smear")
-            bump(1, "moderate")
+            patterns.append("Mild thrombocytopenia")
+            routes.append("Investigate for infection, consumptive or marrow causes")
         elif Plt > 450:
             patterns.append("Thrombocytosis")
-            routes.append("Reactive thrombocytosis vs primary myeloproliferative disorder")
-            next_steps.append("Assess for infection/inflammation/iron deficiency; consider repeat and platelet function if needed")
-            differentials.append({"Thrombocytosis": ["Reactive (infection/inflammation/iron deficiency)", "Primary MPN"]})
+            routes.append("Reactive thrombocytosis vs primary process")
+            differential.extend(["Reactive (infection/inflammation/iron deficiency)", "myeloproliferative disorder"])
 
-    # ---------- Renal ----------
+    # Inflammation & CRP
+    if CRP is not None:
+        if CRP > 100:
+            patterns.append("Very high CRP")
+            routes.append("High inflammatory burden — urgent assessment for sepsis/serious infection")
+            next_steps.append("Blood cultures, start antibiotics if sepsis suspected")
+            differential.extend(["Sepsis", "severe bacterial infection", "major inflammatory process"])
+        elif CRP > 10:
+            patterns.append("Raised CRP")
+            routes.append("Active inflammation/infection likely — correlate with WBC/diff")
+            next_steps.append("Correlate clinically; consider further infectious workup or imaging")
+
+    # Kidney / Creatinine
     if Cr is not None:
-        # crude adult creatinine threshold (uM); consider sex/age in later improvements
-        if Cr > 150:
-            patterns.append("Elevated creatinine")
+        # creatinine reference varies; we treat >110 umol/L roughly as high for adult average
+        if Cr > 120:
+            patterns.append("Raised creatinine")
             routes.append("Renal impairment route")
-            next_steps.append("Repeat U&E; check urine output, consider ultrasound and nephrology if rising")
-            bump(2, "moderate")
-            differentials.append({"High creatinine": ["AKI (pre-renal, intrinsic)", "CKD"]})
-        elif Cr > 120:
-            patterns.append("Mildly elevated creatinine")
-            next_steps.append("Correlate with prior result / hydration status")
+            next_steps.append("Check U&E trend, urine output, medication review, consider nephrology if worsening")
+            differential.extend(["AKI (pre-renal, renal, post-renal)", "CKD"])
 
-    # ---------- Liver ----------
-    # treat ALT/AST absolute numbers—thresholds simplified; later replace with lab references
-    if ALT is not None or AST is not None or Bili is not None:
-        Lvals = [x for x in (ALT, AST, Bili) if x is not None]
-        if any(x is not None and x > 3 * 40 for x in (ALT, AST) if x is not None):
-            patterns.append("Marked transaminitis")
+    # LFTs
+    if any(x is not None for x in (ALT, AST, Bili)):
+        if (ALT and ALT > 120) or (AST and AST > 120):
+            patterns.append("Marked transaminase elevation")
             routes.append("Hepatocellular injury route")
-            next_steps.append("Assess for viral hepatitis, toxins, drugs and consider urgent hepatology if symptomatic")
-            bump(3, "high")
-            differentials.append({"Transaminitis": ["Acute viral hepatitis", "Drug/toxin", "Ischemic hepatitis"]})
-        elif any(x is not None and x > 1.5 * 40 for x in (ALT, AST) if x is not None):
-            patterns.append("Mild-moderate transaminitis")
-            routes.append("Consider viral/medication/alcohol-related causes")
-            next_steps.append("Review medication and alcohol history, consider viral serology")
+            next_steps.append("Assess for viral hepatitis, drugs, ischemia")
+        elif (ALT and ALT > 40) or (AST and AST > 40):
+            patterns.append("Mild-moderate LFT elevation")
+            routes.append("Consider viral, drugs, alcohol, NAFLD")
 
-        if Bili is not None and Bili > 20:
-            patterns.append("Hyperbilirubinaemia")
-            routes.append("Jaundice evaluation (hemolytic vs hepatic vs obstructive)")
-            next_steps.append("Fractionated bilirubin, ultrasound if obstructive features")
-            bump(2, "moderate")
-            differentials.append({"Hyperbilirubinaemia": ["Hemolysis", "Liver disease", "Obstruction"]})
-
-    # ---------- Cardiac / Muscle (CK) ----------
-    if CK is not None and CK > 1000:
-        patterns.append("Very high CK")
-        routes.append("Rhabdomyolysis physiology suspected")
-        next_steps.append("Check creatinine, urine myoglobin, aggressive fluids, consider urgent review")
-        bump(3, "high")
-        differentials.append({"High CK": ["Rhabdomyolysis (trauma, severe exertion, toxin)"]})
-
-    # ---------- Electrolytes ----------
+    # Electrolytes
     if K is not None:
         if K < 3.3:
             patterns.append("Hypokalaemia")
-            routes.append("Correct potassium and search for cause")
-            next_steps.append("Replace potassium; check ECG if symptomatic")
-            bump(2, "moderate")
+            routes.append("Risk of arrhythmia — replace potassium if symptomatic")
+            next_steps.append("ECG if symptomatic or severe; replace potassium carefully")
         elif K > 5.5:
             patterns.append("Hyperkalaemia")
-            routes.append("High arrhythmia risk — urgent management based on ECG/symptoms")
-            next_steps.append("Urgent ECG; treat hyperkalaemia per local protocol")
-            bump(3, "high")
+            routes.append("High arrhythmia risk — urgent ECG and management")
+            next_steps.append("Immediate ECG and hyperkalaemia protocol if present")
 
     if Na is not None:
         if Na < 130:
-            patterns.append("Moderate-severe hyponatraemia")
-            routes.append("Investigate volume status and endocrine causes")
-            next_steps.append("Assess volume status, review diuretics, consider endocrinology if chronic")
-            bump(2, "moderate")
+            patterns.append("Significant hyponatraemia")
+            routes.append("Assess fluid status, medications, endocrine causes")
+            next_steps.append("Consider urgent review if severe or symptomatic")
 
-    # ---------- Inflammation ----------
-    if CRP is not None:
-        if CRP > 100:
-            patterns.append("Very high CRP — strong inflammation")
-            routes.append("Suggest source-focused search and urgent evaluation")
-            next_steps.append("Correlate with WBC and clinical signs; consider imaging if source unclear")
-            bump(2, "moderate")
-        elif CRP > 10:
-            patterns.append("Raised CRP")
-            routes.append("Active inflammation/infection likely")
-            next_steps.append("Clinical correlation & targeted investigations")
-            bump(1, "moderate")
+    # CK
+    if CK is not None and CK > 1000:
+        patterns.append("Raised CK")
+        routes.append("Rhabdomyolysis concern")
+        next_steps.append("Check renal function, urine myoglobin, aggressive fluids")
+        differential.extend(["Trauma", "seizure", "exertional rhabdomyolysis", "statin/myopathy"])
 
-    # ---------- Build severity label ----------
-    if severity >= 7 or urgency == "high":
-        severity_label = "critical"
-    elif severity >= 4 or urgency == "moderate":
-        severity_label = "moderate"
-    else:
-        severity_label = "mild"
+    # Compose summary severity & urgency
+    sev = severity_from_routes(routes)
+    urg = urgency_flag_from_severity(sev)
 
-    # If nothing flagged, return reassuring message
-    if not patterns:
-        patterns.append("No major acute abnormalities detected.")
-        next_steps.append("Correlate clinically and compare with prior results if available.")
+    # Deduplicate lists, keep order
+    def uniq(seq):
+        outl = []
+        for s in seq:
+            if s not in outl:
+                outl.append(s)
+        return outl
+
+    patterns = uniq(patterns)
+    routes = uniq(routes)
+    next_steps = uniq(next_steps)
+    differential = uniq(differential)
+
+    # Trend comparison (if previous provided — expects previous dict of canonical values)
+    trend = "no_data"
+    try:
+        if previous and isinstance(previous, dict):
+            # quick heuristic: if previous has numeric Hb / Cr etc, compare
+            diffs = []
+            for k in ("Hb", "Creatinine", "CRP", "WBC", "Platelets"):
+                prev_val = clean_number(previous.get(k, {}).get("value") if previous.get(k) else None)
+                cur_val = clean_number(cbc_values.get(k, {}).get("value") if cbc_values.get(k) else None)
+                if prev_val is None or cur_val is None:
+                    continue
+                if cur_val > prev_val * 1.15:
+                    diffs.append((k, "worse"))
+                elif cur_val < prev_val * 0.85:
+                    diffs.append((k, "improved"))
+                else:
+                    diffs.append((k, "stable"))
+            # simple majority rule
+            worse = sum(1 for d in diffs if d[1] == "worse")
+            improved = sum(1 for d in diffs if d[1] == "improved")
+            if worse > improved:
+                trend = "worse"
+            elif improved > worse:
+                trend = "improving"
+            elif diffs:
+                trend = "stable"
+    except Exception:
+        trend = "no_data"
 
     return {
         "patterns": patterns,
         "routes": routes,
         "next_steps": next_steps,
-        "differentials": differentials,
-        "urgency": urgency,
-        "severity_score": severity,
-        "severity_label": severity_label
+        "differential": differential,
+        "severity": sev,
+        "urgency": urg,
+        "trend": trend
     }
 
-# ------------------------
-# Trend comparison (simple)
-# ------------------------
-def fetch_prior_reports(report_row: Dict[str, Any], limit: int = 3) -> List[Dict[str, Any]]:
+# -------------------------
+# Top-level processor
+# -------------------------
+def process_report(job: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Try to fetch prior completed reports for same patient (by patient_id or name).
-    This is best-effort: checks for patient_id field or name in report row.
+    job is a dict from supabase table 'reports', must contain id and file_path.
+    Optionally may contain 'previous_results' for trend comparison.
     """
-    try:
-        # If we have patient_id in DB row, use it
-        pid = report_row.get("patient_id")
-        name = report_row.get("name")
-        q = supabase.table("reports").select("*").eq("ai_status", "completed").order("created_at", {"ascending": False}).limit(limit)
-        if pid:
-            q = q.eq("patient_id", pid)
-        elif name:
-            q = q.ilike("name", f"%{name}%")
-        res = q.execute()
-        data = getattr(res, "data", None) or []
-        # Exclude current report if present
-        data = [r for r in data if r.get("id") != report_row.get("id")]
-        return data[:limit]
-    except Exception as e:
-        safe_print("fetch_prior_reports error:", e)
-        return []
+    report_id = job.get("id")
+    file_path = job.get("file_path") or ""
+    previous = job.get("previous_results")  # optional canonical dict
 
-def compute_trend_summary(current_cbc_map: Dict[str, Dict[str, Any]], priors: List[Dict[str, Any]]) -> List[str]:
-    """
-    Compare a few key analytes to previous reports (if any) and summarize trends.
-    """
-    out = []
-    if not priors:
-        return ["No prior data available for trend comparison."]
-    # build prior numeric snapshots (take most recent with ai_results.cbc)
-    def extract_map(report):
-        ai = report.get("ai_results") or {}
-        if isinstance(ai, str):
-            try:
-                ai = json.loads(ai)
-            except Exception:
-                return {}
-        rows = ai.get("cbc") or []
-        d = {}
-        for r in rows:
-            name = (r.get("analyte") or "").strip().lower()
-            val = clean_number(r.get("value"))
-            if name:
-                d[name] = val
-        return d
+    debug(f"Processing report {report_id} file_path={file_path}")
 
-    prior_maps = [extract_map(r) for r in priors]
-
-    # check a short list: Hb, WBC, Platelets, Creatinine, CRP
-    keys = [("haemoglobin", "Hb"), ("hemoglobin", "Hb"), ("white cell", "WBC"), ("wbc", "WBC"), ("platelet", "Platelets"), ("creatinine", "Creatinine"), ("crp", "CRP")]
-    checked = set()
-    for raw_key, canonical in keys:
-        if canonical in checked:
-            continue
-        checked.add(canonical)
-        # find current value
-        cur_entry = current_cbc_map.get(canonical)
-        cur_val = None
-        if cur_entry:
-            cur_val = cur_entry.get("value")
-        else:
-            # try fuzzy match in current_cbc_map
-            for k in current_cbc_map.keys():
-                if raw_key in k.lower():
-                    cur_val = current_cbc_map[k].get("value")
-                    break
-        if cur_val is None:
-            continue
-        # find most recent prior value for same analyte name (loose)
-        prior_vals = []
-        for pm in prior_maps:
-            # try same canonical key names
-            if canonical.lower() in pm:
-                prior_vals.append(pm.get(canonical.lower()))
-            else:
-                # try fuzzy keys
-                for pk, pv in pm.items():
-                    if raw_key in pk:
-                        prior_vals.append(pv)
-                        break
-        if not prior_vals:
-            continue
-        # compare with most recent
-        prev = prior_vals[0]
-        if prev is None:
-            continue
-        try:
-            if abs(cur_val - prev) / max(abs(prev), 0.0001) > 0.15:
-                out.append(f"{canonical}: changed from {prev} → {cur_val} (significant change)")
-            else:
-                out.append(f"{canonical}: stable compared to prior ({prev} → {cur_val})")
-        except Exception:
-            continue
-
-    if not out:
-        return ["No meaningful trends detected vs recent results."]
-    return out
-
-# ------------------------
-# Core report processing
-# ------------------------
-def process_report(report_row: Dict[str, Any]) -> Dict[str, Any]:
-    report_id = report_row.get("id")
-    file_path = report_row.get("file_path")
-    l_text = report_row.get("l_text") or ""
-    safe_print(f"Processing report {report_id} (file_path={file_path}) at {now_iso()}")
-
-    try:
-        if not file_path:
-            err = "Missing file_path"
-            supabase.table("reports").update({"ai_status": "failed", "ai_error": err}).eq("id", report_id).execute()
-            return {"error": err}
-
-        # download pdf bytes from supabase storage
-        pdf_obj = supabase.storage.from_(BUCKET).download(file_path)
-        pdf_bytes = getattr(pdf_obj, "data", pdf_obj)
-
-        # extract text and detect scanned
-        text = extract_text_from_pdf(pdf_bytes)
-        scanned = is_scanned_pdf(text)
-        safe_print(f"Report {report_id}: scanned={scanned}, text_length={len(text)}")
-
-        # aggregate CBC rows from OCR or use extracted text for interpretation
-        table_rows = []
-
-        if scanned:
-            if convert_from_bytes is None:
-                raise RuntimeError("pdf2image/poppler not available for scanned PDF OCR.")
-
-            # convert to images (pages)
-            pages = convert_from_bytes(pdf_bytes, dpi=200)
-            safe_print(f"Converted scanned PDF to {len(pages)} images")
-            page_index = 0
-            for img in pages:
-                page_index += 1
-                safe_print(f"OCR page {page_index} ...")
-                # serialize image to PNG bytes
-                buf = io.BytesIO()
-                img.save(buf, format="PNG")
-                img_bytes = buf.getvalue()
-                # perform OCR
-                ocr_out = ocr_image_via_responses(img_bytes)
-                if ocr_out and isinstance(ocr_out, dict):
-                    rows = ocr_out.get("cbc", []) or []
-                    if rows:
-                        safe_print(f" → OCR extracted {len(rows)} rows on page {page_index}")
-                        # append as-is
-                        table_rows.extend(rows)
-                    else:
-                        safe_print(f" → No CBC rows on page {page_index}")
-                else:
-                    safe_print(f" → OCR returned no usable data on page {page_index}")
-
-            if not table_rows:
-                raise ValueError("No usable CBC data extracted from scanned PDF.")
-
-            # merged_text to feed interpretation is JSON table string
-            merged_text = json.dumps({"cbc": table_rows}, ensure_ascii=False)
-        else:
-            # use textual PDF content OR provided l_text
-            merged_text = (text or l_text or "").strip()
-            if not merged_text:
-                raise ValueError("No usable text content extracted from digital PDF.")
-
-        # Interpret the merged_text into structured JSON
-        safe_print("Calling interpretation model...")
-        ai_interpretation = interpret_text_via_responses(merged_text)
-        if not ai_interpretation or not isinstance(ai_interpretation, dict):
-            raise ValueError("Interpretation model returned no data")
-
-        # build canonical values for route engine
-        canonical = build_cbc_value_dict(ai_interpretation)
-
-        # route engine
-        safe_print("Running route engine v4...")
-        routes_out = route_engine_v4(canonical)
-
-        # trend comparison (best-effort)
-        prior_reports = fetch_prior_reports(report_row, limit=3)
-        trend_summary = compute_trend_summary(canonical, prior_reports)
-
-        # assemble final ai_results object
-        ai_results = {
-            "meta": {
-                "generated_at": now_iso(),
-                "model": "ami-v4",
-                "version": "v4.0"
-            },
-            "patient": ai_interpretation.get("patient") or {"name": report_row.get("name"), "age": report_row.get("age"), "sex": report_row.get("sex", "Unknown")},
-            "cbc_raw": ai_interpretation.get("cbc") or (table_rows if table_rows else []),
-            "summary": ai_interpretation.get("summary") or {},
-            "canonical": canonical,
-            "route_engine": routes_out,
-            "trend_summary": trend_summary
-        }
-
-        # Save to supabase
-        supabase.table("reports").update({
-            "ai_status": "completed",
-            "ai_results": ai_results,
-            "ai_error": None
-        }).eq("id", report_id).execute()
-
-        safe_print(f"✅ Report {report_id} processed successfully")
-        return {"success": True, "data": ai_results}
-
-    except Exception as e:
-        err = f"{type(e).__name__}: {e}"
-        safe_print(f"❌ Error processing report {report_id}: {err}")
-        traceback.print_exc()
-        try:
-            supabase.table("reports").update({"ai_status": "failed", "ai_error": err}).eq("id", report_id).execute()
-        except Exception as e2:
-            safe_print("Failed to update supabase error:", e2)
+    if not file_path:
+        err = "Missing file_path"
+        supabase.table("reports").update({"ai_status": "failed", "ai_error": err}).eq("id", report_id).execute()
         return {"error": err}
 
-# ------------------------
+    # Download PDF bytes from Supabase storage
+    try:
+        pdf_bytes_resp = supabase.storage.from_(BUCKET).download(file_path)
+        # supabase client returns an object; the bytes may be in .data
+        pdf_bytes = getattr(pdf_bytes_resp, "data", pdf_bytes_resp)
+        if isinstance(pdf_bytes, dict) and pdf_bytes.get("error"):
+            raise RuntimeError(f"Supabase storage download error: {pdf_bytes}")
+        if isinstance(pdf_bytes, memoryview):
+            pdf_bytes = pdf_bytes.tobytes()
+    except Exception as e:
+        err = f"Failed to download file: {e}"
+        debug(err)
+        supabase.table("reports").update({"ai_status": "failed", "ai_error": err}).eq("id", report_id).execute()
+        return {"error": err}
+
+    # Attempt text extraction
+    text = extract_text_from_pdf(pdf_bytes)
+    scanned = is_scanned_pdf(text)
+    debug(f"scanned={scanned}, text_length={len(text) if text else 0}")
+
+    extracted_rows: List[Dict[str, Any]] = []
+
+    # If scanned -> convert to images and OCR each page
+    if scanned:
+        debug("SCANNED PDF detected — converting to images")
+        try:
+            images = convert_from_bytes(pdf_bytes, dpi=200)
+            debug(f"Converted scanned PDF to {len(images)} images")
+        except Exception as e:
+            debug("pdf2image conversion error:", e)
+            images = []
+
+        # For each page: try local OCR first; then OpenAI fallback
+        for i, img in enumerate(images, start=1):
+            debug(f"OCR page {i} — local ptysr? {USE_PYTESSACT}")
+            page_text = ""
+            page_rows: List[Dict[str, Any]] = []
+            if USE_PYTESSACT:
+                try:
+                    page_text = ocr_image_local(img)
+                    debug(f"Local OCR page {i}: {len(page_text)} chars")
+                except Exception as e:
+                    debug("Local OCR page error:", e)
+                    page_text = ""
+
+                # parse rows
+                if page_text:
+                    page_rows = parse_cbc_rows_from_text(page_text)
+                    debug(f"Parsed {len(page_rows)} rows from page {i} (local OCR)")
+            else:
+                # fallback: try OpenAI OCR for the page (best-effort)
+                try:
+                    ocr_json = ocr_image_openai_fallback(img)
+                    if ocr_json and isinstance(ocr_json, dict) and "cbc" in ocr_json:
+                        page_rows = ocr_json.get("cbc", [])
+                        debug(f"OpenAI OCR page {i} returned {len(page_rows)} CBC rows")
+                    else:
+                        debug("OpenAI OCR page returned no CBC rows or invalid JSON")
+                except Exception as e:
+                    debug("OpenAI fallback OCR exception:", e)
+
+            # If still nothing, attempt to run OCR via pytesseract on resized grayscale even if module absent -> catch exception
+            if not page_rows and not page_text and USE_PYTESSACT:
+                try:
+                    page_text = ocr_image_local(img)
+                    page_rows = parse_cbc_rows_from_text(page_text)
+                    debug(f"Retry local OCR parsed {len(page_rows)} rows on page {i}")
+                except Exception as e:
+                    debug("Second local OCR attempt failed:", e)
+
+            # If we have page_rows, extend
+            if page_rows:
+                extracted_rows.extend(page_rows)
+            else:
+                # try parse from page_text if present
+                if page_text:
+                    p_rows = parse_cbc_rows_from_text(page_text)
+                    if p_rows:
+                        extracted_rows.extend(p_rows)
+                        debug(f"Parsed {len(p_rows)} rows from page {i} via text parsing")
+
+        # end for pages
+
+    else:
+        # Digital PDF: parse the text directly for table rows
+        debug("Digital PDF detected — parsing text")
+        extracted_rows = parse_cbc_rows_from_text(text)
+        debug(f"Parsed {len(extracted_rows)} rows from digital PDF text")
+
+    # If still no extracted rows, fail gracefully and save error
+    if not extracted_rows:
+        err = "No usable CBC/chemistry data extracted"
+        debug(err)
+        supabase.table("reports").update({"ai_status": "failed", "ai_error": err}).eq("id", report_id).execute()
+        return {"error": err}
+
+    # Build canonical dict
+    canonical = build_cbc_value_dict(extracted_rows)
+    debug("Canonical values keys:", list(canonical.keys()))
+
+    # Compose merged_text (we still call the text interpretation model for richer narrative)
+    merged_text = json.dumps({"cbc": extracted_rows}, ensure_ascii=False)
+
+    # Call AI interpretation (text only) — using chat completions with response_format json_object
+    interpretation = {}
+    try:
+        sys_prompt = (
+            "You are a concise clinical assistant. Given lab values (CBC and chemistry) produce "
+            "strict JSON object with fields: patient (name, age, sex), cbc (list of analytes with value/units/refs/flag), summary (impression, suggested_follow_up). "
+            "Do NOT invent numbers."
+        )
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": merged_text}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+        )
+        # resp.choices[0].message.content might be string or object; try to load
+        raw = resp.choices[0].message.content
+        if isinstance(raw, str):
+            try:
+                interpretation = json.loads(raw)
+            except Exception:
+                debug("Could not parse interpretation raw string")
+                interpretation = {}
+        elif isinstance(raw, dict):
+            interpretation = raw
+        else:
+            # try parsed property
+            interpretation = getattr(resp.choices[0].message, "parsed", {}) or {}
+        debug("AI interpretation obtained keys:", list(interpretation.keys()))
+    except Exception as e:
+        debug("AI interpretation error:", e)
+        interpretation = {"cbc": extracted_rows, "summary": {"impression": "", "suggested_follow_up": ""}}
+
+    # Generate routes using canonical dict + optional previous
+    try:
+        routes_result = generate_clinical_routes_v4(canonical, previous)
+    except Exception as e:
+        debug("Route engine error:", e)
+        traceback.print_exc()
+        routes_result = {
+            "patterns": [],
+            "routes": [],
+            "next_steps": [],
+            "differential": [],
+            "severity": 1,
+            "urgency": "low",
+            "trend": "no_data"
+        }
+
+    # Merge routes_result into interpretation
+    interpretation["routes_v4"] = routes_result
+    # Also include canonical values for UI consumption
+    interpretation["canonical_values"] = canonical
+
+    # Save back to supabase
+    try:
+        supabase.table("reports").update(
+            {
+                "ai_status": "completed",
+                "ai_results": interpretation,
+                "ai_error": None
+            }
+        ).eq("id", report_id).execute()
+        debug(f"Report {report_id} processed successfully — saved AI results.")
+    except Exception as e:
+        debug("Failed saving results to supabase:", e)
+        return {"error": f"Failed saving results: {e}"}
+
+    return {"success": True, "data": interpretation}
+
+# -------------------------
 # Worker loop
-# ------------------------
-def main():
-    safe_print("Entering main loop — watching for pending reports...")
+# -------------------------
+def main_loop():
+    print("Entering main loop — watching for jobs...")
     while True:
         try:
             res = supabase.table("reports").select("*").eq("ai_status", "pending").limit(1).execute()
-            # supabase client returns an object which exposes .data in many versions
-            jobs = getattr(res, "data", None) or (res.get("data") if hasattr(res, "get") else None) or []
+            # supabase returns object with .data attribute
+            jobs = getattr(res, "data", None) or []
             if not jobs:
-                safe_print("No jobs...")
+                print("No jobs...")
                 time.sleep(1)
                 continue
 
             job = jobs[0]
-            safe_print("🔎 Found job:", job.get("id"))
-            supabase.table("reports").update({"ai_status": "processing"}).eq("id", job.get("id")).execute()
-            process_report(job)
+            job_id = job.get("id")
+            print(f"🔎 Found job: {job_id}")
 
-        except KeyboardInterrupt:
-            safe_print("Worker interrupted by user — exiting.")
-            break
+            # mark processing
+            supabase.table("reports").update({"ai_status": "processing"}).eq("id", job_id).execute()
+
+            # process
+            out = process_report(job)
+            debug("process_report result:", out)
+
         except Exception as e:
-            safe_print("LOOP ERROR:", type(e).__name__, e)
+            print("LOOP ERROR:", e)
             traceback.print_exc()
             time.sleep(3)
 
 if __name__ == "__main__":
-    main()
+    main_loop()
