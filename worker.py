@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # worker.py — AMI Health Worker V5 (single-file)
-# Upgrades: Route Engine V5, Admission recommendation, risk bars, safer OCR, improved parsing
+# Upgrades: Route Engine V5 (text-only severity output), removed admission recommendation,
+# kept internal numeric scoring (hidden), safer OCR, improved parsing
 # Usage: python worker.py --test-pdf sample.pdf
 # Note: keep your .env variables (SUPABASE_URL, SUPABASE_KEY, etc.)
 
@@ -105,6 +106,7 @@ def is_scanned_pdf(pdf_bytes: bytes) -> bool:
         logger.info("PDF appears scanned (text len %d)", len(txt))
         return True
     return False
+
 # ---------- OCR via pytesseract (safer) ----------
 
 def preprocess_image_for_ocr(img: Image.Image, target_min_dim: int = 1600) -> Image.Image:
@@ -176,6 +178,7 @@ def do_ocr_on_pdf(pdf_bytes: bytes) -> str:
             page_text = ''
         texts.append(page_text)
     return '\n\n---PAGE_BREAK---\n\n'.join(texts)
+
 # ---------- Parsing: robust lab extraction ----------
 
 # regex pieces
@@ -309,6 +312,7 @@ def find_values_in_text(text: str) -> Dict[str, Dict[str, Any]]:
                 if pl / 1000 < 5000:
                     results['platelets']['value'] = round(pl / 1000, 1)
     return results
+
 # ---------- Canonical mapping & decoration ----------
 
 CANONICAL_KEYS = ['Hb', 'MCV', 'MCH', 'MCHC', 'RDW', 'WBC', 'Neutrophils', 'Lymphocytes',
@@ -355,9 +359,9 @@ def canonical_map(parsed: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]
 
 COLOR_MAP = {
     5: {'label': 'critical', 'color': '#b91c1c', 'tw': 'bg-red-700', 'urgency': 'high'},
-    4: {'label': 'high', 'color': '#ef4444', 'tw': 'bg-red-500', 'urgency': 'high'},
+    4: {'label': 'severe', 'color': '#ef4444', 'tw': 'bg-red-500', 'urgency': 'high'},
     3: {'label': 'moderate', 'color': '#f59e0b', 'tw': 'bg-yellow-400', 'urgency': 'medium'},
-    2: {'label': 'borderline', 'color': '#facc15', 'tw': 'bg-yellow-300', 'urgency': 'low'},
+    2: {'label': 'mild', 'color': '#facc15', 'tw': 'bg-yellow-300', 'urgency': 'low'},
     1: {'label': 'normal', 'color': '#10b981', 'tw': 'bg-green-500', 'urgency': 'low'},
 }
 
@@ -403,7 +407,8 @@ def risk_percentage_for_key(key: str, value: Optional[float]) -> int:
         if v > 450: return min(100, 20 + int(((v-450)/1000)*80))
     # default fallback: small percent
     return min(100, int(min(abs(v), 100)))
-    def age_group_from_age(age: Optional[float]) -> str:
+
+def age_group_from_age(age: Optional[float]) -> str:
     if age is None:
         return 'adult'
     try:
@@ -423,51 +428,92 @@ def risk_percentage_for_key(key: str, value: Optional[float]) -> int:
         return 'adult'
     return 'elderly'
 
+# ---------- Utility: score -> severity_text mapping ----------
+def severity_text_from_score(score: int) -> str:
+    """Map internal numeric score to user-facing severity text."""
+    try:
+        s = int(score)
+    except:
+        s = 1
+    if s <= 1:
+        return 'normal'
+    if s == 2:
+        return 'mild'
+    if s == 3:
+        return 'moderate'
+    if s == 4:
+        return 'severe'
+    return 'critical'
+
+# ---------- Per-analyte flag heuristics ----------
+
+def flag_for_key(key: str, value: Optional[float], sex: str = 'unknown') -> Tuple[str, str]:
+    """
+    Return (flag, color_hex)
+    flag in {'low','normal','high'}
+    color: low -> orange, high -> red, normal -> white
+    Uses simple adult reference ranges; adjust locally if you have patient age/sex specific references.
+    """
+    if value is None:
+        return 'normal', '#ffffff'
+    k = key.lower()
+    try:
+        v = float(value)
+    except:
+        return 'normal', '#ffffff'
+
+    # default white for normal
+    if k == 'hb':
+        # sex-specific
+        if sex.lower() == 'female':
+            low, high = 12.0, 15.5
+        else:
+            low, high = 13.0, 17.5
+        if v < low: return 'low', '#f59e0b'
+        if v > high: return 'high', '#b91c1c'
+        return 'normal', '#ffffff'
+    if k == 'wbc':
+        if v < 4.0: return 'low', '#f59e0b'
+        if v > 11.0: return 'high', '#b91c1c'
+        return 'normal', '#ffffff'
+    if k == 'platelets':
+        if v < 150: return 'low', '#f59e0b'
+        if v > 450: return 'high', '#b91c1c'
+        return 'normal', '#ffffff'
+    if k == 'creatinine':
+        if v < 45: return 'low', '#f59e0b'
+        if v > 120: return 'high', '#b91c1c'
+        return 'normal', '#ffffff'
+    if k == 'crp':
+        if v <= 10: return 'normal', '#ffffff'
+        if v <= 50: return 'high', '#f59e0b'  # moderate elevation
+        return 'high', '#b91c1c'
+    if k == 'sodium':
+        if v < 135: return 'low', '#f59e0b'
+        if v > 145: return 'high', '#b91c1c'
+        return 'normal', '#ffffff'
+    if k == 'potassium':
+        if v < 3.5: return 'low', '#f59e0b'
+        if v > 5.1: return 'high', '#b91c1c'
+        return 'normal', '#ffffff'
+    if k == 'mcv':
+        if v < 80: return 'low', '#f59e0b'
+        if v > 100: return 'high', '#b91c1c'
+        return 'normal', '#ffffff'
+    if k == 'nlr':
+        if v > 10: return 'high', '#b91c1c'
+        if v > 5: return 'high', '#f59e0b'
+        return 'normal', '#ffffff'
+    if k in ('alt', 'ast', 'ck'):
+        if v > 200: return 'high', '#b91c1c'
+        if v > 100: return 'high', '#f59e0b'
+        return 'normal', '#ffffff'
+    # fallback
+    return 'normal', '#ffffff'
+
 # ---------- Route Engine V5 (improved) ----------
-def admission_recommended_logic(summary_scores: Dict[str, int], canonical: Dict[str, Dict[str, Any]], routes_list: List[str]) -> Tuple[bool, Optional[str]]:
-    """
-    Return (admit_bool, reason_text). Admission recommended if:
-    - severity >= 4 by overall score
-    - sepsis/infection route present AND combination of CRP/WBC/NLR high
-    - creatinine severe
-    - severe electrolyte disturbance
-    """
-    # overall severity threshold
-    overall = max(summary_scores.values()) if summary_scores else 1
-    if overall >= 4:
-        return True, f'Overall severity score {overall} >= 4'
-
-    # check sepsis combination
-    crp = canonical.get('CRP', {}).get('value')
-    wbc = canonical.get('WBC', {}).get('value')
-    nlr = canonical.get('NLR', {}).get('value')
-    creat = canonical.get('Creatinine', {}).get('value')
-    sodium = canonical.get('Sodium', {}).get('value')
-    potassium = canonical.get('Potassium', {}).get('value')
-
-    if ('Bacterial infection / Sepsis route' in routes_list or 'High NLR / Sepsis route' in routes_list):
-        if (crp and crp > 150) or (wbc and wbc > 20) or (nlr and nlr > 10):
-            reason = 'Suspected sepsis: '
-            parts = []
-            if crp: parts.append(f'CRP {crp}')
-            if wbc: parts.append(f'WBC {wbc}')
-            if nlr: parts.append(f'NLR {nlr}')
-            return True, reason + ', '.join(parts)
-
-    # renal failure trigger
-    if creat and creat > 250:
-        return True, f'Creatinine {creat} umol/L (AKI risk)'
-
-    # severe sodium/potassium
-    if sodium and (sodium < 125 or sodium > 160):
-        return True, f'Sodium dangerously abnormal {sodium}'
-    if potassium and (potassium < 2.8 or potassium > 6.5):
-        return True, f'Potassium dangerously abnormal {potassium}'
-
-    return False, None
-
 def score_severity_for_abnormality_v5(key: str, value: Optional[float], age_group: str, sex: str) -> int:
-    """Wrap previous scoring but updated thresholds for V5"""
+    """Wrap previous scoring but updated thresholds for V5 (internal numeric scoring)."""
     if value is None:
         return 1
     try:
@@ -525,8 +571,8 @@ def score_severity_for_abnormality_v5(key: str, value: Optional[float], age_grou
 def route_engine_v5(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[str, Any], previous: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     New Route Engine V5:
-    - generates patterns, routes, next_steps, differential (ranked), severity_score (1-5), urgency_flag
-    - computes admission recommendation
+    - generates patterns, routes, next_steps, differential (ranked), severity_text, urgency_flag
+    - computes internal numeric severity (hidden) then converts to severity_text
     - returns color and tw_class (UI)
     - returns clinical risk bars per key
     """
@@ -607,7 +653,7 @@ def route_engine_v5(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[str
         if nlr > 10:
             add_pattern('very high NLR', f'NLR {nlr}', 5)
             routes.append('High NLR / Sepsis route')
-            next_steps.append('Urgent clinical review for sepsis; consider admission and sepsis pathway.')
+            next_steps.append('Urgent clinical review for sepsis; consider sepsis pathway.')
             sepsis_flag = True
         elif nlr > 5:
             add_pattern('high NLR', f'NLR {nlr}', 4)
@@ -670,7 +716,6 @@ def route_engine_v5(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[str
         next_steps.append('Assess menstrual history; consider urgent ferritin and reticulocyte count.')
 
     # Build differential ranking by simple heuristics (frequency + severity)
-    # We'll count ddx and rank by appearance order + per_key severity
     ddx_rank = {}
     for i, d in enumerate(ddx):
         ddx_rank[d] = ddx_rank.get(d, 0) + (10 - i)
@@ -685,15 +730,11 @@ def route_engine_v5(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[str
     ddx_sorted = sorted(ddx_rank.items(), key=lambda x: -x[1])
     ddx_list = [d for d, _ in ddx_sorted]
 
-    # severity aggregation
+    # severity aggregation (internal numeric)
     severity_scores = list(per_key_scores.values()) if per_key_scores else [1]
     combined_score = max(severity_scores) if severity_scores else 1
     color_entry = COLOR_MAP.get(combined_score, COLOR_MAP[1])
     urgency = color_entry['urgency']
-
-
-    admit_bool, admit_reason = False, ""
-
 
     # generate risk bars for UI per canonical key
     risk_bars = {}
@@ -730,23 +771,26 @@ def route_engine_v5(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[str
     elif ag == 'elderly':
         age_note = 'Elderly – broaden differential for chronic disease and malignancy.'
 
+    # Convert internal numeric severity to user-facing severity_text
+    severity_text = severity_text_from_score(combined_score)
+
     final = {
         'patterns': patterns,
         'routes': routes,
         'next_steps': next_steps,
         'differential': ddx_list,
-        'severity_score': combined_score,
-        'urgency_flag': urgency,
+        'severity_text': severity_text,           # TEXT ONLY (normal/mild/moderate/severe/critical)
+        'urgency_flag': urgency,                  # low/medium/high
         'color': color_entry['color'],
         'tw_class': color_entry['tw'],
         'age_group': ag,
         'age_note': age_note,
-        'admission_recommended': admit_bool,
-        'admission_reason': admit_reason,
+        # admission fields removed entirely per requirement
         'risk_bars': risk_bars,
         'summary': '\n'.join(summary_lines[:12]) if summary_lines else 'No significant abnormalities detected.'
     }
     return final
+
 # ---------- Trends, save & processing ----------
 
 def trend_analysis(current: Dict[str, Dict[str, Any]], previous: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -832,25 +876,27 @@ def process_report(record: Dict[str, Any]) -> None:
         'processed_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
     }
 
-    # add per-key decorated flags (color, severity, risk bar)
+    # add per-key decorated flags (color, severity_text, risk bar)
     decorated = {}
+    sex = record.get('sex', 'unknown')
     for key in CANONICAL_KEYS:
         val = canonical.get(key, {})
         value = val.get('value')
-        # compute severity per analyte
-        s = score_severity_for_abnormality_v5(key, value, age_group_from_age(record.get('age')), record.get('sex', 'unknown'))
-        cmap = COLOR_MAP.get(s, COLOR_MAP[1])
+        unit = val.get('unit') if isinstance(val.get('unit'), str) else None
+        # compute internal numeric severity per analyte (kept internal)
+        s_num = score_severity_for_abnormality_v5(key, value, age_group_from_age(record.get('age')), sex)
+        s_text = severity_text_from_score(s_num)
+        flag, flag_color = flag_for_key(key, value, sex)
         pct = risk_percentage_for_key(key, value)
+        # risk_color used by UI bars (heuristic)
         risk_color = '#b91c1c' if pct >= 80 else ('#ef4444' if pct >= 60 else ('#f59e0b' if pct >= 40 else ('#facc15' if pct >= 20 else '#10b981')))
         decorated[key] = {
-            'raw': val,
-            'decorated': {
-                'severity': s,
-                'urgency': cmap['urgency'],
-                'color': cmap['color'],
-                'tw_class': cmap['tw'],
-                'risk_bar': {'percentage': pct, 'color': risk_color}
-            }
+            'value': value,
+            'unit': unit,
+            'flag': flag,                     # low/normal/high
+            'color': flag_color,              # color for the flag (low=orange, high=red, normal=white)
+            'severity_text': s_text,          # textual severity only (normal/mild/...)
+            'risk_bar': {'percentage': pct, 'color': risk_color}
         }
     ai_results['decorated'] = decorated
 
