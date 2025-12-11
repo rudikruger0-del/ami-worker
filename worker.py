@@ -403,6 +403,26 @@ def risk_percentage_for_key(key: str, value: Optional[float]) -> int:
         if v > 450: return min(100, 20 + int(((v-450)/1000)*80))
     # default fallback: small percent
     return min(100, int(min(abs(v), 100)))
+    def age_group_from_age(age: Optional[float]) -> str:
+    if age is None:
+        return 'adult'
+    try:
+        a = float(age)
+    except:
+        return 'adult'
+
+    if a < (1/12):
+        return 'neonate'
+    if a < 1:
+        return 'infant'
+    if a < 13:
+        return 'child'
+    if a < 18:
+        return 'teen'
+    if a < 65:
+        return 'adult'
+    return 'elderly'
+
 # ---------- Route Engine V5 (improved) ----------
 def admission_recommended_logic(summary_scores: Dict[str, int], canonical: Dict[str, Dict[str, Any]], routes_list: List[str]) -> Tuple[bool, Optional[str]]:
     """
@@ -671,8 +691,9 @@ def route_engine_v5(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[str
     color_entry = COLOR_MAP.get(combined_score, COLOR_MAP[1])
     urgency = color_entry['urgency']
 
-    # compute admission recommendation
-    admit_bool, admit_reason = admission_recommended_logic(per_key_scores, canonical, routes)
+
+    admit_bool, admit_reason = False, ""
+
 
     # generate risk bars for UI per canonical key
     risk_bars = {}
