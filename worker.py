@@ -6,73 +6,62 @@ from openai import OpenAI
 from pypdf import PdfReader
 from pdf2image import convert_from_bytes
 
-# ----------------------------------------------------
-# ENV
-# ----------------------------------------------------
+# -----------------------------------------------------
+# ENVIRONMENT
+# -----------------------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("Missing Supabase credentials")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 BUCKET = "reports"
 
-# ----------------------------------------------------
-# PDF TEXT EXTRACTOR
-# ----------------------------------------------------
+# -----------------------------------------------------
+# PDF TEXT EXTRACTION
+# -----------------------------------------------------
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """Extract text from selectable PDFs."""
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
-        pages = [(page.extract_text() or "") for page in reader.pages]
-        return "\n\n".join(pages).strip()
+        return "\n\n".join([(page.extract_text() or "") for page in reader.pages]).strip()
     except:
         return ""
 
 def is_scanned_pdf(text: str) -> bool:
-    """Very low text = scanned PDF."""
     return len(text.strip()) < 30
 
-# ----------------------------------------------------
-# CLEAN NUMBERS
-# ----------------------------------------------------
+# -----------------------------------------------------
+# CLEAN NUMBER
+# -----------------------------------------------------
 def clean_number(val):
     if val is None:
         return None
     if isinstance(val, (int, float)):
         return float(val)
+
     s = str(val).replace(",", ".")
     nums = re.findall(r"-?\d+\.?\d*", s)
-    if not nums:
-        return None
-    try:
-        return float(nums[0])
-    except:
-        return None
+    return float(nums[0]) if nums else None
 
-# ----------------------------------------------------
-# OCR FIXED — MULTI-PAGE
-# ----------------------------------------------------
+# -----------------------------------------------------
+# OCR — FIXED FOR OPENAI v2024+
+# -----------------------------------------------------
 def extract_cbc_from_image(image_bytes: bytes):
-    """Safe OCR wrapper — never crashes worker."""
-    try:
-        b64 = base64.b64encode(image_bytes).decode()
-    except:
-        return {"cbc": []}
+    b64 = base64.b64encode(image_bytes).decode()
 
     system_prompt = (
-        "Extract all visible laboratory values: CBC, differential, platelets, CRP, "
-        "electrolytes, renal markers, liver enzymes. "
-        "Return STRICT JSON: { 'cbc':[{'analyte':'','value':'','units':'','reference_low':'','reference_high':''} ] }"
+        "You are an OCR assistant for lab reports. Extract ALL analytes you can see: "
+        "CBC, diff, electrolytes, CRP, urea, creatinine, liver enzymes, CK. "
+        "Return STRICT JSON:\n"
+        "{ 'cbc': [ { 'analyte':'', 'value':'', 'units':'', 'reference_low':'', 'reference_high':'' } ] }"
     )
 
     try:
         resp = client.chat.completions.create(
             model="gpt-4o",
+            response_format={"type": "json_object"},
+            temperature=0,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {
@@ -84,50 +73,42 @@ def extract_cbc_from_image(image_bytes: bytes):
                         }
                     ]
                 }
-            ],
-            response_format={"type": "json_object"},
-            temperature=0
-        )
-
-        data = resp.choices[0].message.parsed
-        return data if isinstance(data, dict) else {"cbc": []}
-
-    except Exception as e:
-        print("OCR PAGE ERROR:", e)
-        return {"cbc": []}
-
-# ----------------------------------------------------
-# INTERPRETATION MODEL
-# ----------------------------------------------------
-def call_ai_on_report(text: str) -> dict:
-    """Returns clinical summary + structured CBC from text or OCR output."""
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content":
-                        "Analyse CBC & chemistry. Identify patterns. Do NOT diagnose. "
-                        "Return strict JSON: patient, cbc[], summary.impression, summary.suggested_follow_up."
-                },
-                {"role": "user", "content": text}
-            ],
-            response_format={"type": "json_object"},
-            temperature=0
+            ]
         )
         return resp.choices[0].message.parsed
-
     except Exception as e:
-        print("❌ AI INTERPRETATION ERROR:", e)
-        raise
+        print("OCR error:", e)
+        return {"cbc": []}
 
-# ----------------------------------------------------
-# CBC MAPPING
-# ----------------------------------------------------
+# -----------------------------------------------------
+# INTERPRETATION
+# -----------------------------------------------------
+def call_ai_on_report(text: str):
+    system_prompt = (
+        "You are AMI, a medical lab interpreter. "
+        "Return STRICT JSON containing: patient, cbc, summary (impression + follow-up). "
+        "Never diagnose, only describe patterns."
+    )
+
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        response_format={"type": "json_object"},
+        temperature=0,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text}
+        ]
+    )
+    return resp.choices[0].message.parsed
+
+# -----------------------------------------------------
+# CBC DICTIONARY NORMALISATION
+# -----------------------------------------------------
 def build_cbc_dict(ai_json):
+    rows = ai_json.get("cbc") or []
     out = {}
-    for r in ai_json.get("cbc", []):
+
+    for r in rows:
         name = (r.get("analyte") or "").lower()
 
         if "haemo" in name or name == "hb": out["Hb"] = r
@@ -137,101 +118,123 @@ def build_cbc_dict(ai_json):
         if "neut" in name: out["Neut"] = r
         if "lymph" in name: out["Lymph"] = r
         if "plate" in name: out["Plt"] = r
-
         if "creatinine" in name: out["Cr"] = r
         if "urea" in name: out["Urea"] = r
         if "crp" in name: out["CRP"] = r
-
         if "sodium" in name or name == "na": out["Na"] = r
         if "potassium" in name or name == "k": out["K"] = r
 
     return out
 
-# ----------------------------------------------------
-# ROUTE ENGINE v4 (Dr Riekert style)
-# PATTERN → ROUTE → NEXT STEPS
-# ----------------------------------------------------
+# -----------------------------------------------------
+# ROUTE ENGINE V3 — Patterns → Route → Suggested Next Steps
+# -----------------------------------------------------
 def generate_routes(c):
     v = lambda k: clean_number(c.get(k, {}).get("value"))
+    Hb, MCV, WBC, Neut, Lymph, Plt, Cr, Urea, CRP = (
+        v("Hb"), v("MCV"), v("WBC"), v("Neut"), v("Lymph"), v("Plt"),
+        v("Cr"), v("Urea"), v("CRP")
+    )
 
-    Hb = v("Hb")
-    MCV = v("MCV")
-    WBC = v("WBC")
-    Neut = v("Neut")
-    Lymph = v("Lymph")
-    Plt = v("Plt")
-    Cr = v("Cr")
-    CRP = v("CRP")
+    routes = []
 
-    result = {
-        "patterns": [],
-        "routes": [],
-        "next_steps": []
-    }
-
-    # ---------------------- ANAEMIA ----------------------
-    if Hb and Hb < 13:
+    # --- ANAEMIA PATTERN ---
+    if Hb is not None and Hb < 13:
         if MCV and MCV < 80:
-            result["patterns"].append("Microcytic anaemia pattern")
-            result["routes"].append("Iron deficiency / chronic disease anaemia route")
-            result["next_steps"].append("Ferritin, iron studies, transferrin saturation, reticulocyte count")
-
+            routes.append({
+                "pattern": "Microcytic anaemia",
+                "route": "Likely iron deficiency / chronic disease pattern",
+                "next_steps": [
+                    "Request ferritin & iron studies",
+                    "Check reticulocyte count",
+                    "Assess for chronic inflammation"
+                ]
+            })
         elif MCV and MCV > 100:
-            result["patterns"].append("Macrocytic anaemia pattern")
-            result["routes"].append("B12 / folate deficiency route")
-            result["next_steps"].append("Vitamin B12, folate, LFTs, thyroid screen")
-
+            routes.append({
+                "pattern": "Macrocytic anaemia",
+                "route": "Possible B12/folate deficiency / liver pattern",
+                "next_steps": [
+                    "Order B12 & folate",
+                    "Review liver enzymes",
+                    "Check medications (e.g., antiretrovirals)"
+                ]
+            })
         else:
-            result["patterns"].append("Normocytic anaemia")
-            result["routes"].append("Chronic inflammation / renal / early iron deficiency route")
-            result["next_steps"].append("Reticulocyte count, ferritin, renal profile")
+            routes.append({
+                "pattern": "Normocytic anaemia",
+                "route": "Common in renal disease / early iron deficiency",
+                "next_steps": [
+                    "Check creatinine & eGFR",
+                    "Order reticulocyte count",
+                    "Review chronic inflammatory markers"
+                ]
+            })
 
-    # ---------------------- INFECTION ----------------------
+    # --- INFECTION / INFLAMMATION ---
     if WBC and WBC > 12:
-        result["patterns"].append("Leukocytosis")
-        result["routes"].append("Infection / inflammatory response route")
-
         if Neut and Neut > 70:
-            result["patterns"].append("Neutrophil-predominant response")
-            result["next_steps"].append("Consider bacterial source; correlate with CRP and symptoms")
+            routes.append({
+                "pattern": "Neutrophilia",
+                "route": "Bacterial infection physiology",
+                "next_steps": [
+                    "Correlate with fever, CRP",
+                    "Look for localised infection",
+                    "Consider sepsis markers if unwell"
+                ]
+            })
 
         if Lymph and Lymph > 45:
-            result["patterns"].append("Lymphocytosis")
-            result["next_steps"].append("Consider viral illness or recovery phase")
+            routes.append({
+                "pattern": "Lymphocytosis",
+                "route": "Viral or recovery-phase pattern",
+                "next_steps": [
+                    "Check recent viral symptoms",
+                    "Review past CBC for trends",
+                    "Repeat CBC in 1–2 weeks"
+                ]
+            })
 
     if CRP and CRP > 10:
-        result["patterns"].append("Raised CRP")
-        result["routes"].append("Active inflammatory route")
-        result["next_steps"].append("Monitor CRP trend; evaluate infection source")
+        routes.append({
+            "pattern": "Raised CRP",
+            "route": "Inflammation / infection",
+            "next_steps": [
+                "Correlate with WBC",
+                "Assess clinical severity",
+                "Consider imaging if focal symptoms exist"
+            ]
+        })
 
-    # ---------------------- PLATELETS ----------------------
-    if Plt and Plt > 450:
-        result["patterns"].append("Thrombocytosis")
-        result["routes"].append("Reactive thrombocytosis route")
-        result["next_steps"].append("Check iron studies, inflammation markers")
-
-    # ---------------------- RENAL ----------------------
+    # --- RENAL FUNCTION ---
     if Cr and Cr > 120:
-        result["patterns"].append("Possible renal impairment")
-        result["routes"].append("Renal function evaluation route")
-        result["next_steps"].append("Repeat U&E, hydration assessment, medication review")
+        routes.append({
+            "pattern": "Renal impairment physiology",
+            "route": "Possible dehydration / CKD / medication effect",
+            "next_steps": [
+                "Repeat U&E",
+                "Check hydration & meds",
+                "Order eGFR"
+            ]
+        })
 
-    # ----------------------------------------------
-    if not result["patterns"]:
-        result["patterns"].append("No significant abnormal patterns detected")
-        result["routes"].append("No major diagnostic route triggered")
-        result["next_steps"].append("Correlate with clinical picture")
+    # Default
+    if not routes:
+        routes.append({
+            "pattern": "No major abnormalities",
+            "route": "All key markers within expected physiology",
+            "next_steps": ["Monitor and correlate clinically"]
+        })
 
-    return result
+    return routes
 
-# ----------------------------------------------------
+# -----------------------------------------------------
 # PROCESS REPORT
-# ----------------------------------------------------
+# -----------------------------------------------------
 def process_report(job):
     rid = job["id"]
     file_path = job.get("file_path")
-
-    print(f"Processing report {rid}…")
+    print(f"Processing {rid}...")
 
     pdf_bytes = supabase.storage.from_(BUCKET).download(file_path)
     if hasattr(pdf_bytes, "data"):
@@ -240,46 +243,48 @@ def process_report(job):
     text = extract_text_from_pdf(pdf_bytes)
     scanned = is_scanned_pdf(text)
 
-    all_rows = []
+    extracted_rows = []
 
+    # --- SCANNED PDF → OCR ---
     if scanned:
-        print("SCANNED PDF → OCR")
+        print("SCANNED PDF → OCR START")
         pages = convert_from_bytes(pdf_bytes)
-        for idx, img in enumerate(pages, 1):
-            print(f"OCR page {idx}…")
+
+        for i, img in enumerate(pages, 1):
+            print(f"OCR page {i}...")
             buf = io.BytesIO()
             img.save(buf, format="PNG")
-            ocr_res = extract_cbc_from_image(buf.getvalue())
-            all_rows.extend(ocr_res.get("cbc", []))
+            result = extract_cbc_from_image(buf.getvalue())
+            rows = result.get("cbc", [])
+            if rows:
+                extracted_rows.extend(rows)
+
+        if not extracted_rows:
+            raise ValueError("No CBC extracted from scanned PDF")
+
+        merged_text = json.dumps({"cbc": extracted_rows})
+
     else:
-        all_rows = text
+        merged_text = text or job.get("l_text") or ""
 
-    if not all_rows:
-        raise ValueError("No CBC extracted.")
-
-    merged_text = (
-        json.dumps({"cbc": all_rows}) if isinstance(all_rows, list)
-        else all_rows
-    )
-
+    # --- AI INTERPRETATION ---
     ai_json = call_ai_on_report(merged_text)
 
+    # --- ROUTE ENGINE v3 ---
     cdict = build_cbc_dict(ai_json)
-    ai_json["clinical_engine"] = generate_routes(cdict)
+    ai_json["routes"] = generate_routes(cdict)
 
     supabase.table("reports").update(
         {"ai_status": "completed", "ai_results": ai_json, "ai_error": None}
     ).eq("id", rid).execute()
 
     print(f"✓ Completed {rid}")
-    return ai_json
 
-# ----------------------------------------------------
-# MAIN LOOP (FIXED FOR SUPABASE v2)
-# ----------------------------------------------------
+# -----------------------------------------------------
+# MAIN LOOP — FIXED
+# -----------------------------------------------------
 def main():
     print("Entering main loop...")
-
     while True:
         try:
             res = (
@@ -290,21 +295,17 @@ def main():
                 .execute()
             )
 
-            # FIXED: New Supabase client returns .model
-            rows = getattr(res, "model", None)
-            jobs = rows if rows else []
+            jobs = res.model or []   # ← FIXED
 
             if not jobs:
-                print("No jobs…")
+                print("No jobs...")
                 time.sleep(1)
                 continue
 
             job = jobs[0]
-            rid = job["id"]
-
             supabase.table("reports").update(
                 {"ai_status": "processing"}
-            ).eq("id", rid).execute()
+            ).eq("id", job["id"]).execute()
 
             process_report(job)
 
