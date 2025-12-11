@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
-# worker.py — AMI Health Worker V5 (single-file)
-# Upgrades: Route Engine V5 (text-only severity output), removed admission recommendation,
-# kept internal numeric scoring (hidden), safer OCR, improved parsing
+# worker.py — AMI Health Worker V5 (single-file, expanded)
+# Features:
+#  - PDF reading → detect scanned vs digital
+#  - OCR (pytesseract only)
+#  - Robust CBC parsing (regex + improved safe_float)
+#  - Canonical mapping of analytes
+#  - Route Engine V5: patterns → routes → next_steps → differential → internal numeric severity → user-facing severity_text
+#  - NO admission recommendation logic
+#  - Decorated analytes include flag + color + severity_text
+#  - Diagnostic Possibilities (IMPRESSION) inserted at top of summary (Option A)
+#  - Improvements: decimal/spacing robustness, unit protection, impossible-value correction
+#
 # Usage: python worker.py --test-pdf sample.pdf
-# Note: keep your .env variables (SUPABASE_URL, SUPABASE_KEY, etc.)
+# Keep your .env variables (SUPABASE_URL, SUPABASE_KEY, etc.)
 
 import os
 import io
@@ -115,17 +124,12 @@ def preprocess_image_for_ocr(img: Image.Image, target_min_dim: int = 1600) -> Im
     - convert to grayscale,
     - autocontrast,
     - denoise (median),
-    - threshold if image is low contrast,
     - upscale small pages for better OCR.
     """
     try:
-        # grayscale
         img = img.convert('L')
-        # autocontrast
         img = ImageOps.autocontrast(img, cutoff=1)
-        # median filter to reduce salt-and-pepper
         img = img.filter(ImageFilter.MedianFilter(size=3))
-        # adaptive threshold if very light/dark
         w, h = img.size
         maxdim = max(w, h)
         if maxdim < target_min_dim:
@@ -140,7 +144,6 @@ def ocr_image_pytesseract(img: Image.Image, lang: str = OCR_LANG) -> str:
     if not HAS_PYTESSERACT:
         raise RuntimeError("pytesseract is not available in this environment.")
     img2 = preprocess_image_for_ocr(img)
-    # OEM 3 (LSTM), PSM 6 (assume a block of text). If full-page forms, PSM 4 may help.
     config = r'--oem 3 --psm 6'
     try:
         text = pytesseract.image_to_string(img2, lang=lang, config=config)
@@ -231,10 +234,107 @@ def find_key_for_label(label: str) -> Optional[str]:
     return None
 
 def safe_float(s: str) -> Optional[float]:
+    """
+    Improved float converter:
+    - Handles commas as decimals.
+    - Removes stray characters.
+    - Joins split OCR fragments like '1 1 . 6' -> '11.6'
+    - Prevents unit contamination.
+    """
+    if s is None:
+        return None
+
+    # replace common OCR commas and unicode decimals
+    s = s.replace(',', '.')
+    # remove any character that's not digit, dot, or minus
+    s = re.sub(r'[^0-9\.\-]', '', s)
+    # if multiple dots exist, keep only the last (join parts)
+    if s.count('.') > 1:
+        parts = s.split('.')
+        s = ''.join(parts[:-1]) + '.' + parts[-1]
+    # remove spaces (join broken tokens)
+    s = s.replace(' ', '').strip()
+    if s == '':
+        return None
+
     try:
-        return float(re.sub(r'[^\d\.\-]', '', s))
+        return float(s)
     except Exception:
         return None
+
+def normalize_impossible_values(results: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Detect and correct biologically impossible lab values caused by OCR / spacing errors.
+    Only modifies values that are clearly incorrect. Non-confident corrections set value to None.
+    Keys are the LABEL_TO_KEY keys (e.g., 'hb','wbc') as parsed, not canonical keys.
+    """
+    def fix_value(key, v):
+        if v is None:
+            return v
+        try:
+            v = float(v)
+        except:
+            return None
+
+        # Hemoglobin: unlikely >25 g/dL. Common OCR error 150 -> 15.0
+        if key == "hb":
+            if v > 50:
+                return round(v / 10.0, 2)
+            # if unreasonably low (<3) assume parse error
+            if v < 3:
+                return None
+
+        # MCV: typical 70-110 fL. If <40 or >200 treat as error
+        if key == "mcv":
+            if v < 40 or v > 200:
+                return None
+
+        # RDW: typical 10-20%
+        if key == "rdw":
+            if v > 40 or v < 5:
+                return None
+
+        # WBC: physiologic extremes; if >300 likely misplaced decimal or scale
+        if key == "wbc":
+            if v > 300:
+                # if >3000 maybe divide by 100? Heuristic -> divide by 10
+                return round(v / 10.0, 2)
+
+        # Platelets: if extremely large (OCR jam) scale down heuristically
+        if key == "platelets":
+            if v > 1000000:
+                return round(v / 10000.0, 1)  # 4529600 -> 452.96 -> 452.96
+            if v > 10000 and v < 1000000:
+                # ambiguous: if value between 10000 and 1e6 divide by 1000
+                return round(v / 1000.0, 1)
+
+        # Neutrophil % should be 0-100
+        if key == "neutrophils_pc":
+            if v > 100 or v < 0:
+                return None
+
+        # Potassium: physiologic 1.5-8; OCR like 24 -> likely 2.4
+        if key == "potassium":
+            if v >= 20 and v < 100:
+                # e.g., 24 -> 2.4
+                return round(v / 10.0, 2)
+            if v > 100:
+                return None
+
+        # Creatinine: if extremely high clamp or leave
+        if key == "creatinine":
+            if v > 2000:
+                return round(v / 10.0, 2)
+
+        return v
+
+    for k in list(results.keys()):
+        entry = results.get(k)
+        if not entry:
+            continue
+        if 'value' in entry:
+            entry['value'] = fix_value(k, entry['value'])
+    return results
 
 def find_values_in_text(text: str) -> Dict[str, Dict[str, Any]]:
     """
@@ -242,9 +342,12 @@ def find_values_in_text(text: str) -> Dict[str, Dict[str, Any]]:
     - iterate lines, try to match known labels (exact or fuzzy)
     - handle patterns like 'Hb: 11.6 g/dL (12.4-16.7)'
     - collect percentages and absolute values
-    - reject obviously spurious values (e.g., platelets > 1000000 treated carefully)
+    - use safer numeric extraction (safe_float)
+    - post-process to normalize impossible values
     """
     results: Dict[str, Dict[str, Any]] = {}
+    # replace common OCR splits like '1 1 . 6' -> '11.6' (but don't over-join letters)
+    text = re.sub(r'(?<=\d)\s+(?=\d)', '', text)
     lines = [ln.strip() for ln in re.split(r'\n|\r', text) if ln.strip()]
     for line in lines:
         lowline = line.lower()
@@ -259,17 +362,17 @@ def find_values_in_text(text: str) -> Dict[str, Dict[str, Any]]:
                         results.setdefault(key, {})['value'] = val
                         results.setdefault(key, {})['raw_line'] = line
                         continue
-                # numeric search following the label
-                pat = re.compile(rf'{re.escape(label)}[^\d\.\-]{{0,30}}({VALUE_RE})', flags=re.IGNORECASE)
+                # numeric search following the label (allow OCR noise up to 40 chars)
+                pat = re.compile(rf'{re.escape(label)}[^\d\.\-]{{0,40}}({VALUE_RE})', flags=re.IGNORECASE)
                 m = pat.search(line)
                 if m:
                     v = safe_float(m.group(1))
                     if v is not None:
                         results.setdefault(key, {})['value'] = v
-                        # units attempt
-                        um = re.search(rf'{re.escape(label)}[^\d\n\r]*{VALUE_RE}\s*([a-zA-Z/%\d\.\-]*)', line, flags=re.IGNORECASE)
-                        if um and um.group(2).strip():
-                            results.setdefault(key, {})['unit'] = um.group(2).strip()
+                        # units attempt: look after the matched number for unit tokens
+                        um = re.search(rf'{re.escape(label)}[^\d\n\r]*{re.escape(m.group(1))}\s*([a-zA-Z/%\d\.\-]*)', line, flags=re.IGNORECASE)
+                        if um and um.group(1).strip():
+                            results.setdefault(key, {})['unit'] = um.group(1).strip()
                         results.setdefault(key, {})['raw_line'] = line
                         continue
         # fallback generic: e.g., "Hb 11.6 g/dL" or "MCV 78.9 fl"
@@ -306,11 +409,14 @@ def find_values_in_text(text: str) -> Dict[str, Dict[str, Any]]:
     if 'platelets' in results:
         pl = results['platelets'].get('value')
         if pl is not None:
-            # if value > 10000, assume reported as raw count (e.g., 4529606), convert to x10^9/L if clearly necessary
+            # if value > 10000, assume reported as raw count (e.g., 4529606), convert heuristically
             if pl > 10000 and pl > 1e5:
-                # try scale down by factor to reasonable range (heuristic)
                 if pl / 1000 < 5000:
                     results['platelets']['value'] = round(pl / 1000, 1)
+
+    # final cleanup of impossible values
+    results = normalize_impossible_values(results)
+
     return results
 
 # ---------- Canonical mapping & decoration ----------
@@ -348,7 +454,6 @@ def canonical_map(parsed: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]
         n = out.get('Neutrophils', {}).get('value')
         l = out.get('Lymphocytes', {}).get('value')
         if n is not None and l is not None and l != 0:
-            # if neutrophils likely percent and lymphocytes absolute (or vice versa), handle carefully
             out['NLR'] = {'value': round(float(n) / float(l), 2)}
     except Exception:
         pass
@@ -366,8 +471,7 @@ COLOR_MAP = {
 }
 
 def risk_percentage_for_key(key: str, value: Optional[float]) -> int:
-    """Map a value to a risk percentage (0-100) for a key using clinical heuristics.
-       This is intentionally conservative; used only for UI bars."""
+    """Map a value to a risk percentage (0-100) for a key using clinical heuristics."""
     if value is None:
         return 0
     k = key.lower()
@@ -375,13 +479,10 @@ def risk_percentage_for_key(key: str, value: Optional[float]) -> int:
         v = float(value)
     except:
         return 0
-    # simple heuristic scaling per analyte
     if k == 'crp':
-        # 0-200 maps to 0-100 with >200 clamped
         pct = min(100, int((v / 200.0) * 100))
         return pct
     if k == 'wbc':
-        # normal 4-11 => low risk; >20 high
         if v <= 11: return int((v/11)*20)
         if v <= 20: return 30 + int(((v-11)/9) * 30)
         return min(100, 60 + int(((v-20)/30)*40))
@@ -391,12 +492,10 @@ def risk_percentage_for_key(key: str, value: Optional[float]) -> int:
         if v <= 10: return 40 + int(((v-6)/4)*30)
         return min(100, 70 + int(((v-10)/30)*30))
     if k == 'creatinine':
-        # 60-120 normalish
         if v <= 120: return int((v/120)*20)
         if v <= 200: return 25 + int(((v-120)/80)*30)
         return min(100, 60 + int(((v-200)/300)*40))
     if k == 'hb':
-        # lower hb increases risk
         if v >= 12: return 5
         if v >= 10: return 20
         if v >= 8: return 50
@@ -405,7 +504,6 @@ def risk_percentage_for_key(key: str, value: Optional[float]) -> int:
         if v >= 100 and v <= 450: return 5
         if v < 100: return min(100, 30 + int(((100 - v)/100)*70))
         if v > 450: return min(100, 20 + int(((v-450)/1000)*80))
-    # default fallback: small percent
     return min(100, int(min(abs(v), 100)))
 
 def age_group_from_age(age: Optional[float]) -> str:
@@ -415,7 +513,6 @@ def age_group_from_age(age: Optional[float]) -> str:
         a = float(age)
     except:
         return 'adult'
-
     if a < (1/12):
         return 'neonate'
     if a < 1:
@@ -452,7 +549,6 @@ def flag_for_key(key: str, value: Optional[float], sex: str = 'unknown') -> Tupl
     Return (flag, color_hex)
     flag in {'low','normal','high'}
     color: low -> orange, high -> red, normal -> white
-    Uses simple adult reference ranges; adjust locally if you have patient age/sex specific references.
     """
     if value is None:
         return 'normal', '#ffffff'
@@ -461,10 +557,7 @@ def flag_for_key(key: str, value: Optional[float], sex: str = 'unknown') -> Tupl
         v = float(value)
     except:
         return 'normal', '#ffffff'
-
-    # default white for normal
     if k == 'hb':
-        # sex-specific
         if sex.lower() == 'female':
             low, high = 12.0, 15.5
         else:
@@ -486,7 +579,7 @@ def flag_for_key(key: str, value: Optional[float], sex: str = 'unknown') -> Tupl
         return 'normal', '#ffffff'
     if k == 'crp':
         if v <= 10: return 'normal', '#ffffff'
-        if v <= 50: return 'high', '#f59e0b'  # moderate elevation
+        if v <= 50: return 'high', '#f59e0b'
         return 'high', '#b91c1c'
     if k == 'sodium':
         if v < 135: return 'low', '#f59e0b'
@@ -508,12 +601,11 @@ def flag_for_key(key: str, value: Optional[float], sex: str = 'unknown') -> Tupl
         if v > 200: return 'high', '#b91c1c'
         if v > 100: return 'high', '#f59e0b'
         return 'normal', '#ffffff'
-    # fallback
     return 'normal', '#ffffff'
 
 # ---------- Route Engine V5 (improved) ----------
 def score_severity_for_abnormality_v5(key: str, value: Optional[float], age_group: str, sex: str) -> int:
-    """Wrap previous scoring but updated thresholds for V5 (internal numeric scoring)."""
+    """Internal numeric scoring for severity (kept internal)."""
     if value is None:
         return 1
     try:
@@ -522,7 +614,6 @@ def score_severity_for_abnormality_v5(key: str, value: Optional[float], age_grou
         return 1
     key_l = key.lower()
     score = 1
-    # re-use some heuristics but tuned
     if key_l == 'hb':
         low_cut = 12.0 if sex.lower() == 'female' else 13.0
         if age_group in ['neonate','infant']:
@@ -568,22 +659,69 @@ def score_severity_for_abnormality_v5(key: str, value: Optional[float], age_grou
         score = 1
     return score
 
+def generate_diagnostic_possibilities(canonical: Dict[str, Dict[str, Any]], patterns: List[Dict[str, Any]], routes: List[str]) -> List[str]:
+    """
+    Produce clinician-style diagnostic impressions using canonical values,
+    matched patterns, and detected routes. These are short, top-of-summary statements.
+    """
+    Hb = canonical.get("Hb", {}).get("value")
+    WBC = canonical.get("WBC", {}).get("value")
+    Neut = canonical.get("Neutrophils", {}).get("value")
+    CRP = canonical.get("CRP", {}).get("value")
+    NLR = canonical.get("NLR", {}).get("value")
+    Creat = canonical.get("Creatinine", {}).get("value")
+    K = canonical.get("Potassium", {}).get("value")
+    Urea = canonical.get("Urea", {}).get("value")
+
+    possibilities: List[str] = []
+
+    # Sepsis / bacterial infection impression
+    if (WBC and WBC > 12) or (Neut and Neut > 80) or (NLR and NLR > 10) or (CRP and CRP > 20):
+        reasons = []
+        if WBC and WBC > 12: reasons.append(f"WBC {WBC}")
+        if Neut and Neut > 80: reasons.append(f"neutrophilia {Neut}%")
+        if NLR and NLR > 10: reasons.append(f"NLR {NLR}")
+        if CRP and CRP > 20: reasons.append(f"CRP {CRP}")
+        possibilities.append("Sepsis / bacterial infection — " + "; ".join(reasons))
+
+    # Electrolyte derangement
+    if K is not None and (K < 3.0 or K > 6.0):
+        possibilities.append(f"Severe electrolyte derangement — potassium {K} mmol/L")
+
+    # Renal function / AKI
+    if Creat is not None and Creat > 120:
+        possibilities.append(f"Acute kidney injury suspected — creatinine {Creat} umol/L")
+    else:
+        possibilities.append("Renal function normal — no evidence of AKI")
+
+    # Anemia
+    if Hb is not None and Hb < 11:
+        possibilities.append(f"Anemia — Hb {Hb} g/dL")
+    else:
+        possibilities.append("No anemia — Hb normal for age/sex")
+
+    # General inflammation
+    if CRP is not None and CRP > 10:
+        possibilities.append(f"Inflammatory response — CRP {CRP} mg/L")
+
+    return possibilities
+
 def route_engine_v5(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[str, Any], previous: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    New Route Engine V5:
-    - generates patterns, routes, next_steps, differential (ranked), severity_text, urgency_flag
-    - computes internal numeric severity (hidden) then converts to severity_text
-    - returns color and tw_class (UI)
-    - returns clinical risk bars per key
+    Route Engine V5:
+    - builds patterns, routes, next_steps, ddx
+    - computes internal numeric severity and converts to severity_text for output
+    - attaches risk bars and UI metadata
+    - *No admission recommendation logic included in output*
     """
     age = patient_meta.get('age')
     sex = patient_meta.get('sex', 'unknown')
     ag = age_group_from_age(age)
 
-    patterns = []
-    routes = []
-    next_steps = []
-    ddx = []
+    patterns: List[Dict[str, Any]] = []
+    routes: List[str] = []
+    next_steps: List[str] = []
+    ddx: List[str] = []
     per_key_scores: Dict[str, int] = {}
 
     def add_pattern(name, reason, score):
@@ -716,17 +854,12 @@ def route_engine_v5(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[str
         next_steps.append('Assess menstrual history; consider urgent ferritin and reticulocyte count.')
 
     # Build differential ranking by simple heuristics (frequency + severity)
-    ddx_rank = {}
+    ddx_rank: Dict[str, int] = {}
     for i, d in enumerate(ddx):
         ddx_rank[d] = ddx_rank.get(d, 0) + (10 - i)
-    # boost sepsis/infectious causes if sepsis_flag
     if sepsis_flag:
         for d in ('Sepsis','Bacterial infection','Severe infection'):
-            if d in ddx_rank:
-                ddx_rank[d] += 50
-            else:
-                ddx_rank[d] = 50
-    # sort unique ddx by score
+            ddx_rank[d] = ddx_rank.get(d, 0) + 50
     ddx_sorted = sorted(ddx_rank.items(), key=lambda x: -x[1])
     ddx_list = [d for d, _ in ddx_sorted]
 
@@ -737,11 +870,10 @@ def route_engine_v5(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[str
     urgency = color_entry['urgency']
 
     # generate risk bars for UI per canonical key
-    risk_bars = {}
+    risk_bars: Dict[str, Dict[str, Any]] = {}
     for kk in CANONICAL_KEYS:
         val = canonical.get(kk, {}).get('value')
         pct = risk_percentage_for_key(kk, val)
-        # determine color for pct
         if pct >= 80:
             clr = '#b91c1c'
         elif pct >= 60:
@@ -754,8 +886,13 @@ def route_engine_v5(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[str
             clr = '#10b981'
         risk_bars[kk] = {'percentage': pct, 'color': clr}
 
-    # construct readable summary
-    summary_lines = []
+    # Diagnostic possibilities (IMPRESSION) first (Option A)
+    diagnostic_possibilities = generate_diagnostic_possibilities(canonical, patterns, routes)
+
+    # construct readable summary (Diagnostic Possibilities first)
+    summary_lines: List[str] = []
+    if diagnostic_possibilities:
+        summary_lines.append("Diagnostic possibilities:\n• " + "\n• ".join(diagnostic_possibilities))
     if patterns:
         summary_lines.append('Patterns: ' + '; '.join([p['pattern'] for p in patterns]))
     if routes:
@@ -779,13 +916,13 @@ def route_engine_v5(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[str
         'routes': routes,
         'next_steps': next_steps,
         'differential': ddx_list,
-        'severity_text': severity_text,           # TEXT ONLY (normal/mild/moderate/severe/critical)
+        'severity_text': severity_text,           # TEXT ONLY
         'urgency_flag': urgency,                  # low/medium/high
         'color': color_entry['color'],
         'tw_class': color_entry['tw'],
         'age_group': ag,
         'age_note': age_note,
-        # admission fields removed entirely per requirement
+        'diagnostic_possibilities': diagnostic_possibilities,
         'risk_bars': risk_bars,
         'summary': '\n'.join(summary_lines[:12]) if summary_lines else 'No significant abnormalities detected.'
     }
@@ -796,7 +933,7 @@ def route_engine_v5(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[str
 def trend_analysis(current: Dict[str, Dict[str, Any]], previous: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not previous:
         return {'trend': 'no_previous'}
-    diffs = {}
+    diffs: Dict[str, Any] = {}
     for k, v in current.items():
         prev_val = previous.get(k, {}).get('value') if isinstance(previous, dict) else None
         cur_val = v.get('value')
@@ -877,25 +1014,24 @@ def process_report(record: Dict[str, Any]) -> None:
     }
 
     # add per-key decorated flags (color, severity_text, risk bar)
-    decorated = {}
+    decorated: Dict[str, Any] = {}
     sex = record.get('sex', 'unknown')
     for key in CANONICAL_KEYS:
         val = canonical.get(key, {})
         value = val.get('value')
         unit = val.get('unit') if isinstance(val.get('unit'), str) else None
-        # compute internal numeric severity per analyte (kept internal)
+        # internal numeric severity per analyte (kept internal)
         s_num = score_severity_for_abnormality_v5(key, value, age_group_from_age(record.get('age')), sex)
         s_text = severity_text_from_score(s_num)
         flag, flag_color = flag_for_key(key, value, sex)
         pct = risk_percentage_for_key(key, value)
-        # risk_color used by UI bars (heuristic)
         risk_color = '#b91c1c' if pct >= 80 else ('#ef4444' if pct >= 60 else ('#f59e0b' if pct >= 40 else ('#facc15' if pct >= 20 else '#10b981')))
         decorated[key] = {
             'value': value,
             'unit': unit,
             'flag': flag,                     # low/normal/high
-            'color': flag_color,              # color for the flag (low=orange, high=red, normal=white)
-            'severity_text': s_text,          # textual severity only (normal/mild/...)
+            'color': flag_color,              # color for the flag
+            'severity_text': s_text,          # textual severity only
             'risk_bar': {'percentage': pct, 'color': risk_color}
         }
     ai_results['decorated'] = decorated
@@ -946,7 +1082,7 @@ if __name__ == '__main__':
         dummy = {
             'id': 'local-test',
             'patient_id': 'local-patient',
-            'age': 45,
+            'age': 17,
             'sex': 'female',
             'file_path': args.test_pdf,
         }
