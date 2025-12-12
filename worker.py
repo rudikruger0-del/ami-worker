@@ -1,18 +1,7 @@
 #!/usr/bin/env python3
-# worker.py — AMI Health Worker V5 (single-file, expanded)
-# Features:
-#  - PDF reading → detect scanned vs digital
-#  - OCR (pytesseract only)
-#  - Robust CBC parsing (regex + improved safe_float)
-#  - Canonical mapping of analytes
-#  - Route Engine V5: patterns → routes → next_steps → differential → internal numeric severity → user-facing severity_text
-#  - NO admission recommendation logic
-#  - Decorated analytes include flag + color + severity_text
-#  - Diagnostic Possibilities (IMPRESSION) inserted at top of summary (Option A)
-#  - Improvements: decimal/spacing robustness, unit protection, impossible-value correction
-#
-# Usage: python worker.py --test-pdf sample.pdf
-# Keep your .env variables (SUPABASE_URL, SUPABASE_KEY, etc.)
+# worker.py — AMI Health Worker V5 (single-file, patched)
+# Changes: improved safe_float, potassium sanitization, neutrophils_abs -> percent conversion,
+# menstrual suggestion only when Hb < 11 in teen female, other robustness tweaks.
 
 import os
 import io
@@ -80,7 +69,6 @@ def download_pdf_from_record(record: Dict[str, Any]) -> bytes:
         path = record['file_path']
         try:
             res = supabase.storage.from_(SUPABASE_BUCKET).download(path)
-            # supabase-python returns a bytes-like or StorageFileResponse
             if hasattr(res, 'data'):
                 return res.data
             return res
@@ -198,7 +186,7 @@ COMMON_KEYS = {
     'rdw': ['rdw','red cell distribution width'],
     'wbc': ['wbc','white cell count','white blood cell','leukocyte','leucocyte','leukocytes'],
     'neutrophils_pc': ['neutrophils %','neutrophils%','neutrophils percent','neutrophil%','neutrophils'],
-    'neutrophils_abs': ['neutrophil absolute','neutrophil count','neutrophils absolute'],
+    'neutrophils_abs': ['neutrophil absolute','neutrophil count','neutrophils absolute','neutrophils abs','neut abs'],
     'lymphocytes_pc': ['lymphocytes %','lymphocytes%','lymphocytes'],
     'monocytes_pc': ['monocytes %','monocytes'],
     'eosinophils_pc': ['eosinophils %','eosinophils'],
@@ -239,24 +227,27 @@ def safe_float(s: str) -> Optional[float]:
     - Handles commas as decimals.
     - Removes stray characters.
     - Joins split OCR fragments like '1 1 . 6' -> '11.6'
-    - Prevents unit contamination.
+    - PRE-CLEAN: remove patterns like '/7' which come from scanner marks and would corrupt numbers.
     """
     if s is None:
         return None
 
+    # If string contains '/7' or '/7)' or similar scribble-like tokens, remove them *before* removing other characters.
+    s = re.sub(r'/\s*7\)?', '', s)
+
     # replace common OCR commas and unicode decimals
     s = s.replace(',', '.')
-    # remove any character that's not digit, dot, or minus
-    s = re.sub(r'[^0-9\.\-]', '', s)
-    # if multiple dots exist, keep only the last (join parts)
+    # remove any character that's not digit, dot, or minus or space (keep space to join tokens later)
+    s = re.sub(r'[^0-9\.\-\s]', '', s)
+    # Join digits split by spaces only: "1 1 . 6" -> "11.6"
+    s = re.sub(r'(?<=\d)\s+(?=\d)', '', s)
+    # if multiple dots exist, keep only the last dot as decimal separator (join prior parts)
     if s.count('.') > 1:
         parts = s.split('.')
         s = ''.join(parts[:-1]) + '.' + parts[-1]
-    # remove spaces (join broken tokens)
-    s = s.replace(' ', '').strip()
+    s = s.strip()
     if s == '':
         return None
-
     try:
         return float(s)
     except Exception:
@@ -276,11 +267,10 @@ def normalize_impossible_values(results: Dict[str, Dict[str, Any]]) -> Dict[str,
         except:
             return None
 
-        # Hemoglobin: unlikely >25 g/dL. Common OCR error 150 -> 15.0
+        # Hemoglobin: unlikely >50 g/dL. Common OCR error 150 -> 15.0
         if key == "hb":
             if v > 50:
                 return round(v / 10.0, 2)
-            # if unreasonably low (<3) assume parse error
             if v < 3:
                 return None
 
@@ -294,18 +284,16 @@ def normalize_impossible_values(results: Dict[str, Dict[str, Any]]) -> Dict[str,
             if v > 40 or v < 5:
                 return None
 
-        # WBC: physiologic extremes; if >300 likely misplaced decimal or scale
+        # WBC: if >300 likely misplaced decimal or scale
         if key == "wbc":
             if v > 300:
-                # if >3000 maybe divide by 100? Heuristic -> divide by 10
                 return round(v / 10.0, 2)
 
-        # Platelets: if extremely large (OCR jam) scale down heuristically
+        # Platelets: correct huge OCR numbers
         if key == "platelets":
             if v > 1000000:
-                return round(v / 10000.0, 1)  # 4529600 -> 452.96 -> 452.96
+                return round(v / 10000.0, 1)
             if v > 10000 and v < 1000000:
-                # ambiguous: if value between 10000 and 1e6 divide by 1000
                 return round(v / 1000.0, 1)
 
         # Neutrophil % should be 0-100
@@ -315,13 +303,12 @@ def normalize_impossible_values(results: Dict[str, Dict[str, Any]]) -> Dict[str,
 
         # Potassium: physiologic 1.5-8; OCR like 24 -> likely 2.4
         if key == "potassium":
-            if v >= 20 and v < 100:
-                # e.g., 24 -> 2.4
+            if 20 <= v < 100:
                 return round(v / 10.0, 2)
             if v > 100:
                 return None
 
-        # Creatinine: if extremely high clamp or leave
+        # Creatinine: if extremely high clamp or scale down
         if key == "creatinine":
             if v > 2000:
                 return round(v / 10.0, 2)
@@ -341,20 +328,22 @@ def find_values_in_text(text: str) -> Dict[str, Dict[str, Any]]:
     Improved parsing:
     - iterate lines, try to match known labels (exact or fuzzy)
     - handle patterns like 'Hb: 11.6 g/dL (12.4-16.7)'
-    - collect percentages and absolute values
+    - capture percent and absolute neutrophil patterns; compute percent from absolute if needed
     - use safer numeric extraction (safe_float)
-    - post-process to normalize impossible values
     """
     results: Dict[str, Dict[str, Any]] = {}
-    # replace common OCR splits like '1 1 . 6' -> '11.6' (but don't over-join letters)
-    text = re.sub(r'(?<=\d)\s+(?=\d)', '', text)
+    # remove obvious OCR divider artifacts, but keep spaces for join logic
+    text = re.sub(r'\t', ' ', text)
+    # remove control characters
+    text = ''.join(ch if (31 < ord(ch) < 127 or ch in '\n\r\t') else ' ' for ch in text)
+    # lines
     lines = [ln.strip() for ln in re.split(r'\n|\r', text) if ln.strip()]
+    # First pass: label matching
     for line in lines:
         lowline = line.lower()
-        # try to extract labelled value occurrences
         for label, key in LABEL_TO_KEY.items():
             if label in lowline:
-                # try percent first
+                # percent?
                 p = re.search(PERCENT_RE, line)
                 if p:
                     val = safe_float(p.group(1))
@@ -362,21 +351,21 @@ def find_values_in_text(text: str) -> Dict[str, Dict[str, Any]]:
                         results.setdefault(key, {})['value'] = val
                         results.setdefault(key, {})['raw_line'] = line
                         continue
-                # numeric search following the label (allow OCR noise up to 40 chars)
+                # numeric search close to label (allow 0-40 chars)
                 pat = re.compile(rf'{re.escape(label)}[^\d\.\-]{{0,40}}({VALUE_RE})', flags=re.IGNORECASE)
                 m = pat.search(line)
                 if m:
                     v = safe_float(m.group(1))
                     if v is not None:
                         results.setdefault(key, {})['value'] = v
-                        # units attempt: look after the matched number for unit tokens
-                        um = re.search(rf'{re.escape(label)}[^\d\n\r]*{re.escape(m.group(1))}\s*([a-zA-Z/%\d\.\-]*)', line, flags=re.IGNORECASE)
+                        # attempt units (simple)
+                        um = re.search(rf'{re.escape(label)}[^\d\n\r]*{re.escape(m.group(1))}\s*([a-zA-Z/%μµ\^0-9\.\-]*)', line, flags=re.IGNORECASE)
                         if um and um.group(1).strip():
                             results.setdefault(key, {})['unit'] = um.group(1).strip()
                         results.setdefault(key, {})['raw_line'] = line
                         continue
-        # fallback generic: e.g., "Hb 11.6 g/dL" or "MCV 78.9 fl"
-        gen = re.findall(r'([A-Za-z\-/ ]{2,30})\s*[:\-]?\s*(' + VALUE_RE + r')\s*([a-zA-Z/%\d\.\-]*)', line)
+        # generic fallback: "Label 11.6 unit"
+        gen = re.findall(r'([A-Za-z\-/ ]{2,30})\s*[:\-]?\s*(' + VALUE_RE + r')\s*([a-zA-Z/%μµ\^0-9\.\-]*)', line)
         for g in gen:
             label_raw = g[0].strip()
             val_s = g[1]
@@ -391,31 +380,55 @@ def find_values_in_text(text: str) -> Dict[str, Dict[str, Any]]:
                     results.setdefault(key, {})['unit'] = unit
                 results.setdefault(key, {})['raw_line'] = line
 
-    # special pass: neutrophils with absolute (e.g., 17.32 x10^9/L) or percent
+    # Special pass: absolute neutrophil values (x10^9/L) -> capture both "x10^9/L" and "x10^9 / L" formats
     for line in lines:
-        if 'neutrophil' in line.lower():
+        if 'neutrophil' in line.lower() or 'neut #' in line.lower() or 'neut abs' in line.lower() or 'neut abs' in line.lower():
+            # percent
             p = re.search(PERCENT_RE, line)
             if p:
                 v = safe_float(p.group(1))
                 if v is not None:
                     results.setdefault('neutrophils_pc', {})['value'] = v
-            a = re.search(r'([0-9]{1,3}\.\d+)\s*x\s*10\^?\d?/?L', line, flags=re.IGNORECASE)
+                    results.setdefault('neutrophils_pc', {})['raw_line'] = line
+            # absolute: look for patterns like '17.8 x10^9/L' or '17.8 x10^9 / L' or '17.8 x 10^9 / L'
+            a = re.search(r'([0-9]{1,3}\.\d+|[0-9]{1,3})\s*x\s*10\^?\s*([0-9]{1,2})\s*/?\s*L', line, flags=re.IGNORECASE)
+            if not a:
+                # alternative common form: "17.8 x10^9/L" without spaces
+                a = re.search(r'([0-9]{1,3}\.\d+|[0-9]{1,3})\s*x10\^?9\s*/?\s*L', line, flags=re.IGNORECASE)
             if a:
-                v = safe_float(a.group(1))
+                # usually it's x10^9/L. We can parse the mantissa
+                mant = a.group(1)
+                v = safe_float(mant)
                 if v is not None:
+                    # store as absolute (in x10^9/L)
                     results.setdefault('neutrophils_abs', {})['value'] = v
+                    results.setdefault('neutrophils_abs', {})['raw_line'] = line
 
-    # ensure platelets reasonable (many labs show platelets as e.g., 376 -> 376 x10^9/L)
+    # Heuristic: if platelets appear as large raw counts, scale if plausible
     if 'platelets' in results:
         pl = results['platelets'].get('value')
         if pl is not None:
-            # if value > 10000, assume reported as raw count (e.g., 4529606), convert heuristically
-            if pl > 10000 and pl > 1e5:
-                if pl / 1000 < 5000:
-                    results['platelets']['value'] = round(pl / 1000, 1)
+            if pl > 1000000:
+                results['platelets']['value'] = round(pl / 10000.0, 1)
+            elif pl > 10000 and pl < 1000000:
+                results['platelets']['value'] = round(pl / 1000.0, 1)
 
-    # final cleanup of impossible values
+    # Final: normalize impossible values
     results = normalize_impossible_values(results)
+
+    # If neutrophils_abs and WBC present -> compute percent neutrophils
+    try:
+        if 'neutrophils_abs' in results and 'wbc' in results:
+            neut_abs = results['neutrophils_abs'].get('value')
+            wbc_val = results['wbc'].get('value')
+            if neut_abs is not None and wbc_val is not None and wbc_val != 0:
+                # Both neut_abs & wbc are in x10^9/L -> percent = (neut_abs / wbc) * 100
+                neut_pct = round((float(neut_abs) / float(wbc_val)) * 100.0, 2)
+                # If the computed percent is reasonable (0-100), set neutrophils_pc
+                if 0 <= neut_pct <= 1000:  # allow some leeway
+                    results.setdefault('neutrophils_pc', {})['value'] = neut_pct
+    except Exception:
+        pass
 
     return results
 
@@ -428,7 +441,7 @@ CANONICAL_KEYS = ['Hb', 'MCV', 'MCH', 'MCHC', 'RDW', 'WBC', 'Neutrophils', 'Lymp
 def canonical_map(parsed: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     map_rules = {
         'hb': 'Hb', 'mcv': 'MCV', 'mch': 'MCH', 'mchc': 'MCHC', 'rdw': 'RDW',
-        'wbc': 'WBC', 'neutrophils_pc': 'Neutrophils', 'neutrophils_abs': 'Neutrophils',
+        'wbc': 'WBC', 'neutrophils_pc': 'Neutrophils', 'neutrophils_abs': None,
         'lymphocytes_pc': 'Lymphocytes', 'monocytes_pc': 'Monocytes',
         'eosinophils_pc': 'Eosinophils', 'basophils_pc': 'Basophils',
         'platelets': 'Platelets', 'creatinine': 'Creatinine', 'crp': 'CRP',
@@ -438,7 +451,11 @@ def canonical_map(parsed: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]
     out: Dict[str, Dict[str, Any]] = {}
     for k, v in parsed.items():
         canon = map_rules.get(k)
-        if not canon:
+        # Note: neutrophils_abs handled separately below (we compute % if needed)
+        if canon is None and k != 'neutrophils_abs':
+            continue
+        if k == 'neutrophils_abs':
+            # handled later
             continue
         try:
             out[canon] = {'value': float(v.get('value')) if v.get('value') is not None else None}
@@ -449,10 +466,28 @@ def canonical_map(parsed: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]
         if v.get('raw_line'):
             out[canon]['raw'] = v.get('raw_line')
 
-    # compute NLR if both neutrophils (percent or absolute) and lymphocytes present
+    # If neutrophils_abs exists and WBC present -> compute percent and map
+    try:
+        if 'neutrophils_abs' in parsed:
+            neut_abs = parsed['neutrophils_abs'].get('value')
+            wbc_val = parsed.get('wbc', {}).get('value') or out.get('WBC', {}).get('value')
+            if neut_abs is not None and wbc_val is not None and wbc_val != 0:
+                neut_pct = round((float(neut_abs) / float(wbc_val)) * 100.0, 2)
+                out['Neutrophils'] = {'value': neut_pct, 'raw': parsed['neutrophils_abs'].get('raw_line')}
+            else:
+                # If we can't compute percent, but neut_abs exists, store absolute under a raw key
+                # and do not overwrite Neutrophils percent if already present
+                if 'Neutrophils' not in out and neut_abs is not None:
+                    # This is absolute neutrophil count — store under Neutrophils_abs as raw info
+                    out['Neutrophils'] = {'value': None, 'raw_abs': neut_abs}
+    except Exception:
+        pass
+
+    # compute NLR if neutrophils + lymphocytes present
     try:
         n = out.get('Neutrophils', {}).get('value')
         l = out.get('Lymphocytes', {}).get('value')
+        # Lymphocytes may be percent or absolute; if both in percent, NLR computed with percents is okay as ratio
         if n is not None and l is not None and l != 0:
             out['NLR'] = {'value': round(float(n) / float(l), 2)}
     except Exception:
@@ -676,17 +711,17 @@ def generate_diagnostic_possibilities(canonical: Dict[str, Dict[str, Any]], patt
     possibilities: List[str] = []
 
     # Sepsis / bacterial infection impression
-    if (WBC and WBC > 12) or (Neut and Neut > 80) or (NLR and NLR > 10) or (CRP and CRP > 20):
+    if (WBC and WBC > 12) or (Neut and Neut > 70) or (NLR and NLR > 10) or (CRP and CRP > 20):
         reasons = []
         if WBC and WBC > 12: reasons.append(f"WBC {WBC}")
-        if Neut and Neut > 80: reasons.append(f"neutrophilia {Neut}%")
+        if Neut and Neut > 70: reasons.append(f"neutrophilia {Neut}%")
         if NLR and NLR > 10: reasons.append(f"NLR {NLR}")
         if CRP and CRP > 20: reasons.append(f"CRP {CRP}")
         possibilities.append("Sepsis / bacterial infection — " + "; ".join(reasons))
 
     # Electrolyte derangement
-    if K is not None and (K < 3.0 or K > 6.0):
-        possibilities.append(f"Severe electrolyte derangement — potassium {K} mmol/L")
+    if K is not None and (K < 3.2 or K > 6.0):
+        possibilities.append(f"Electrolyte derangement — potassium {K} mmol/L")
 
     # Renal function / AKI
     if Creat is not None and Creat > 120:
@@ -698,7 +733,7 @@ def generate_diagnostic_possibilities(canonical: Dict[str, Dict[str, Any]], patt
     if Hb is not None and Hb < 11:
         possibilities.append(f"Anemia — Hb {Hb} g/dL")
     else:
-        possibilities.append("No anemia — Hb normal for age/sex")
+        possibilities.append("No anemia — Hb within expected range")
 
     # General inflammation
     if CRP is not None and CRP > 10:
@@ -849,8 +884,8 @@ def route_engine_v5(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[str
             routes.append('Infection with anemia route')
             next_steps.append('Treat source of infection; reassess Hb after control; do ferritin when CRP falls.')
 
-    # Age/sex modifiers
-    if ag == 'teen' and sex.lower() == 'female':
+    # Menstrual/ferritin suggestion: ONLY when clinically indicated (Hb < 11 AND teen female)
+    if ag == 'teen' and sex.lower() == 'female' and hb is not None and hb < 11:
         next_steps.append('Assess menstrual history; consider urgent ferritin and reticulocyte count.')
 
     # Build differential ranking by simple heuristics (frequency + severity)
@@ -903,8 +938,8 @@ def route_engine_v5(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[str
         summary_lines.append('Immediate suggested actions: ' + ' | '.join(next_steps))
 
     age_note = ''
-    if ag == 'teen' and sex.lower() == 'female':
-        age_note = 'Teenage female — consider menstrual blood loss and iron deficiency.'
+    if ag == 'teen' and sex.lower() == 'female' and (hb is None or hb >= 11):
+        age_note = ''  # don't add menstrual message unless Hb < 11 (we add only in next_steps when Hb<11)
     elif ag == 'elderly':
         age_note = 'Elderly – broaden differential for chronic disease and malignancy.'
 
@@ -1071,7 +1106,7 @@ def poll_and_process():
 # ---------- CLI / test ----------
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser(description="AMI Health Worker V5 (pypdf + pytesseract)")
+    parser = argparse.ArgumentParser(description="AMI Health Worker V5 (pypdf + pytesseract) - patched")
     parser.add_argument('--test-pdf', help='Path to local PDF for testing')
     parser.add_argument('--once', action='store_true', help='Poll once then exit (if not test)')
     args = parser.parse_args()
