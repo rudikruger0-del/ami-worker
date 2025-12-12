@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-# worker.py — AMI Health Worker V5 (single-file, patched)
-# Changes: improved safe_float, potassium sanitization, neutrophils_abs -> percent conversion,
-# menstrual suggestion only when Hb < 11 in teen female, other robustness tweaks.
 
 import os
 import io
@@ -17,7 +14,7 @@ from pypdf import PdfReader
 from pdf2image import convert_from_bytes
 from PIL import Image, ImageFilter, ImageOps
 
-# optional imports
+# Optional imports
 try:
     import pytesseract
     HAS_PYTESSERACT = True
@@ -32,673 +29,660 @@ except Exception:
     create_client = None
     HAS_SUPABASE = False
 
-# ---------- config & logging ----------
 load_dotenv()
-SUPABASE_URL = os.getenv('SUPABASE_URL')
-SUPABASE_KEY = os.getenv('SUPABASE_KEY')
-SUPABASE_TABLE = os.getenv('SUPABASE_TABLE', 'reports')
-SUPABASE_BUCKET = os.getenv('SUPABASE_BUCKET', 'reports')
-POLL_INTERVAL = int(os.getenv('POLL_INTERVAL', '6'))
-PDF_RENDER_DPI = int(os.getenv('PDF_RENDER_DPI', '200'))
-TEXT_LENGTH_THRESHOLD = int(os.getenv('TEXT_LENGTH_THRESHOLD', '80'))
-OCR_LANG = os.getenv('OCR_LANG', 'eng')
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-logger = logging.getLogger('ami-worker-v5')
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "reports")
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "reports")
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "6"))
+TEXT_LENGTH_THRESHOLD = int(os.getenv("TEXT_LENGTH_THRESHOLD", "80"))
+OCR_LANG = os.getenv("OCR_LANG", "eng")
+PDF_RENDER_DPI = int(os.getenv("PDF_RENDER_DPI", "200"))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("ami-worker-v6")
 
 if HAS_SUPABASE and SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 else:
     supabase = None
-    if not HAS_SUPABASE:
-        logger.warning("supabase package not available - saving disabled.")
-    else:
-        logger.warning("SUPABASE_URL or SUPABASE_KEY missing - saving disabled.")
 
-# ---------- PDF reading & scanned detection ----------
+# ---------------------------
+# PDF DOWNLOAD
+# ---------------------------
 
 def download_pdf_from_record(record: Dict[str, Any]) -> bytes:
-    """Download PDF binary. Supports 'pdf_url' or Supabase storage 'file_path'."""
-    if 'pdf_url' in record and record['pdf_url']:
+    if "pdf_url" in record and record["pdf_url"]:
         import requests
-        url = record['pdf_url']
+        url = record["pdf_url"]
         r = requests.get(url, timeout=30)
         r.raise_for_status()
         return r.content
-    elif 'file_path' in record and supabase:
-        path = record['file_path']
+
+    elif "file_path" in record and supabase:
+        path = record["file_path"]
         try:
             res = supabase.storage.from_(SUPABASE_BUCKET).download(path)
-            if hasattr(res, 'data'):
+            if hasattr(res, "data"):
                 return res.data
             return res
         except Exception as e:
-            logger.exception("Supabase storage download failed: %s", e)
+            logger.exception("Supabase download failed: %s", e)
             raise
+
     else:
-        raise ValueError("No 'pdf_url' or 'file_path' in record, or supabase not configured.")
+        raise ValueError("Missing 'pdf_url' or 'file_path'")
+
+# ---------------------------
+# PDF TEXT EXTRACTION
+# ---------------------------
 
 def extract_text_with_pypdf(pdf_bytes: bytes) -> str:
-    """Extract text using pypdf (digital text). Returns concatenated pages."""
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
-    except Exception as e:
-        logger.debug("PdfReader failed: %s", e)
-        return ''
+    except:
+        return ""
+
     parts = []
-    for i, p in enumerate(reader.pages):
+    for p in reader.pages:
         try:
-            txt = p.extract_text() or ''
-            parts.append(txt)
-        except Exception as e:
-            logger.debug("pypdf page extract failed %d: %s", i, e)
-            parts.append('')
-    joined = '\n'.join(parts)
-    return joined
+            t = p.extract_text() or ""
+        except:
+            t = ""
+        parts.append(t)
+
+    return "\n".join(parts)
+
 
 def is_scanned_pdf(pdf_bytes: bytes) -> bool:
-    """Decide whether PDF is scanned (low extracted text length)"""
     txt = extract_text_with_pypdf(pdf_bytes)
-    if len(txt.strip()) < TEXT_LENGTH_THRESHOLD:
-        logger.info("PDF appears scanned (text len %d)", len(txt))
-        return True
-    return False
+    return len(txt.strip()) < TEXT_LENGTH_THRESHOLD
 
-# ---------- OCR via pytesseract (safer) ----------
+# ---------------------------
+# OCR ENGINE (pytesseract)
+# ---------------------------
 
 def preprocess_image_for_ocr(img: Image.Image, target_min_dim: int = 1600) -> Image.Image:
-    """
-    Preprocess to improve OCR:
-    - convert to grayscale,
-    - autocontrast,
-    - denoise (median),
-    - upscale small pages for better OCR.
-    """
     try:
-        img = img.convert('L')
+        img = img.convert("L")
         img = ImageOps.autocontrast(img, cutoff=1)
         img = img.filter(ImageFilter.MedianFilter(size=3))
         w, h = img.size
-        maxdim = max(w, h)
-        if maxdim < target_min_dim:
-            factor = max(1, int(target_min_dim / maxdim))
+        if max(w, h) < target_min_dim:
+            factor = max(1, int(target_min_dim / max(w, h)))
             img = img.resize((w * factor, h * factor), Image.LANCZOS)
         return img
-    except Exception as e:
-        logger.debug("preprocess_image_for_ocr failed: %s", e)
+    except:
         return img
+
 
 def ocr_image_pytesseract(img: Image.Image, lang: str = OCR_LANG) -> str:
     if not HAS_PYTESSERACT:
-        raise RuntimeError("pytesseract is not available in this environment.")
+        return ""
+
     img2 = preprocess_image_for_ocr(img)
-    config = r'--oem 3 --psm 6'
+    config = "--oem 3 --psm 6"
+
     try:
-        text = pytesseract.image_to_string(img2, lang=lang, config=config)
-    except Exception as e:
-        logger.exception("pytesseract error: %s", e)
-        text = ''
-    # sanitize: remove non-printables
-    text = ''.join(ch if (31 < ord(ch) < 127 or ch in '\n\r\t') else ' ' for ch in text)
-    return text
+        t = pytesseract.image_to_string(img2, lang=lang, config=config)
+    except:
+        t = ""
+
+    t = "".join(ch if (31 < ord(ch) < 127 or ch in "\n\r\t") else " " for ch in t)
+    return t
+
 
 def pdf_to_images(pdf_bytes: bytes, dpi: int = PDF_RENDER_DPI) -> List[Image.Image]:
-    """Render PDF to list of PIL Images using pdf2image."""
-    try:
-        imgs = convert_from_bytes(pdf_bytes, dpi=dpi)
-        return imgs
-    except Exception as e:
-        logger.exception("convert_from_bytes failed: %s", e)
-        raise
+    return convert_from_bytes(pdf_bytes, dpi=dpi)
+
 
 def do_ocr_on_pdf(pdf_bytes: bytes) -> str:
-    """Render scanned PDF to images and OCR each page with pytesseract, returning concatenated text."""
-    try:
-        images = pdf_to_images(pdf_bytes)
-    except Exception as e:
-        logger.exception("Failed to render PDF to images: %s", e)
-        raise
-
+    images = pdf_to_images(pdf_bytes)
     texts = []
-    for i, img in enumerate(images):
-        try:
-            page_text = ocr_image_pytesseract(img)
-            logger.info("OCR page %d length %d", i, len(page_text))
-        except Exception as e:
-            logger.exception("pytesseract failed on page %d: %s", i, e)
-            page_text = ''
-        texts.append(page_text)
-    return '\n\n---PAGE_BREAK---\n\n'.join(texts)
+    for img in images:
+        text = ocr_image_pytesseract(img)
+        texts.append(text)
+    return "\n---PAGE_BREAK---\n".join(texts)
 
-# ---------- Parsing: robust lab extraction ----------
+# ---------------------------
+# SMART NUMERIC CLEANER
+# ---------------------------
 
-# regex pieces
-VALUE_RE = r'(-?\d+\.\d+|-?\d+)'
-PERCENT_RE = r'([0-9]{1,3}\.?\d*)\s*%'
+def safe_float(text: str) -> Optional[float]:
+    if text is None:
+        return None
 
-COMMON_KEYS = {
-    'hb': ['hb','haemoglobin','hemoglobin'],
-    'rbc': ['rbc','erythrocyte count','erythrocyte'],
-    'hct': ['hct','haematocrit','hematocrit'],
-    'mcv': ['mcv','mean corpuscular volume'],
-    'mch': ['mch','mean corpuscular haemoglobin','mean corpuscular hemoglobin'],
-    'mchc': ['mchc'],
-    'rdw': ['rdw','red cell distribution width'],
-    'wbc': ['wbc','white cell count','white blood cell','leukocyte','leucocyte','leukocytes'],
-    'neutrophils_pc': ['neutrophils %','neutrophils%','neutrophils percent','neutrophil%','neutrophils'],
-    'neutrophils_abs': ['neutrophil absolute','neutrophil count','neutrophils absolute','neutrophils abs','neut abs'],
-    'lymphocytes_pc': ['lymphocytes %','lymphocytes%','lymphocytes'],
-    'monocytes_pc': ['monocytes %','monocytes'],
-    'eosinophils_pc': ['eosinophils %','eosinophils'],
-    'basophils_pc': ['basophils %','basophils'],
-    'platelets': ['platelets','thrombocytes','platelet count'],
-    'crp': ['crp','c-reactive protein','c reactive protein'],
-    'creatinine': ['creatinine','creat'],
-    'sodium': ['sodium','na '],
-    'potassium': ['potassium','k '],
-    'chloride': ['chloride','cl '],
-    'urea': ['urea','bun'],
-    'alt': ['alt','alanine aminotransferase'],
-    'ast': ['ast','aspartate aminotransferase'],
-    'ck': ['ck','creatine kinase'],
+    text = re.sub(r"/\s*7", "", text)
+    text = text.replace(",", ".")
+    text = re.sub(r"[^0-9.\-\s]", "", text)
+    text = re.sub(r"(?<=\d)\s+(?=\d)", "", text)
+
+    if text.count(".") > 1:
+        parts = text.split(".")
+        text = "".join(parts[:-1]) + "." + parts[-1]
+
+    text = text.strip()
+    if text == "":
+        return None
+
+    try:
+        return float(text)
+    except:
+        return None
+
+# ---------------------------
+# TABLE PARSER V6 (NEW)
+# ---------------------------
+
+TABLE_LABEL_MAP = {
+    "hb": "Hb",
+    "hgb": "Hb",
+    "haemoglobin": "Hb",
+    "hemoglobin": "Hb",
+
+    "rbc": "RBC",
+    "hct": "HCT",
+    "haematocrit": "HCT",
+
+    "mcv": "MCV",
+    "mch": "MCH",
+    "mchc": "MCHC",
+    "rdw": "RDW",
+
+    "wbc": "WBC",
+    "neut": "Neutrophils",
+    "neutrophils": "Neutrophils",
+    "lymph": "Lymphocytes",
+    "mono": "Monocytes",
+    "mono abs": "Monocytes",
+    "eos": "Eosinophils",
+    "baso": "Basophils",
+
+    "plt": "Platelets",
+    "platelets": "Platelets",
+
+    "crp": "CRP",
+    "creat": "Creatinine",
+    "creatinine": "Creatinine",
+    "urea": "Urea",
+    "bun": "Urea",
+
+    "na": "Sodium",
+    "sodium": "Sodium",
+    "k": "Potassium",
+    "potassium": "Potassium",
+    "cl": "Chloride",
+    "chloride": "Chloride",
+
+    "alt": "ALT",
+    "ast": "AST",
+    "ck": "CK",
+    "ck-mb": "CK_MB",
+
+    "ca": "Calcium",
+    "ca adj": "Calcium_Adjusted",
+    "albumin": "Albumin",
+    "co2": "CO2",
+    "tco2": "CO2",
+    "total co2": "CO2",
 }
 
-LABEL_TO_KEY = {}
-for k, labels in COMMON_KEYS.items():
-    for l in labels:
-        LABEL_TO_KEY[l.lower()] = k
 
-def normalize_label(lbl: str) -> str:
-    return re.sub(r'[^a-z0-9 ]', '', lbl.lower()).strip()
+def normalize_label_for_table(label: str) -> str:
+    label = label.lower().strip()
+    label = re.sub(r"[^a-z0-9 ]", "", label)
+    return label
 
-def find_key_for_label(label: str) -> Optional[str]:
-    l = normalize_label(label)
-    if l in LABEL_TO_KEY:
-        return LABEL_TO_KEY[l]
-    # fuzzy contains check
-    for lab, key in LABEL_TO_KEY.items():
-        if lab in l or l in lab:
-            return key
+
+def map_table_label(label: str) -> Optional[str]:
+    l = normalize_label_for_table(label)
+    if l in TABLE_LABEL_MAP:
+        return TABLE_LABEL_MAP[l]
+
+    for key in TABLE_LABEL_MAP:
+        if key in l:
+            return TABLE_LABEL_MAP[key]
+
     return None
 
-def safe_float(s: str) -> Optional[float]:
-    """
-    Improved float converter:
-    - Handles commas as decimals.
-    - Removes stray characters.
-    - Joins split OCR fragments like '1 1 . 6' -> '11.6'
-    - PRE-CLEAN: remove patterns like '/7' which come from scanner marks and would corrupt numbers.
-    """
-    if s is None:
-        return None
 
-    # If string contains '/7' or '/7)' or similar scribble-like tokens, remove them *before* removing other characters.
-    s = re.sub(r'/\s*7\)?', '', s)
-
-    # replace common OCR commas and unicode decimals
-    s = s.replace(',', '.')
-    # remove any character that's not digit, dot, or minus or space (keep space to join tokens later)
-    s = re.sub(r'[^0-9\.\-\s]', '', s)
-    # Join digits split by spaces only: "1 1 . 6" -> "11.6"
-    s = re.sub(r'(?<=\d)\s+(?=\d)', '', s)
-    # if multiple dots exist, keep only the last dot as decimal separator (join prior parts)
-    if s.count('.') > 1:
-        parts = s.split('.')
-        s = ''.join(parts[:-1]) + '.' + parts[-1]
-    s = s.strip()
-    if s == '':
-        return None
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-def normalize_impossible_values(results: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """
-    Detect and correct biologically impossible lab values caused by OCR / spacing errors.
-    Only modifies values that are clearly incorrect. Non-confident corrections set value to None.
-    Keys are the LABEL_TO_KEY keys (e.g., 'hb','wbc') as parsed, not canonical keys.
-    """
-    def fix_value(key, v):
-        if v is None:
-            return v
-        try:
-            v = float(v)
-        except:
-            return None
-
-        # Hemoglobin: unlikely >50 g/dL. Common OCR error 150 -> 15.0
-        if key == "hb":
-            if v > 50:
-                return round(v / 10.0, 2)
-            if v < 3:
-                return None
-
-        # MCV: typical 70-110 fL. If <40 or >200 treat as error
-        if key == "mcv":
-            if v < 40 or v > 200:
-                return None
-
-        # RDW: typical 10-20%
-        if key == "rdw":
-            if v > 40 or v < 5:
-                return None
-
-        # WBC: if >300 likely misplaced decimal or scale
-        if key == "wbc":
-            if v > 300:
-                return round(v / 10.0, 2)
-
-        # Platelets: correct huge OCR numbers
-        if key == "platelets":
-            if v > 1000000:
-                return round(v / 10000.0, 1)
-            if v > 10000 and v < 1000000:
-                return round(v / 1000.0, 1)
-
-        # Neutrophil % should be 0-100
-        if key == "neutrophils_pc":
-            if v > 100 or v < 0:
-                return None
-
-        # Potassium: physiologic 1.5-8; OCR like 24 -> likely 2.4
-        if key == "potassium":
-            if 20 <= v < 100:
-                return round(v / 10.0, 2)
-            if v > 100:
-                return None
-
-        # Creatinine: if extremely high clamp or scale down
-        if key == "creatinine":
-            if v > 2000:
-                return round(v / 10.0, 2)
-
-        return v
-
-    for k in list(results.keys()):
-        entry = results.get(k)
-        if not entry:
-            continue
-        if 'value' in entry:
-            entry['value'] = fix_value(k, entry['value'])
-    return results
-
-def find_values_in_text(text: str) -> Dict[str, Dict[str, Any]]:
-    """
-    Improved parsing:
-    - iterate lines, try to match known labels (exact or fuzzy)
-    - handle patterns like 'Hb: 11.6 g/dL (12.4-16.7)'
-    - capture percent and absolute neutrophil patterns; compute percent from absolute if needed
-    - use safer numeric extraction (safe_float)
-    """
-    results: Dict[str, Dict[str, Any]] = {}
-    # remove obvious OCR divider artifacts, but keep spaces for join logic
-    text = re.sub(r'\t', ' ', text)
-    # remove control characters
-    text = ''.join(ch if (31 < ord(ch) < 127 or ch in '\n\r\t') else ' ' for ch in text)
-    # lines
-    lines = [ln.strip() for ln in re.split(r'\n|\r', text) if ln.strip()]
-    # First pass: label matching
-    for line in lines:
-        lowline = line.lower()
-        for label, key in LABEL_TO_KEY.items():
-            if label in lowline:
-                # percent?
-                p = re.search(PERCENT_RE, line)
-                if p:
-                    val = safe_float(p.group(1))
-                    if val is not None:
-                        results.setdefault(key, {})['value'] = val
-                        results.setdefault(key, {})['raw_line'] = line
-                        continue
-                # numeric search close to label (allow 0-40 chars)
-                pat = re.compile(rf'{re.escape(label)}[^\d\.\-]{{0,40}}({VALUE_RE})', flags=re.IGNORECASE)
-                m = pat.search(line)
-                if m:
-                    v = safe_float(m.group(1))
-                    if v is not None:
-                        results.setdefault(key, {})['value'] = v
-                        # attempt units (simple)
-                        um = re.search(rf'{re.escape(label)}[^\d\n\r]*{re.escape(m.group(1))}\s*([a-zA-Z/%μµ\^0-9\.\-]*)', line, flags=re.IGNORECASE)
-                        if um and um.group(1).strip():
-                            results.setdefault(key, {})['unit'] = um.group(1).strip()
-                        results.setdefault(key, {})['raw_line'] = line
-                        continue
-        # generic fallback: "Label 11.6 unit"
-        gen = re.findall(r'([A-Za-z\-/ ]{2,30})\s*[:\-]?\s*(' + VALUE_RE + r')\s*([a-zA-Z/%μµ\^0-9\.\-]*)', line)
-        for g in gen:
-            label_raw = g[0].strip()
-            val_s = g[1]
-            unit = g[2].strip() if g[2] else None
-            key = find_key_for_label(label_raw)
-            if key:
-                v = safe_float(val_s)
-                if v is None:
-                    continue
-                results.setdefault(key, {})['value'] = v
-                if unit:
-                    results.setdefault(key, {})['unit'] = unit
-                results.setdefault(key, {})['raw_line'] = line
-
-    # Special pass: absolute neutrophil values (x10^9/L) -> capture both "x10^9/L" and "x10^9 / L" formats
-    for line in lines:
-        if 'neutrophil' in line.lower() or 'neut #' in line.lower() or 'neut abs' in line.lower() or 'neut abs' in line.lower():
-            # percent
-            p = re.search(PERCENT_RE, line)
-            if p:
-                v = safe_float(p.group(1))
-                if v is not None:
-                    results.setdefault('neutrophils_pc', {})['value'] = v
-                    results.setdefault('neutrophils_pc', {})['raw_line'] = line
-            # absolute: look for patterns like '17.8 x10^9/L' or '17.8 x10^9 / L' or '17.8 x 10^9 / L'
-            a = re.search(r'([0-9]{1,3}\.\d+|[0-9]{1,3})\s*x\s*10\^?\s*([0-9]{1,2})\s*/?\s*L', line, flags=re.IGNORECASE)
-            if not a:
-                # alternative common form: "17.8 x10^9/L" without spaces
-                a = re.search(r'([0-9]{1,3}\.\d+|[0-9]{1,3})\s*x10\^?9\s*/?\s*L', line, flags=re.IGNORECASE)
-            if a:
-                # usually it's x10^9/L. We can parse the mantissa
-                mant = a.group(1)
-                v = safe_float(mant)
-                if v is not None:
-                    # store as absolute (in x10^9/L)
-                    results.setdefault('neutrophils_abs', {})['value'] = v
-                    results.setdefault('neutrophils_abs', {})['raw_line'] = line
-
-    # Heuristic: if platelets appear as large raw counts, scale if plausible
-    if 'platelets' in results:
-        pl = results['platelets'].get('value')
-        if pl is not None:
-            if pl > 1000000:
-                results['platelets']['value'] = round(pl / 10000.0, 1)
-            elif pl > 10000 and pl < 1000000:
-                results['platelets']['value'] = round(pl / 1000.0, 1)
-
-    # Final: normalize impossible values
-    results = normalize_impossible_values(results)
-
-    # If neutrophils_abs and WBC present -> compute percent neutrophils
-    try:
-        if 'neutrophils_abs' in results and 'wbc' in results:
-            neut_abs = results['neutrophils_abs'].get('value')
-            wbc_val = results['wbc'].get('value')
-            if neut_abs is not None and wbc_val is not None and wbc_val != 0:
-                # Both neut_abs & wbc are in x10^9/L -> percent = (neut_abs / wbc) * 100
-                neut_pct = round((float(neut_abs) / float(wbc_val)) * 100.0, 2)
-                # If the computed percent is reasonable (0-100), set neutrophils_pc
-                if 0 <= neut_pct <= 1000:  # allow some leeway
-                    results.setdefault('neutrophils_pc', {})['value'] = neut_pct
-    except Exception:
-        pass
-
-    return results
-
-# ---------- Canonical mapping & decoration ----------
-
-CANONICAL_KEYS = ['Hb', 'MCV', 'MCH', 'MCHC', 'RDW', 'WBC', 'Neutrophils', 'Lymphocytes',
-                  'Monocytes', 'Eosinophils', 'Basophils', 'NLR', 'Platelets', 'Creatinine',
-                  'CRP', 'Sodium', 'Potassium', 'Chloride', 'Urea', 'RBC', 'HCT', 'ALT', 'AST', 'CK']
-
-def canonical_map(parsed: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    map_rules = {
-        'hb': 'Hb', 'mcv': 'MCV', 'mch': 'MCH', 'mchc': 'MCHC', 'rdw': 'RDW',
-        'wbc': 'WBC', 'neutrophils_pc': 'Neutrophils', 'neutrophils_abs': None,
-        'lymphocytes_pc': 'Lymphocytes', 'monocytes_pc': 'Monocytes',
-        'eosinophils_pc': 'Eosinophils', 'basophils_pc': 'Basophils',
-        'platelets': 'Platelets', 'creatinine': 'Creatinine', 'crp': 'CRP',
-        'sodium': 'Sodium', 'potassium': 'Potassium', 'chloride': 'Chloride',
-        'urea': 'Urea', 'rbc': 'RBC', 'hct': 'HCT', 'alt': 'ALT', 'ast': 'AST', 'ck': 'CK'
-    }
+def parse_table_block(lines: List[str]) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
-    for k, v in parsed.items():
-        canon = map_rules.get(k)
-        # Note: neutrophils_abs handled separately below (we compute % if needed)
-        if canon is None and k != 'neutrophils_abs':
-            continue
-        if k == 'neutrophils_abs':
-            # handled later
-            continue
-        try:
-            out[canon] = {'value': float(v.get('value')) if v.get('value') is not None else None}
-        except Exception:
-            out[canon] = {'value': None}
-        if v.get('unit'):
-            out[canon]['unit'] = v.get('unit')
-        if v.get('raw_line'):
-            out[canon]['raw'] = v.get('raw_line')
 
-    # If neutrophils_abs exists and WBC present -> compute percent and map
-    try:
-        if 'neutrophils_abs' in parsed:
-            neut_abs = parsed['neutrophils_abs'].get('value')
-            wbc_val = parsed.get('wbc', {}).get('value') or out.get('WBC', {}).get('value')
-            if neut_abs is not None and wbc_val is not None and wbc_val != 0:
-                neut_pct = round((float(neut_abs) / float(wbc_val)) * 100.0, 2)
-                out['Neutrophils'] = {'value': neut_pct, 'raw': parsed['neutrophils_abs'].get('raw_line')}
-            else:
-                # If we can't compute percent, but neut_abs exists, store absolute under a raw key
-                # and do not overwrite Neutrophils percent if already present
-                if 'Neutrophils' not in out and neut_abs is not None:
-                    # This is absolute neutrophil count — store under Neutrophils_abs as raw info
-                    out['Neutrophils'] = {'value': None, 'raw_abs': neut_abs}
-    except Exception:
-        pass
+    for ln in lines:
+        ln_clean = re.sub(r"\s+", " ", ln.strip())
+        if ln_clean == "":
+            continue
 
-    # compute NLR if neutrophils + lymphocytes present
-    try:
-        n = out.get('Neutrophils', {}).get('value')
-        l = out.get('Lymphocytes', {}).get('value')
-        # Lymphocytes may be percent or absolute; if both in percent, NLR computed with percents is okay as ratio
-        if n is not None and l is not None and l != 0:
-            out['NLR'] = {'value': round(float(n) / float(l), 2)}
-    except Exception:
-        pass
+        tokens = ln_clean.split(" ")
+
+        if len(tokens) < 2:
+            continue
+
+        label = tokens[0]
+        mapped = map_table_label(label)
+        if not mapped:
+            continue
+
+        numeric = None
+        flag = None
+
+        for t in tokens[1:]:
+            v = safe_float(t)
+            if v is not None:
+                numeric = v
+            elif t.upper() in ("L", "H", "LL", "HH"):
+                flag = t.upper()
+
+        if numeric is not None:
+            out[mapped] = {"value": numeric, "raw_line": ln_clean}
+            if flag:
+                out[mapped]["flag"] = flag
+
+    return out
+# ---------------------------
+# FALLBACK LINE PARSER (non-table)
+# ---------------------------
+
+LABEL_TO_KEY = {
+    "hb": "Hb",
+    "hgb": "Hb",
+    "haemoglobin": "Hb",
+    "hemoglobin": "Hb",
+
+    "rbc": "RBC",
+    "hct": "HCT",
+    "mcv": "MCV",
+    "mch": "MCH",
+    "mchc": "MCHC",
+    "rdw": "RDW",
+
+    "wbc": "WBC",
+    "white cell": "WBC",
+    "leukocyte": "WBC",
+    "leucocyte": "WBC",
+
+    "neut": "Neutrophils",
+    "neutrophils": "Neutrophils",
+    "lymph": "Lymphocytes",
+    "lymphocytes": "Lymphocytes",
+    "mono": "Monocytes",
+    "monocytes": "Monocytes",
+    "eos": "Eosinophils",
+    "eosinophils": "Eosinophils",
+    "baso": "Basophils",
+    "basophils": "Basophils",
+
+    "plt": "Platelets",
+    "platelets": "Platelets",
+
+    "crp": "CRP",
+    "creat": "Creatinine",
+    "creatinine": "Creatinine",
+    "urea": "Urea",
+    "bun": "Urea",
+
+    "na": "Sodium",
+    "sodium": "Sodium",
+    "k": "Potassium",
+    "potassium": "Potassium",
+    "cl": "Chloride",
+    "chloride": "Chloride",
+
+    "alt": "ALT",
+    "ast": "AST",
+    "ck": "CK",
+    "ckmb": "CK_MB",
+    "ck-mb": "CK_MB",
+}
+
+
+def normalize_label_general(text: str) -> str:
+    t = text.lower()
+    t = re.sub(r"[^a-z0-9 ]", "", t)
+    t = t.strip()
+    return t
+
+
+def find_key_for_label_general(lbl: str) -> Optional[str]:
+    lbl2 = normalize_label_general(lbl)
+    if lbl2 in LABEL_TO_KEY:
+        return LABEL_TO_KEY[lbl2]
+
+    for k in LABEL_TO_KEY:
+        if k in lbl2:
+            return LABEL_TO_KEY[k]
+
+    return None
+
+
+def parse_lines_fallback(lines: List[str]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+
+    for ln in lines:
+        ln_clean = re.sub(r"\s+", " ", ln.strip())
+        if ln_clean == "":
+            continue
+
+        m = re.match(r"([A-Za-z0-9\-/ ]{2,30})[:\-\s]+\s*([0-9\.\-,]+)", ln_clean)
+        if not m:
+            continue
+
+        label_raw = m.group(1).strip()
+        val_raw = m.group(2).strip()
+
+        key = find_key_for_label_general(label_raw)
+        if not key:
+            continue
+
+        v = safe_float(val_raw)
+        if v is None:
+            continue
+
+        out[key] = {"value": v, "raw_line": ln_clean}
 
     return out
 
-# ---------- Risk bar helper & decorators ----------
+# ---------------------------
+# MASTER PARSER — COMBINES TABLE + FALLBACK
+# ---------------------------
 
-COLOR_MAP = {
-    5: {'label': 'critical', 'color': '#b91c1c', 'tw': 'bg-red-700', 'urgency': 'high'},
-    4: {'label': 'severe', 'color': '#ef4444', 'tw': 'bg-red-500', 'urgency': 'high'},
-    3: {'label': 'moderate', 'color': '#f59e0b', 'tw': 'bg-yellow-400', 'urgency': 'medium'},
-    2: {'label': 'mild', 'color': '#facc15', 'tw': 'bg-yellow-300', 'urgency': 'low'},
-    1: {'label': 'normal', 'color': '#10b981', 'tw': 'bg-green-500', 'urgency': 'low'},
-}
+def find_values_in_text(text: str) -> Dict[str, Dict[str, Any]]:
+    text = "".join(ch if (31 < ord(ch) < 127 or ch in "\n\r\t") else " " for ch in text)
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
 
-def risk_percentage_for_key(key: str, value: Optional[float]) -> int:
-    """Map a value to a risk percentage (0-100) for a key using clinical heuristics."""
-    if value is None:
-        return 0
-    k = key.lower()
-    try:
-        v = float(value)
-    except:
-        return 0
-    if k == 'crp':
-        pct = min(100, int((v / 200.0) * 100))
-        return pct
-    if k == 'wbc':
-        if v <= 11: return int((v/11)*20)
-        if v <= 20: return 30 + int(((v-11)/9) * 30)
-        return min(100, 60 + int(((v-20)/30)*40))
-    if k == 'neutrophils' or k == 'nlr':
-        if v <= 3: return int((v/3)*10)
-        if v <= 6: return 15 + int(((v-3)/3)*25)
-        if v <= 10: return 40 + int(((v-6)/4)*30)
-        return min(100, 70 + int(((v-10)/30)*30))
-    if k == 'creatinine':
-        if v <= 120: return int((v/120)*20)
-        if v <= 200: return 25 + int(((v-120)/80)*30)
-        return min(100, 60 + int(((v-200)/300)*40))
-    if k == 'hb':
-        if v >= 12: return 5
-        if v >= 10: return 20
-        if v >= 8: return 50
-        return min(100, 70 + int(((12 - v)/12)*30))
-    if k == 'platelets':
-        if v >= 100 and v <= 450: return 5
-        if v < 100: return min(100, 30 + int(((100 - v)/100)*70))
-        if v > 450: return min(100, 20 + int(((v-450)/1000)*80))
-    return min(100, int(min(abs(v), 100)))
+    parsed_table = parse_table_block(lines)
+    parsed_lines = parse_lines_fallback(lines)
+
+    merged: Dict[str, Dict[str, Any]] = {}
+    merged.update(parsed_lines)
+    merged.update(parsed_table)
+
+    return merged
+
+# ---------------------------
+# CANONICAL MAPPING
+# ---------------------------
+
+CANONICAL_KEYS = [
+    "Hb", "MCV", "MCH", "MCHC", "RDW", "WBC", "Neutrophils", "Lymphocytes",
+    "Monocytes", "Eosinophils", "Basophils", "NLR", "Platelets", "Creatinine",
+    "CRP", "Sodium", "Potassium", "Chloride", "Urea", "RBC", "HCT", "ALT", "AST", "CK",
+    "CK_MB", "Calcium", "Calcium_Adjusted", "Albumin", "CO2"
+]
+
+
+def canonical_map(parsed: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+
+    for k, v in parsed.items():
+        if k not in CANONICAL_KEYS:
+            continue
+
+        val = v.get("value")
+        out[k] = {"value": val}
+
+        if "raw_line" in v:
+            out[k]["raw"] = v["raw_line"]
+        if "flag" in v:
+            out[k]["flag_from_table"] = v["flag"]
+
+    neut = out.get("Neutrophils", {}).get("value")
+    lymph = out.get("Lymphocytes", {}).get("value")
+    if neut is not None and lymph is not None and lymph != 0:
+        out["NLR"] = {"value": round(neut / lymph, 2)}
+
+    return out
+
+# ---------------------------
+# AGE GROUP
+# ---------------------------
 
 def age_group_from_age(age: Optional[float]) -> str:
     if age is None:
-        return 'adult'
+        return "adult"
     try:
         a = float(age)
     except:
-        return 'adult'
+        return "adult"
+
     if a < (1/12):
-        return 'neonate'
+        return "neonate"
     if a < 1:
-        return 'infant'
+        return "infant"
     if a < 13:
-        return 'child'
+        return "child"
     if a < 18:
-        return 'teen'
+        return "teen"
     if a < 65:
-        return 'adult'
-    return 'elderly'
+        return "adult"
+    return "elderly"
 
-# ---------- Utility: score -> severity_text mapping ----------
+# ---------------------------
+# SEVERITY TEXT
+# ---------------------------
+
 def severity_text_from_score(score: int) -> str:
-    """Map internal numeric score to user-facing severity text."""
-    try:
-        s = int(score)
-    except:
-        s = 1
-    if s <= 1:
-        return 'normal'
-    if s == 2:
-        return 'mild'
-    if s == 3:
-        return 'moderate'
-    if s == 4:
-        return 'severe'
-    return 'critical'
+    if score <= 1:
+        return "normal"
+    if score == 2:
+        return "mild"
+    if score == 3:
+        return "moderate"
+    if score == 4:
+        return "severe"
+    return "critical"
 
-# ---------- Per-analyte flag heuristics ----------
+# ---------------------------
+# PER-KEY SEVERITY SCORING (INTERNAL)
+# ---------------------------
 
-def flag_for_key(key: str, value: Optional[float], sex: str = 'unknown') -> Tuple[str, str]:
-    """
-    Return (flag, color_hex)
-    flag in {'low','normal','high'}
-    color: low -> orange, high -> red, normal -> white
-    """
-    if value is None:
-        return 'normal', '#ffffff'
-    k = key.lower()
-    try:
-        v = float(value)
-    except:
-        return 'normal', '#ffffff'
-    if k == 'hb':
-        if sex.lower() == 'female':
-            low, high = 12.0, 15.5
-        else:
-            low, high = 13.0, 17.5
-        if v < low: return 'low', '#f59e0b'
-        if v > high: return 'high', '#b91c1c'
-        return 'normal', '#ffffff'
-    if k == 'wbc':
-        if v < 4.0: return 'low', '#f59e0b'
-        if v > 11.0: return 'high', '#b91c1c'
-        return 'normal', '#ffffff'
-    if k == 'platelets':
-        if v < 150: return 'low', '#f59e0b'
-        if v > 450: return 'high', '#b91c1c'
-        return 'normal', '#ffffff'
-    if k == 'creatinine':
-        if v < 45: return 'low', '#f59e0b'
-        if v > 120: return 'high', '#b91c1c'
-        return 'normal', '#ffffff'
-    if k == 'crp':
-        if v <= 10: return 'normal', '#ffffff'
-        if v <= 50: return 'high', '#f59e0b'
-        return 'high', '#b91c1c'
-    if k == 'sodium':
-        if v < 135: return 'low', '#f59e0b'
-        if v > 145: return 'high', '#b91c1c'
-        return 'normal', '#ffffff'
-    if k == 'potassium':
-        if v < 3.5: return 'low', '#f59e0b'
-        if v > 5.1: return 'high', '#b91c1c'
-        return 'normal', '#ffffff'
-    if k == 'mcv':
-        if v < 80: return 'low', '#f59e0b'
-        if v > 100: return 'high', '#b91c1c'
-        return 'normal', '#ffffff'
-    if k == 'nlr':
-        if v > 10: return 'high', '#b91c1c'
-        if v > 5: return 'high', '#f59e0b'
-        return 'normal', '#ffffff'
-    if k in ('alt', 'ast', 'ck'):
-        if v > 200: return 'high', '#b91c1c'
-        if v > 100: return 'high', '#f59e0b'
-        return 'normal', '#ffffff'
-    return 'normal', '#ffffff'
-
-# ---------- Route Engine V5 (improved) ----------
-def score_severity_for_abnormality_v5(key: str, value: Optional[float], age_group: str, sex: str) -> int:
-    """Internal numeric scoring for severity (kept internal)."""
+def score_severity_for_abnormality_v6(key: str, value: Optional[float], age_group: str, sex: str) -> int:
     if value is None:
         return 1
+
     try:
         v = float(value)
     except:
         return 1
+
     key_l = key.lower()
-    score = 1
-    if key_l == 'hb':
-        low_cut = 12.0 if sex.lower() == 'female' else 13.0
-        if age_group in ['neonate','infant']:
+    s = 1
+
+    if key_l == "hb":
+        low_cut = 12.0 if sex.lower() == "female" else 13.0
+        if age_group in ["neonate", "infant"]:
             low_cut = 14.0
         if v < low_cut - 4:
-            score = 5
+            s = 5
         elif v < low_cut - 2:
-            score = 4
+            s = 4
         elif v < low_cut:
-            score = 3
-    elif key_l == 'wbc':
-        if v > 30: score = 5
-        elif v > 20: score = 4
-        elif v > 12: score = 3
-    elif key_l == 'crp':
-        if v > 250: score = 5
-        elif v > 100: score = 4
-        elif v > 50: score = 3
-        elif v > 10: score = 2
-    elif key_l in ('neutrophils', 'nlr'):
-        if v > 12: score = 5
-        elif v > 7: score = 4
-        elif v > 3: score = 3
-    elif key_l == 'creatinine':
-        if v > 400: score = 5
-        elif v > 200: score = 4
-        elif v > 120: score = 3
-    elif key_l == 'platelets':
-        if v < 10: score = 5
-        elif v < 30: score = 4
-        elif v < 100: score = 3
-        elif v > 1000: score = 4
-    elif key_l in ('sodium', 'potassium'):
-        if key_l == 'sodium':
-            if v < 120 or v > 160: score = 5
-            elif v < 125 or v > 155: score = 4
-            elif v < 130 or v > 150: score = 3
-        if key_l == 'potassium':
-            if v < 2.8 or v > 6.5: score = 5
-            elif v < 3.2 or v > 6.0: score = 4
-            elif v < 3.5 or v > 5.5: score = 3
-    else:
-        score = 1
-    return score
+            s = 3
 
-def generate_diagnostic_possibilities(canonical: Dict[str, Dict[str, Any]], patterns: List[Dict[str, Any]], routes: List[str]) -> List[str]:
-    """
-    Produce clinician-style diagnostic impressions using canonical values,
-    matched patterns, and detected routes. These are short, top-of-summary statements.
-    """
+    elif key_l == "wbc":
+        if v > 30:
+            s = 5
+        elif v > 20:
+            s = 4
+        elif v > 12:
+            s = 3
+
+    elif key_l in ("neutrophils", "nlr"):
+        if v > 12:
+            s = 5
+        elif v > 7:
+            s = 4
+        elif v > 3:
+            s = 3
+
+    elif key_l == "crp":
+        if v > 250:
+            s = 5
+        elif v > 100:
+            s = 4
+        elif v > 50:
+            s = 3
+        elif v > 10:
+            s = 2
+
+    elif key_l == "creatinine":
+        if v > 400:
+            s = 5
+        elif v > 200:
+            s = 4
+        elif v > 120:
+            s = 3
+
+    elif key_l == "platelets":
+        if v < 10:
+            s = 5
+        elif v < 30:
+            s = 4
+        elif v < 100:
+            s = 3
+        elif v > 1000:
+            s = 4
+
+    elif key_l == "sodium":
+        if v < 120 or v > 160:
+            s = 5
+        elif v < 125 or v > 155:
+            s = 4
+        elif v < 130 or v > 150:
+            s = 3
+
+    elif key_l == "potassium":
+        if v < 2.8 or v > 6.5:
+            s = 5
+        elif v < 3.2 or v > 6.0:
+            s = 4
+        elif v < 3.5 or v > 5.5:
+            s = 3
+
+    return s
+
+# ---------------------------
+# FLAG COLOR LOGIC
+# ---------------------------
+
+def flag_for_key(key: str, value: Optional[float], sex: str = "unknown") -> Tuple[str, str]:
+    if value is None:
+        return ("normal", "#ffffff")
+
+    try:
+        v = float(value)
+    except:
+        return ("normal", "#ffffff")
+
+    k = key.lower()
+
+    if k == "hb":
+        low = 12.0 if sex.lower() == "female" else 13.0
+        high = 15.5 if sex.lower() == "female" else 17.5
+        if v < low: return ("low", "#f59e0b")
+        if v > high: return ("high", "#b91c1c")
+        return ("normal", "#ffffff")
+
+    if k == "wbc":
+        if v < 4.0: return ("low", "#f59e0b")
+        if v > 11.0: return ("high", "#b91c1c")
+        return ("normal", "#ffffff")
+
+    if k == "platelets":
+        if v < 150: return ("low", "#f59e0b")
+        if v > 450: return ("high", "#b91c1c")
+        return ("normal", "#ffffff")
+
+    if k == "creatinine":
+        if v < 45: return ("low", "#f59e0b")
+        if v > 120: return ("high", "#b91c1c")
+        return ("normal", "#ffffff")
+
+    if k == "crp":
+        if v <= 10: return ("normal", "#ffffff")
+        if v <= 50: return ("high", "#f59e0b")
+        return ("high", "#b91c1c")
+
+    if k == "sodium":
+        if v < 135: return ("low", "#f59e0b")
+        if v > 145: return ("high", "#b91c1c")
+        return ("normal", "#ffffff")
+
+    if k == "potassium":
+        if v < 3.5: return ("low", "#f59e0b")
+        if v > 5.1: return ("high", "#b91c1c")
+        return ("normal", "#ffffff")
+
+    if k == "mcv":
+        if v < 80: return ("low", "#f59e0b")
+        if v > 100: return ("high", "#b91c1c")
+        return ("normal", "#ffffff")
+
+    if k == "nlr":
+        if v > 10: return ("high", "#b91c1c")
+        if v > 5: return ("high", "#f59e0b")
+        return ("normal", "#ffffff")
+
+    if k in ("alt", "ast", "ck"):
+        if v > 200: return ("high", "#b91c1c")
+        if v > 100: return ("high", "#f59e0b")
+        return ("normal", "#ffffff")
+
+    return ("normal", "#ffffff")
+
+# ---------------------------
+# RISK BAR CALCULATOR
+# ---------------------------
+
+def risk_percentage_for_key(key: str, value: Optional[float]) -> int:
+    if value is None:
+        return 0
+
+    try:
+        v = float(value)
+    except:
+        return 0
+
+    k = key.lower()
+
+    if k == "crp":
+        return min(100, int((v / 200) * 100))
+
+    if k == "wbc":
+        if v <= 11: return int((v / 11) * 20)
+        if v <= 20: return 30 + int(((v - 11) / 9) * 30)
+        return min(100, 60 + int(((v - 20) / 30) * 40))
+
+    if k in ("neutrophils", "nlr"):
+        if v <= 3: return int((v / 3) * 10)
+        if v <= 6: return 15 + int(((v - 3) / 3) * 25)
+        if v <= 10: return 40 + int(((v - 6) / 4) * 30)
+        return min(100, 70 + int(((v - 10) / 30) * 30))
+
+    if k == "creatinine":
+        if v <= 120: return int((v / 120) * 20)
+        if v <= 200: return 25 + int(((v - 120) / 80) * 30)
+        return min(100, 60 + int(((v - 200) / 300) * 40))
+
+    if k == "hb":
+        if v >= 12: return 5
+        if v >= 10: return 20
+        if v >= 8: return 50
+        return min(100, 70 + int(((12 - v) / 12) * 30))
+
+    if k == "platelets":
+        if v >= 100 and v <= 450: return 5
+        if v < 100: return min(100, 30 + int(((100 - v) / 100) * 70))
+        if v > 450: return min(100, 20 + int(((v - 450) / 1000) * 80))
+
+    return min(100, int(min(abs(v), 100)))
+# ---------------------------
+# ROUTE ENGINE V6
+# ---------------------------
+
+def generate_diagnostic_possibilities(canonical: Dict[str, Dict[str, Any]]) -> List[str]:
     Hb = canonical.get("Hb", {}).get("value")
     WBC = canonical.get("WBC", {}).get("value")
     Neut = canonical.get("Neutrophils", {}).get("value")
@@ -706,425 +690,427 @@ def generate_diagnostic_possibilities(canonical: Dict[str, Dict[str, Any]], patt
     NLR = canonical.get("NLR", {}).get("value")
     Creat = canonical.get("Creatinine", {}).get("value")
     K = canonical.get("Potassium", {}).get("value")
-    Urea = canonical.get("Urea", {}).get("value")
 
-    possibilities: List[str] = []
+    poss = []
 
-    # Sepsis / bacterial infection impression
     if (WBC and WBC > 12) or (Neut and Neut > 70) or (NLR and NLR > 10) or (CRP and CRP > 20):
         reasons = []
         if WBC and WBC > 12: reasons.append(f"WBC {WBC}")
         if Neut and Neut > 70: reasons.append(f"neutrophilia {Neut}%")
         if NLR and NLR > 10: reasons.append(f"NLR {NLR}")
         if CRP and CRP > 20: reasons.append(f"CRP {CRP}")
-        possibilities.append("Sepsis / bacterial infection — " + "; ".join(reasons))
+        poss.append("Sepsis / bacterial infection — " + "; ".join(reasons))
 
-    # Electrolyte derangement
     if K is not None and (K < 3.2 or K > 6.0):
-        possibilities.append(f"Electrolyte derangement — potassium {K} mmol/L")
+        poss.append(f"Electrolyte derangement — potassium {K} mmol/L")
 
-    # Renal function / AKI
     if Creat is not None and Creat > 120:
-        possibilities.append(f"Acute kidney injury suspected — creatinine {Creat} umol/L")
+        poss.append(f"Acute kidney injury suspected — creatinine {Creat}")
     else:
-        possibilities.append("Renal function normal — no evidence of AKI")
+        poss.append("Renal function normal — no evidence of AKI")
 
-    # Anemia
     if Hb is not None and Hb < 11:
-        possibilities.append(f"Anemia — Hb {Hb} g/dL")
+        poss.append(f"Anemia — Hb {Hb}")
     else:
-        possibilities.append("No anemia — Hb within expected range")
+        poss.append("No anemia — Hb within expected range")
 
-    # General inflammation
     if CRP is not None and CRP > 10:
-        possibilities.append(f"Inflammatory response — CRP {CRP} mg/L")
+        poss.append(f"Inflammatory response — CRP {CRP} mg/L")
 
-    return possibilities
+    return poss
 
-def route_engine_v5(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[str, Any], previous: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    Route Engine V5:
-    - builds patterns, routes, next_steps, ddx
-    - computes internal numeric severity and converts to severity_text for output
-    - attaches risk bars and UI metadata
-    - *No admission recommendation logic included in output*
-    """
-    age = patient_meta.get('age')
-    sex = patient_meta.get('sex', 'unknown')
+
+def route_engine_v6(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[str, Any], previous: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    age = patient_meta.get("age")
+    sex = patient_meta.get("sex", "unknown")
     ag = age_group_from_age(age)
 
-    patterns: List[Dict[str, Any]] = []
-    routes: List[str] = []
-    next_steps: List[str] = []
-    ddx: List[str] = []
-    per_key_scores: Dict[str, int] = {}
+    patterns = []
+    routes = []
+    next_steps = []
+    ddx = []
+    per_key_scores = {}
+    sepsis_flag = False
 
     def add_pattern(name, reason, score):
-        patterns.append({'pattern': name, 'reason': reason})
+        patterns.append({"pattern": name, "reason": reason})
         per_key_scores[name] = max(per_key_scores.get(name, 1), score)
 
-    # map canonical into local vars for readability
-    hb = canonical.get('Hb', {}).get('value')
-    mcv = canonical.get('MCV', {}).get('value')
-    wbc = canonical.get('WBC', {}).get('value')
-    crp = canonical.get('CRP', {}).get('value')
-    neut = canonical.get('Neutrophils', {}).get('value')
-    nlr = canonical.get('NLR', {}).get('value')
-    plate = canonical.get('Platelets', {}).get('value')
-    creat = canonical.get('Creatinine', {}).get('value')
-    sodium = canonical.get('Sodium', {}).get('value')
-    potassium = canonical.get('Potassium', {}).get('value')
-    alt = canonical.get('ALT', {}).get('value')
-    ast = canonical.get('AST', {}).get('value')
-    ck = canonical.get('CK', {}).get('value')
+    hb = canonical.get("Hb", {}).get("value")
+    mcv = canonical.get("MCV", {}).get("value")
+    wbc = canonical.get("WBC", {}).get("value")
+    crp = canonical.get("CRP", {}).get("value")
+    neut = canonical.get("Neutrophils", {}).get("value")
+    nlr = canonical.get("NLR", {}).get("value")
+    plate = canonical.get("Platelets", {}).get("value")
+    creat = canonical.get("Creatinine", {}).get("value")
+    sodium = canonical.get("Sodium", {}).get("value")
+    potassium = canonical.get("Potassium", {}).get("value")
+    alt = canonical.get("ALT", {}).get("value")
+    ast = canonical.get("AST", {}).get("value")
+    ck = canonical.get("CK", {}).get("value")
 
-    # Anemia handling
     if hb is not None:
-        score_hb = score_severity_for_abnormality_v5('hb', hb, ag, sex)
-        if score_hb > 1:
-            add_pattern('anemia', f'Hb {hb} g/dL', score_hb)
+        s_hb = score_severity_for_abnormality_v6("Hb", hb, ag, sex)
+        if s_hb > 1:
+            add_pattern("anemia", f"Hb {hb}", s_hb)
             if mcv is not None and mcv < 80:
-                add_pattern('microcytic anemia', f'MCV {mcv} fL', max(3, score_hb))
-                routes.append('Iron deficiency route (Ferritin + reticulocyte)')
-                ddx.extend(['Iron deficiency anemia', 'Thalassaemia trait', 'Chronic blood loss'])
-                next_steps.append('Order ferritin, reticulocyte count, and peripheral smear. Consider stool occult blood if adult.')
+                add_pattern("microcytic anemia", f"MCV {mcv}", max(3, s_hb))
+                routes.append("Iron deficiency route")
+                ddx.extend(["Iron deficiency", "Thalassaemia trait", "Chronic blood loss"])
+                next_steps.append("Order ferritin + reticulocyte count.")
             elif mcv is not None and mcv > 100:
-                add_pattern('macrocytic anemia', f'MCV {mcv} fL', max(3, score_hb))
-                routes.append('Macrocytic route (B12/folate)')
-                ddx.extend(['Vitamin B12 deficiency', 'Folate deficiency', 'Alcohol-related'])
-                next_steps.append('Order B12 and folate; review meds.')
+                add_pattern("macrocytic anemia", f"MCV {mcv}", max(3, s_hb))
+                routes.append("Macrocytic anemia route")
+                ddx.extend(["B12 deficiency", "Folate deficiency"])
+                next_steps.append("Order B12/folate.")
             else:
-                add_pattern('normocytic anemia', 'MCV normal or missing', max(2, score_hb))
-                routes.append('Normocytic anemia route')
-                ddx.extend(['Acute blood loss', 'Hemolysis', 'Anaemia of inflammation'])
-                next_steps.append('Order reticulocyte count, LDH, peripheral smear.')
+                add_pattern("normocytic anemia", "MCV normal", max(2, s_hb))
+                routes.append("Normocytic route")
+                ddx.extend(["Acute blood loss", "Hemolysis", "Anaemia of inflammation"])
+                next_steps.append("Order retic + smear.")
 
-    # Infection / inflammation & sepsis signals
-    sepsis_flag = False
     if wbc is not None and wbc > 11:
-        s = score_severity_for_abnormality_v5('wbc', wbc, ag, sex)
-        add_pattern('leukocytosis', f'WBC {wbc} x10^9/L', s)
+        s = score_severity_for_abnormality_v6("WBC", wbc, ag, sex)
+        add_pattern("leukocytosis", f"WBC {wbc}", s)
         if neut is not None and neut >= 70:
-            add_pattern('neutrophilic predominance', f'Neutrophils {neut}%', max(3, s))
-            routes.append('Bacterial infection / Sepsis route')
-            ddx.extend(['Bacterial infection', 'Sepsis', 'Acute inflammation'])
-            next_steps.append('Clinical assessment for sepsis; consider blood cultures, IV fluids, empiric antibiotics if unstable.')
+            add_pattern("neutrophilic predominance", f"Neutrophils {neut}%", max(3, s))
+            routes.append("Bacterial infection / Sepsis route")
+            ddx.extend(["Bacterial infection", "Sepsis"])
+            next_steps.append("Assess for sepsis; consider blood cultures + fluids.")
             sepsis_flag = True
 
     if crp is not None:
-        s = score_severity_for_abnormality_v5('crp', crp, ag, sex)
+        s = score_severity_for_abnormality_v6("CRP", crp, ag, sex)
         if s > 1:
-            add_pattern('elevated CRP', f'CRP {crp} mg/L', s)
+            add_pattern("elevated CRP", f"CRP {crp}", s)
             if crp > 50:
-                routes.append('Significant inflammatory response')
-                ddx.extend(['Severe infection', 'Inflammatory disease'])
-                next_steps.append('Consider urgent review; blood cultures if febrile; procalcitonin if available.')
+                routes.append("Inflammatory response route")
+                ddx.extend(["Severe infection", "Inflammation"])
+                next_steps.append("Urgent review; consider cultures.")
                 if crp > 150:
                     sepsis_flag = True
 
     if nlr is not None:
         if nlr > 10:
-            add_pattern('very high NLR', f'NLR {nlr}', 5)
-            routes.append('High NLR / Sepsis route')
-            next_steps.append('Urgent clinical review for sepsis; consider sepsis pathway.')
+            add_pattern("very high NLR", f"NLR {nlr}", 5)
+            routes.append("High NLR / Sepsis route")
+            next_steps.append("Urgent sepsis review.")
             sepsis_flag = True
         elif nlr > 5:
-            add_pattern('high NLR', f'NLR {nlr}', 4)
-            routes.append('High NLR route')
-            next_steps.append('Assess severity and source of infection.')
+            add_pattern("high NLR", f"NLR {nlr}", 4)
+            routes.append("High NLR route")
+            next_steps.append("Search for infection source.")
 
-    # Platelets
     if plate is not None:
-        pscore = score_severity_for_abnormality_v5('platelets', plate, ag, sex)
+        s = score_severity_for_abnormality_v6("Platelets", plate, ag, sex)
         if plate < 150:
-            add_pattern('thrombocytopenia', f'Platelets {plate}', pscore)
-            ddx.extend(['Immune thrombocytopenia', 'DIC', 'Bone marrow suppression'])
-            next_steps.append('Repeat platelet count; check smear; assess bleeding.')
+            add_pattern("thrombocytopenia", f"Platelets {plate}", s)
+            ddx.extend(["ITP", "DIC", "Bone marrow failure"])
+            next_steps.append("Repeat platelets; check smear.")
         elif plate > 450:
-            add_pattern('thrombocytosis', f'Platelets {plate}', max(2, pscore))
-            next_steps.append('Consider reactive thrombocytosis; repeat and investigate inflammation/iron status.')
+            add_pattern("thrombocytosis", f"Platelets {plate}", s)
+            next_steps.append("Consider reactive thrombocytosis.")
 
-    # Renal / AKI
     if creat is not None:
-        cscore = score_severity_for_abnormality_v5('creatinine', creat, ag, sex)
-        if cscore >= 3:
-            add_pattern('elevated creatinine', f'Creatinine {creat} umol/L', cscore)
-            routes.append('AKI route')
-            ddx.extend(['Acute kidney injury', 'Chronic kidney disease'])
-            next_steps.append('Repeat creatinine urgently; check urine output and electrolytes; review meds.')
-
-    # Electrolytes
-    if sodium is not None:
-        s = score_severity_for_abnormality_v5('sodium', sodium, ag, sex)
+        s = score_severity_for_abnormality_v6("Creatinine", creat, ag, sex)
         if s >= 3:
-            add_pattern('sodium derangement', f'Sodium {sodium} mmol/L', s)
-            next_steps.append('Correct sodium abnormalities per local protocol; check fluid status.')
+            add_pattern("elevated creatinine", f"Creatinine {creat}", s)
+            routes.append("AKI route")
+            ddx.append("Acute kidney injury")
+            next_steps.append("Repeat creatinine + check urine output.")
+
+    if sodium is not None:
+        s = score_severity_for_abnormality_v6("Sodium", sodium, ag, sex)
+        if s >= 3:
+            add_pattern("sodium derangement", f"Sodium {sodium}", s)
+            next_steps.append("Correct sodium abnormalities.")
 
     if potassium is not None:
-        s = score_severity_for_abnormality_v5('potassium', potassium, ag, sex)
+        s = score_severity_for_abnormality_v6("Potassium", potassium, ag, sex)
         if s >= 3:
-            add_pattern('potassium derangement', f'Potassium {potassium} mmol/L', s)
-            next_steps.append('Correct potassium urgently; monitor ECG.')
+            add_pattern("potassium derangement", f"Potassium {potassium}", s)
+            next_steps.append("Correct potassium urgently; ECG monitoring.")
 
-    # Rhabdomyolysis and LFT
     if ck is not None and ck > 1000:
-        add_pattern('rhabdomyolysis signal', f'CK {ck}', 4)
-        routes.append('Rhabdomyolysis route')
-        next_steps.append('Assess for muscle pain/urine colour; check creatinine and electrolytes; consider urgent fluids.')
+        add_pattern("rhabdomyolysis signal", f"CK {ck}", 4)
+        routes.append("Rhabdomyolysis route")
+        next_steps.append("Assess muscle pain; give fluids.")
 
-    if (alt is not None and alt > 200) or (ast is not None and ast > 200):
-        add_pattern('transaminitis', f'ALT {alt} AST {ast}', 3)
-        routes.append('Hepatic route')
-        next_steps.append('Review hepatotoxins, viral hepatitis risk; consider LFT panel.')
+    if (alt and alt > 200) or (ast and ast > 200):
+        add_pattern("transaminitis", f"ALT {alt} AST {ast}", 3)
+        routes.append("Hepatic route")
+        next_steps.append("Check hepatitis panel + toxins.")
 
-    # Combined pattern: anemia + inflammation
     if hb is not None and crp is not None and wbc is not None:
         if hb < 12 and crp > 20 and wbc > 11:
-            add_pattern('anemia with inflammatory/infective response', 'Low Hb + high CRP + leukocytosis', 4)
-            routes.append('Infection with anemia route')
-            next_steps.append('Treat source of infection; reassess Hb after control; do ferritin when CRP falls.')
+            add_pattern("anemia with inflammation", "Low Hb + high CRP + WBC", 4)
+            routes.append("Infection + anemia route")
+            next_steps.append("Treat infection; recheck Hb when CRP falls.")
 
-    # Menstrual/ferritin suggestion: ONLY when clinically indicated (Hb < 11 AND teen female)
-    if ag == 'teen' and sex.lower() == 'female' and hb is not None and hb < 11:
-        next_steps.append('Assess menstrual history; consider urgent ferritin and reticulocyte count.')
+    if ag == "teen" and sex.lower() == "female" and hb is not None and hb < 11:
+        next_steps.append("Assess menstrual history; check ferritin.")
 
-    # Build differential ranking by simple heuristics (frequency + severity)
-    ddx_rank: Dict[str, int] = {}
+    ddx_rank = {}
     for i, d in enumerate(ddx):
         ddx_rank[d] = ddx_rank.get(d, 0) + (10 - i)
+
     if sepsis_flag:
-        for d in ('Sepsis','Bacterial infection','Severe infection'):
+        for d in ("Sepsis", "Bacterial infection", "Severe infection"):
             ddx_rank[d] = ddx_rank.get(d, 0) + 50
+
     ddx_sorted = sorted(ddx_rank.items(), key=lambda x: -x[1])
     ddx_list = [d for d, _ in ddx_sorted]
 
-    # severity aggregation (internal numeric)
-    severity_scores = list(per_key_scores.values()) if per_key_scores else [1]
-    combined_score = max(severity_scores) if severity_scores else 1
-    color_entry = COLOR_MAP.get(combined_score, COLOR_MAP[1])
-    urgency = color_entry['urgency']
+    severity_scores = list(per_key_scores.values()) or [1]
+    combined = max(severity_scores) if severity_scores else 1
+    severity_text = severity_text_from_score(combined)
+    urgency = "high" if combined >= 4 else ("medium" if combined == 3 else "low")
 
-    # generate risk bars for UI per canonical key
-    risk_bars: Dict[str, Dict[str, Any]] = {}
-    for kk in CANONICAL_KEYS:
-        val = canonical.get(kk, {}).get('value')
-        pct = risk_percentage_for_key(kk, val)
-        if pct >= 80:
-            clr = '#b91c1c'
-        elif pct >= 60:
-            clr = '#ef4444'
-        elif pct >= 40:
-            clr = '#f59e0b'
-        elif pct >= 20:
-            clr = '#facc15'
-        else:
-            clr = '#10b981'
-        risk_bars[kk] = {'percentage': pct, 'color': clr}
+    diagnostic_poss = generate_diagnostic_possibilities(canonical)
 
-    # Diagnostic possibilities (IMPRESSION) first (Option A)
-    diagnostic_possibilities = generate_diagnostic_possibilities(canonical, patterns, routes)
-
-    # construct readable summary (Diagnostic Possibilities first)
-    summary_lines: List[str] = []
-    if diagnostic_possibilities:
-        summary_lines.append("Diagnostic possibilities:\n• " + "\n• ".join(diagnostic_possibilities))
+    summary_lines = []
+    if diagnostic_poss:
+        summary_lines.append("Diagnostic possibilities:\n• " + "\n• ".join(diagnostic_poss))
     if patterns:
-        summary_lines.append('Patterns: ' + '; '.join([p['pattern'] for p in patterns]))
+        summary_lines.append("Patterns: " + "; ".join([p["pattern"] for p in patterns]))
     if routes:
-        summary_lines.append('Primary routes: ' + '; '.join(routes))
+        summary_lines.append("Routes: " + "; ".join(routes))
     if ddx_list:
-        summary_lines.append('Top differential diagnoses: ' + ', '.join(ddx_list))
+        summary_lines.append("Top differentials: " + ", ".join(ddx_list))
     if next_steps:
-        summary_lines.append('Immediate suggested actions: ' + ' | '.join(next_steps))
+        summary_lines.append("Immediate actions: " + " | ".join(next_steps))
 
-    age_note = ''
-    if ag == 'teen' and sex.lower() == 'female' and (hb is None or hb >= 11):
-        age_note = ''  # don't add menstrual message unless Hb < 11 (we add only in next_steps when Hb<11)
-    elif ag == 'elderly':
-        age_note = 'Elderly – broaden differential for chronic disease and malignancy.'
+    age_note = ""
+    if ag == "elderly":
+        age_note = "Elderly – broaden differential."
 
-    # Convert internal numeric severity to user-facing severity_text
-    severity_text = severity_text_from_score(combined_score)
+    color = "#b91c1c" if combined == 5 else "#ef4444" if combined == 4 else "#f59e0b" if combined == 3 else "#10b981"
+    tw = "bg-red-700" if combined == 5 else "bg-red-500" if combined == 4 else "bg-yellow-400" if combined == 3 else "bg-green-500"
 
-    final = {
-        'patterns': patterns,
-        'routes': routes,
-        'next_steps': next_steps,
-        'differential': ddx_list,
-        'severity_text': severity_text,           # TEXT ONLY
-        'urgency_flag': urgency,                  # low/medium/high
-        'color': color_entry['color'],
-        'tw_class': color_entry['tw'],
-        'age_group': ag,
-        'age_note': age_note,
-        'diagnostic_possibilities': diagnostic_possibilities,
-        'risk_bars': risk_bars,
-        'summary': '\n'.join(summary_lines[:12]) if summary_lines else 'No significant abnormalities detected.'
+    risk_bars = {}
+    for k in CANONICAL_KEYS:
+        v = canonical.get(k, {}).get("value")
+        pct = risk_percentage_for_key(k, v)
+        if pct >= 80: c = "#b91c1c"
+        elif pct >= 60: c = "#ef4444"
+        elif pct >= 40: c = "#f59e0b"
+        elif pct >= 20: c = "#facc15"
+        else: c = "#10b981"
+        risk_bars[k] = {"percentage": pct, "color": c}
+
+    return {
+        "patterns": patterns,
+        "routes": routes,
+        "next_steps": next_steps,
+        "differential": ddx_list,
+        "severity_text": severity_text,
+        "urgency_flag": urgency,
+        "color": color,
+        "tw_class": tw,
+        "age_group": ag,
+        "age_note": age_note,
+        "diagnostic_possibilities": diagnostic_poss,
+        "risk_bars": risk_bars,
+        "summary": "\n".join(summary_lines) if summary_lines else "No significant abnormalities detected."
     }
-    return final
 
-# ---------- Trends, save & processing ----------
+# ---------------------------
+# TREND ANALYSIS
+# ---------------------------
 
 def trend_analysis(current: Dict[str, Dict[str, Any]], previous: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not previous:
-        return {'trend': 'no_previous'}
-    diffs: Dict[str, Any] = {}
+        return {"trend": "no_previous"}
+
+    diffs = {}
     for k, v in current.items():
-        prev_val = previous.get(k, {}).get('value') if isinstance(previous, dict) else None
-        cur_val = v.get('value')
+        prev_val = previous.get(k, {}).get("value") if isinstance(previous, dict) else None
+        cur_val = v.get("value")
         if prev_val is None or cur_val is None:
             continue
         try:
             delta = cur_val - prev_val
             pct = (delta / prev_val) * 100 if prev_val != 0 else None
-            diffs[k] = {'previous': prev_val, 'current': cur_val, 'delta': delta, 'pct_change': pct}
-        except Exception:
+            diffs[k] = {"previous": prev_val, "current": cur_val, "delta": delta, "pct_change": pct}
+        except:
             pass
-    return {'trend': diffs or 'no_change'}
 
-def save_ai_results_to_supabase(report_id: str, ai_results: Dict[str, Any]) -> None:
+    return {"trend": diffs or "no_change"}
+
+# ---------------------------
+# SAVE TO SUPABASE
+# ---------------------------
+
+def save_ai_results_to_supabase(report_id: str, ai_results: Dict[str, Any]):
     if not supabase:
-        logger.warning("Supabase client not available; skipping save.")
         return
     try:
-        payload = {'ai_status': 'completed', 'ai_results': ai_results, 'ai_error': None}
-        res = supabase.table(SUPABASE_TABLE).update(payload).eq('id', report_id).execute()
-        logger.info("Saved ai_results for report %s", report_id)
+        supabase.table(SUPABASE_TABLE).update({
+            "ai_status": "completed",
+            "ai_results": ai_results,
+            "ai_error": None
+        }).eq("id", report_id).execute()
     except Exception as e:
-        logger.exception("Failed to save ai_results: %s", e)
+        logger.exception("Supabase save failed: %s", e)
 
-def process_report(record: Dict[str, Any]) -> None:
-    report_id = record.get('id') or record.get('report_id') or '<unknown>'
-    logger.info("Processing report %s", report_id)
+# ---------------------------
+# PROCESS REPORT
+# ---------------------------
+
+def process_report(record: Dict[str, Any]):
+    report_id = record.get("id", "<unknown>")
+
     try:
         pdf_bytes = download_pdf_from_record(record)
     except Exception as e:
-        logger.exception("Failed to download PDF: %s", e)
         if supabase:
-            supabase.table(SUPABASE_TABLE).update({'ai_status': 'failed', 'ai_error': str(e)}).eq('id', report_id).execute()
+            supabase.table(SUPABASE_TABLE).update({
+                "ai_status": "failed",
+                "ai_error": str(e)
+            }).eq("id", report_id).execute()
         return
 
     scanned = is_scanned_pdf(pdf_bytes)
-    if not scanned:
-        text = extract_text_with_pypdf(pdf_bytes)
-    else:
+    if scanned:
         if not HAS_PYTESSERACT:
-            err = "Detected scanned PDF but pytesseract not available."
-            logger.error(err)
+            err = "Scanned PDF but pytesseract unavailable."
             if supabase:
-                supabase.table(SUPABASE_TABLE).update({'ai_status': 'failed', 'ai_error': err}).eq('id', report_id).execute()
+                supabase.table(SUPABASE_TABLE).update({
+                    "ai_status": "failed",
+                    "ai_error": err
+                }).eq("id", report_id).execute()
             return
         text = do_ocr_on_pdf(pdf_bytes)
+    else:
+        text = extract_text_with_pypdf(pdf_bytes)
 
-    # parse
     parsed = find_values_in_text(text)
     canonical = canonical_map(parsed)
 
-    # fetch previous results (latest by patient_id) for trend
+    if not canonical:
+        ai_results = {
+            "error": "No analytes extracted",
+            "parsed": parsed,
+            "raw_text_excerpt": text[:5000],
+            "scanned": scanned
+        }
+        save_ai_results_to_supabase(report_id, ai_results)
+        return
+
     previous = None
     if supabase:
         try:
-            pid = record.get('patient_id')
+            pid = record.get("patient_id")
             if pid:
-                prev_q = supabase.table(SUPABASE_TABLE).select('ai_results').eq('patient_id', pid).order('created_at', desc=True).limit(1).execute()
-                rows = prev_q.data if hasattr(prev_q, 'data') else prev_q
+                q = supabase.table(SUPABASE_TABLE).select("ai_results").eq("patient_id", pid)\
+                    .order("created_at", desc=True).limit(1).execute()
+                rows = q.data if hasattr(q, "data") else q
                 if rows:
-                    previous = rows[0].get('ai_results')
-        except Exception as e:
-            logger.debug("Failed fetch previous: %s", e)
+                    previous = rows[0].get("ai_results")
+        except:
+            pass
 
     trends = trend_analysis(canonical, previous)
+    routes = route_engine_v6(canonical, record, previous)
 
-    patient_meta = {'age': record.get('age'), 'sex': record.get('sex', 'unknown')}
-    routes = route_engine_v5(canonical, patient_meta, previous)
+    decorated = {}
+    sex = record.get("sex", "unknown")
+
+    for k in CANONICAL_KEYS:
+        val = canonical.get(k, {})
+        value = val.get("value")
+        unit = val.get("unit") if isinstance(val.get("unit"), str) else None
+        s_num = score_severity_for_abnormality_v6(k, value, age_group_from_age(record.get("age")), sex)
+        s_text = severity_text_from_score(s_num)
+        flag, flag_color = flag_for_key(k, value, sex)
+        pct = risk_percentage_for_key(k, value)
+
+        if pct >= 80: rcol = "#b91c1c"
+        elif pct >= 60: rcol = "#ef4444"
+        elif pct >= 40: rcol = "#f59e0b"
+        elif pct >= 20: rcol = "#facc15"
+        else: rcol = "#10b981"
+
+        decorated[k] = {
+            "value": value,
+            "unit": unit,
+            "flag": flag,
+            "color": flag_color,
+            "severity_text": s_text,
+            "risk_bar": {"percentage": pct, "color": rcol}
+        }
 
     ai_results = {
-        'canonical': canonical,
-        'parsed': parsed,
-        'routes': routes,
-        'trends': trends,
-        'raw_text_excerpt': text[:5000],
-        'scanned': scanned,
-        'processed_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        "canonical": canonical,
+        "parsed": parsed,
+        "routes": routes,
+        "decorated": decorated,
+        "trends": trends,
+        "raw_text_excerpt": text[:5000],
+        "scanned": scanned,
+        "processed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     }
 
-    # add per-key decorated flags (color, severity_text, risk bar)
-    decorated: Dict[str, Any] = {}
-    sex = record.get('sex', 'unknown')
-    for key in CANONICAL_KEYS:
-        val = canonical.get(key, {})
-        value = val.get('value')
-        unit = val.get('unit') if isinstance(val.get('unit'), str) else None
-        # internal numeric severity per analyte (kept internal)
-        s_num = score_severity_for_abnormality_v5(key, value, age_group_from_age(record.get('age')), sex)
-        s_text = severity_text_from_score(s_num)
-        flag, flag_color = flag_for_key(key, value, sex)
-        pct = risk_percentage_for_key(key, value)
-        risk_color = '#b91c1c' if pct >= 80 else ('#ef4444' if pct >= 60 else ('#f59e0b' if pct >= 40 else ('#facc15' if pct >= 20 else '#10b981')))
-        decorated[key] = {
-            'value': value,
-            'unit': unit,
-            'flag': flag,                     # low/normal/high
-            'color': flag_color,              # color for the flag
-            'severity_text': s_text,          # textual severity only
-            'risk_bar': {'percentage': pct, 'color': risk_color}
-        }
-    ai_results['decorated'] = decorated
+    save_ai_results_to_supabase(report_id, ai_results)
 
-    try:
-        save_ai_results_to_supabase(report_id, ai_results)
-    except Exception as e:
-        logger.exception("Failed to save results: %s", e)
+# ---------------------------
+# POLLING LOOP
+# ---------------------------
 
 def poll_and_process():
     if not supabase:
-        logger.error("Supabase client not configured. Exiting.")
+        logger.error("Supabase missing")
         return
-    logger.info("Starting poll loop (interval %ds) table=%s", POLL_INTERVAL, SUPABASE_TABLE)
+
     while True:
         try:
-            res = supabase.table(SUPABASE_TABLE).select('*').eq('ai_status', 'pending').limit(10).execute()
-            rows = res.data if hasattr(res, 'data') else res
+            res = supabase.table(SUPABASE_TABLE).select("*").eq("ai_status", "pending")\
+                .limit(10).execute()
+            rows = res.data if hasattr(res, "data") else res
+
             if rows:
                 for r in rows:
                     try:
-                        # mark processing
-                        supabase.table(SUPABASE_TABLE).update({'ai_status': 'processing'}).eq('id', r.get('id')).execute()
+                        supabase.table(SUPABASE_TABLE).update({"ai_status": "processing"})\
+                            .eq("id", r.get("id")).execute()
                         process_report(r)
                     except Exception as e:
-                        logger.exception("Record processing failed %s: %s", r.get('id'), e)
-                        try:
-                            supabase.table(SUPABASE_TABLE).update({'ai_status': 'failed', 'ai_error': str(e)}).eq('id', r.get('id')).execute()
-                        except:
-                            pass
+                        supabase.table(SUPABASE_TABLE).update({
+                            "ai_status": "failed",
+                            "ai_error": str(e)
+                        }).eq("id", r.get("id")).execute()
             else:
-                logger.debug("No pending reports.")
+                time.sleep(POLL_INTERVAL)
+
         except Exception as e:
             logger.exception("Polling error: %s", e)
-        time.sleep(POLL_INTERVAL)
+            time.sleep(POLL_INTERVAL)
 
-# ---------- CLI / test ----------
-if __name__ == '__main__':
+# ---------------------------
+# MAIN
+# ---------------------------
+
+if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="AMI Health Worker V5 (pypdf + pytesseract) - patched")
-    parser.add_argument('--test-pdf', help='Path to local PDF for testing')
-    parser.add_argument('--once', action='store_true', help='Poll once then exit (if not test)')
+    parser = argparse.ArgumentParser(description="AMI Health Worker V6")
+    parser.add_argument("--test-pdf", help="Path to a PDF for local testing")
+    parser.add_argument("--once", action="store_true", help="Poll once then exit")
     args = parser.parse_args()
 
     if args.test_pdf:
-        with open(args.test_pdf, 'rb') as f:
+        with open(args.test_pdf, "rb") as f:
             pdfb = f.read()
         dummy = {
-            'id': 'local-test',
-            'patient_id': 'local-patient',
-            'age': 17,
-            'sex': 'female',
-            'file_path': args.test_pdf,
+            "id": "local-test",
+            "patient_id": "local-patient",
+            "age": 30,
+            "sex": "male",
+            "file_path": args.test_pdf,
         }
-        # override downloader
         def dl_override(rec):
             return pdfb
-        globals()['download_pdf_from_record'] = dl_override
+        globals()["download_pdf_from_record"] = dl_override
         process_report(dummy)
         print("Test run complete.")
     else:
