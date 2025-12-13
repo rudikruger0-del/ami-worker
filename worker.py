@@ -1,224 +1,242 @@
 #!/usr/bin/env python3
-"""
-AMI Health — Worker v4 (STABLE BASELINE)
-Pattern → Route → Next Steps
+# ============================================================
+# AMI Health — Worker v4 (RESTORED & FIXED)
+# Compatible with openai==0.28.0
+# ============================================================
 
-CRITICAL NOTES:
-- Compatible with openai==0.28.0
-- NO OpenAI v1 client
-- NO breaking parser changes
-- NO NORMAL fallback
-"""
+print(">>> AMI Worker v4 starting — Pattern → Route → Next Steps")
 
 import os
 import io
 import re
-import json
 import time
-import logging
-from typing import Dict, Any, List
+import json
+import datetime
+import traceback
+from typing import Dict, Any, List, Optional
 
-# ------------------------------
-# ENV + LOGGING
-# ------------------------------
 from dotenv import load_dotenv
-load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [AMI-WORKER] %(levelname)s: %(message)s"
-)
-log = logging.getLogger("ami-worker")
-
-# ------------------------------
-# OPENAI (OLD SDK — CORRECT)
-# ------------------------------
-import openai
-
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
-# ------------------------------
-# PDF / OCR
-# ------------------------------
+from supabase import create_client
 from pypdf import PdfReader
 from pdf2image import convert_from_bytes
 from PIL import Image
 import pytesseract
+import openai
 
-# ------------------------------
-# SUPABASE
-# ------------------------------
-from supabase import create_client
+# ============================================================
+# ENV
+# ============================================================
+
+load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "reports")
-SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "reports")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("Missing Supabase credentials")
+
+openai.api_key = OPENAI_API_KEY
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ------------------------------
-# CONSTANTS
-# ------------------------------
-CBC_ANCHORS = {"hb", "wbc", "platelet", "platelets"}
+BUCKET = "reports"
 
-# ------------------------------
-# PDF LOADING
-# ------------------------------
-def load_pdf_bytes(path: str) -> bytes:
-    res = supabase.storage.from_(SUPABASE_BUCKET).download(path)
-    return res
+# ============================================================
+# HELPERS
+# ============================================================
 
-# ------------------------------
-# TEXT EXTRACTION
-# ------------------------------
-def extract_text_digital(pdf_bytes: bytes) -> str:
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    text = ""
-    for page in reader.pages:
-        t = page.extract_text()
-        if t:
-            text += "\n" + t
-    return text.strip()
+def now():
+    return datetime.datetime.utcnow().isoformat() + "Z"
 
-def extract_text_ocr(pdf_bytes: bytes) -> str:
-    images = convert_from_bytes(pdf_bytes, dpi=300)
-    text = ""
+def clean_number(x):
+    if x is None:
+        return None
+    s = str(x).replace(",", ".")
+    m = re.search(r"-?\d+\.?\d*", s)
+    return float(m.group()) if m else None
+
+# ============================================================
+# PDF EXTRACTION
+# ============================================================
+
+def extract_text(pdf_bytes: bytes) -> str:
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        return "\n".join(p.extract_text() or "" for p in reader.pages)
+    except:
+        return ""
+
+def is_scanned(text: str) -> bool:
+    return len(text.strip()) < 40
+
+def ocr_pdf(pdf_bytes: bytes) -> str:
+    images = convert_from_bytes(pdf_bytes, dpi=200)
+    text = []
     for img in images:
-        text += "\n" + pytesseract.image_to_string(img)
-    return text.strip()
+        g = img.convert("L")
+        g = g.resize((g.width * 2, g.height * 2))
+        text.append(pytesseract.image_to_string(g))
+    return "\n".join(text)
 
-# ------------------------------
-# BASIC LAB PARSER (SAFE)
-# ------------------------------
-def parse_labs(text: str) -> Dict[str, float]:
-    labs = {}
+# ============================================================
+# CBC PARSER (RESTORED STYLE)
+# ============================================================
 
-    patterns = {
-        "hb": r"\bHb\b.*?([\d\.]+)",
-        "wbc": r"\bWBC\b.*?([\d\.]+)",
-        "platelets": r"\bPLT\b.*?([\d\.]+)",
-        "crp": r"\bCRP\b.*?([\d\.]+)",
-        "mcv": r"\bMCV\b.*?([\d\.]+)",
-        "neutrophils": r"\bNeutrophils?\b.*?([\d\.]+)"
-    }
+CBC_MAP = {
+    "hb": "Hb",
+    "hemoglobin": "Hb",
+    "haemoglobin": "Hb",
+    "wbc": "WBC",
+    "white": "WBC",
+    "platelet": "Platelets",
+    "plt": "Platelets",
+    "neut": "Neutrophils",
+    "lymph": "Lymphocytes",
+    "monocyte": "Monocytes",
+    "eosin": "Eosinophils",
+    "baso": "Basophils",
+    "mcv": "MCV",
+    "mch": "MCH",
+    "mchc": "MCHC",
+    "rdw": "RDW",
+    "creatinine": "Creatinine",
+    "urea": "Urea",
+    "crp": "CRP",
+    "alt": "ALT",
+    "ast": "AST",
+    "ck-mb": "CK_MB",
+    "ck": "CK",
+    "sodium": "Sodium",
+    "potassium": "Potassium",
+    "chloride": "Chloride",
+    "calcium": "Calcium",
+}
 
-    for key, pat in patterns.items():
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            try:
-                labs[key] = float(m.group(1))
-            except:
-                pass
+def parse_cbc(text: str) -> Dict[str, float]:
+    out = {}
+    for line in text.splitlines():
+        low = line.lower()
+        for k, canon in CBC_MAP.items():
+            if k in low:
+                val = clean_number(line)
+                if val is not None:
+                    out[canon] = val
+    return out
 
-    return labs
+# ============================================================
+# ROUTE ENGINE V4 (SIMPLIFIED & SAFE)
+# ============================================================
 
-# ------------------------------
-# ROUTE ENGINE (SAFE, NO NORMAL FALLBACK)
-# ------------------------------
-def route_engine(labs: Dict[str, float]) -> Dict[str, Any]:
-
-    found = set(labs.keys())
-    has_cbc = CBC_ANCHORS.intersection(found)
-
-    if not has_cbc:
-        return {
-            "severity_text": "unreliable",
-            "urgency_flag": "manual_review",
-            "summary": "Incomplete CBC data — interpretation withheld",
-            "patterns": [],
-            "diagnostic_possibilities": [],
-            "next_steps": []
-        }
-
+def route_engine(cbc: Dict[str, float]) -> Dict[str, Any]:
     patterns = []
-    dx = []
-    steps = []
+    routes = []
+    next_steps = []
+    diff = []
+    severity = "normal"
+    urgency = "low"
 
-    if labs.get("wbc", 0) > 12:
-        patterns.append("Leukocytosis")
-        dx.append("Bacterial infection / sepsis — leukocytosis")
-        steps.append("Clinical assessment for infection")
+    Hb = cbc.get("Hb")
+    WBC = cbc.get("WBC")
+    Neut = cbc.get("Neutrophils")
+    CRP = cbc.get("CRP")
+    Cr = cbc.get("Creatinine")
 
-    if labs.get("crp", 0) > 20:
-        patterns.append("Elevated CRP")
-        dx.append("Inflammatory or infective process")
-        steps.append("Consider blood cultures if febrile")
+    if Hb and Hb < 11:
+        patterns.append("anaemia")
+        routes.append("Anaemia workup")
+        diff += ["Iron deficiency", "Chronic disease"]
 
-    if labs.get("hb", 99) < 12:
-        patterns.append("Anemia")
-        dx.append("Anemia — consider iron deficiency vs inflammation")
-        steps.append("Order ferritin and reticulocyte count")
-
-    severity = "mild"
-    if labs.get("wbc", 0) > 15 and labs.get("crp", 0) > 40:
+    if WBC and WBC > 15 and Neut and Neut > 70:
+        patterns.append("leukocytosis with neutrophilia")
+        routes.append("Infection / sepsis route")
+        diff.append("Bacterial infection")
         severity = "severe"
+        urgency = "high"
+
+    if CRP and CRP > 100:
+        patterns.append("very high CRP")
+        routes.append("Severe inflammation / sepsis")
+        urgency = "high"
+
+    if Cr and Cr > 150:
+        patterns.append("renal impairment")
+        routes.append("AKI route")
+        diff.append("Acute kidney injury")
+
+    if not patterns:
+        patterns.append("no major acute abnormalities")
 
     return {
-        "severity_text": severity,
-        "urgency_flag": "high" if severity == "severe" else "medium",
-        "summary": "; ".join(patterns),
         "patterns": patterns,
-        "diagnostic_possibilities": dx,
-        "next_steps": steps
+        "routes": routes,
+        "next_steps": next_steps,
+        "differential": list(set(diff)),
+        "severity_text": severity,
+        "urgency_flag": urgency
     }
 
-# ------------------------------
-# MAIN LOOP
-# ------------------------------
+# ============================================================
+# MAIN PROCESSOR
+# ============================================================
+
+def process_report(job):
+    report_id = job["id"]
+    path = job["file_path"]
+
+    print(f"Processing report {report_id}")
+
+    pdf = supabase.storage.from_(BUCKET).download(path).data
+    text = extract_text(pdf)
+
+    if is_scanned(text):
+        text = ocr_pdf(pdf)
+
+    cbc = parse_cbc(text)
+
+    if not cbc:
+        supabase.table("reports").update({
+            "ai_status": "failed",
+            "ai_error": "No CBC extracted"
+        }).eq("id", report_id).execute()
+        return
+
+    routes = route_engine(cbc)
+
+    ai_results = {
+        "cbc": cbc,
+        "patterns": routes["patterns"],
+        "routes": routes["routes"],
+        "differential": routes["differential"],
+        "severity_text": routes["severity_text"],
+        "urgency_flag": routes["urgency_flag"],
+        "generated_at": now()
+    }
+
+    supabase.table("reports").update({
+        "ai_status": "completed",
+        "ai_results": ai_results
+    }).eq("id", report_id).execute()
+
+# ============================================================
+# WORKER LOOP
+# ============================================================
+
 def main():
-    log.info("AMI Worker v4 starting — Pattern → Route → Next Steps")
-
+    print("Worker running...")
     while True:
-        rows = supabase.table(SUPABASE_TABLE)\
-            .select("*")\
-            .eq("ai_status", "pending")\
-            .limit(1)\
-            .execute().data
-
-        if not rows:
-            time.sleep(5)
-            continue
-
-        row = rows[0]
-        report_id = row["id"]
-        file_path = row["file_path"]
-
-        log.info(f"Processing report {report_id}")
-
         try:
-            pdf_bytes = load_pdf_bytes(file_path)
-
-            text = extract_text_digital(pdf_bytes)
-            if len(text) < 100:
-                log.warning("Digital text insufficient — using OCR")
-                text = extract_text_ocr(pdf_bytes)
-
-            labs = parse_labs(text)
-            ai = route_engine(labs)
-
-            supabase.table(SUPABASE_TABLE)\
-                .update({
-                    "ai_results": ai,
-                    "ai_status": "completed"
-                })\
-                .eq("id", report_id)\
-                .execute()
-
-            log.info(f"Report {report_id} completed")
-
+            res = supabase.table("reports").select("*").eq("ai_status", "pending").limit(1).execute()
+            jobs = res.data or []
+            if not jobs:
+                time.sleep(1)
+                continue
+            job = jobs[0]
+            supabase.table("reports").update({"ai_status": "processing"}).eq("id", job["id"]).execute()
+            process_report(job)
         except Exception as e:
-            log.exception(f"Failed report {report_id}")
-            supabase.table(SUPABASE_TABLE)\
-                .update({
-                    "ai_status": "error",
-                    "ai_error": str(e)
-                })\
-                .eq("id", report_id)\
-                .execute()
+            print("ERROR:", e)
+            traceback.print_exc()
+            time.sleep(3)
 
-        time.sleep(1)
-
-# ------------------------------
 if __name__ == "__main__":
     main()
