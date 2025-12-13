@@ -1,41 +1,30 @@
 #!/usr/bin/env python3
-# =========================================================
-# AMI HEALTH — WORKER V8 (HYBRID TABLE PARSER)
-# Fixes: digital tables, scanned PDFs, OCR fallback
-# Mode: BALANCED (GP-safe)
-# =========================================================
+# ============================================================
+# AMI HEALTH — WORKER V8.1 (PRODUCTION)
+# Pattern-first, doctor-grade CBC interpretation
+# Supports DIGITAL PDFs + SCANNED PDFs (OCR fallback)
+# ============================================================
 
-import os
-import io
-import re
-import time
-import logging
-from typing import Dict, Any, Optional, List, Tuple
+import os, io, re, time, json, logging
+from typing import Dict, Any, Optional, List
 
 from dotenv import load_dotenv
 from pypdf import PdfReader
 from pdf2image import convert_from_bytes
 from PIL import Image, ImageOps, ImageFilter
 
-import fitz  # PyMuPDF
+# OCR
+import pytesseract
 
-try:
-    import pytesseract
-    HAS_OCR = True
-except:
-    pytesseract = None
-    HAS_OCR = False
+# Supabase
+from supabase import create_client
 
-try:
-    from supabase import create_client
-    HAS_SUPABASE = True
-except:
-    create_client = None
-    HAS_SUPABASE = False
+# PyMuPDF (table-aware extraction)
+import fitz  # pymupdf
 
-# ---------------------------------------------------------
-# ENV
-# ---------------------------------------------------------
+# ------------------------------------------------------------
+# ENV + LOGGING
+# ------------------------------------------------------------
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -43,281 +32,273 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "reports")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "reports")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "6"))
-PDF_DPI = int(os.getenv("PDF_RENDER_DPI", "220"))
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [AMI-V8] %(levelname)s: %(message)s"
+    format="%(asctime)s [AMI-V8.1] %(levelname)s: %(message)s"
 )
-log = logging.getLogger("worker-v8")
+log = logging.getLogger("ami-worker-v8.1")
 
-supabase = None
-if HAS_SUPABASE and SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ---------------------------------------------------------
-# ANALYTE MAP
-# ---------------------------------------------------------
-LABEL_MAP = {
-    "hb": "Hb",
-    "hemoglobin": "Hb",
-    "haemoglobin": "Hb",
-    "rbc": "RBC",
-    "hct": "HCT",
-    "mcv": "MCV",
-    "mch": "MCH",
-    "mchc": "MCHC",
-    "rdw": "RDW",
-    "plt": "Platelets",
-    "platelet": "Platelets",
-    "wbc": "WBC",
-    "white": "WBC",
-    "neut": "Neutrophils",
-    "lymph": "Lymphocytes",
-    "mono": "Monocytes",
-    "eos": "Eosinophils",
-    "baso": "Basophils",
-    "crp": "CRP",
-    "urea": "Urea",
-    "creat": "Creatinine",
-    "creatinine": "Creatinine",
-    "na": "Sodium",
-    "sodium": "Sodium",
-    "k": "Potassium",
-    "potassium": "Potassium",
-    "cl": "Chloride",
-    "alt": "ALT",
-    "ast": "AST",
-    "ck-mb": "CK_MB",
-    "ck": "CK",
-    "albumin": "Albumin",
-    "calcium": "Calcium",
-    "ca": "Calcium",
-    "co2": "CO2",
+# ------------------------------------------------------------
+# HARD LIMITS (SAFETY — NEVER ROUTE IMPOSSIBLE VALUES)
+# ------------------------------------------------------------
+PHYSIO_LIMITS = {
+    "Potassium": (1.5, 7.5),
+    "Sodium": (110, 170),
+    "Creatinine": (20, 2000),
+    "WBC": (0.1, 200),
+    "Platelets": (1, 5000),
+    "CRP": (0, 1000),
+    "CK": (0, 200000),
 }
 
-NUM_RE = re.compile(r"[-+]?\d*\.\d+|\d+")
-
-# ---------------------------------------------------------
+# ------------------------------------------------------------
 # PDF DOWNLOAD
-# ---------------------------------------------------------
+# ------------------------------------------------------------
 def download_pdf(record: Dict[str, Any]) -> bytes:
-    if "pdf_url" in record and record["pdf_url"]:
-        import requests
-        r = requests.get(record["pdf_url"], timeout=30)
-        r.raise_for_status()
-        return r.content
-
-    if "file_path" in record and supabase:
+    if record.get("file_path"):
         res = supabase.storage.from_(SUPABASE_BUCKET).download(record["file_path"])
         return res.data if hasattr(res, "data") else res
+    raise RuntimeError("Missing file_path")
 
-    raise ValueError("No PDF source")
-
-# ---------------------------------------------------------
-# SAFE FLOAT
-# ---------------------------------------------------------
-def safe_float(txt: str) -> Optional[float]:
-    if not txt:
-        return None
-    txt = txt.replace(",", ".")
-    m = NUM_RE.findall(txt)
-    if not m:
-        return None
-    try:
-        return float(m[-1])
-    except:
-        return None
-
-# ---------------------------------------------------------
-# 1️⃣ PYMuPDF TABLE PARSER (PRIMARY)
-# ---------------------------------------------------------
-def parse_tables_pymupdf(pdf_bytes: bytes) -> Dict[str, Dict[str, Any]]:
+# ------------------------------------------------------------
+# DIGITAL PDF — PyMuPDF TABLE EXTRACTION
+# ------------------------------------------------------------
+def extract_with_pymupdf(pdf_bytes: bytes) -> Dict[str, float]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    out = {}
+    results = {}
 
     for page in doc:
         blocks = page.get_text("blocks")
         rows = {}
 
-        for x0, y0, x1, y1, text, *_ in blocks:
-            y_key = round(y0 / 5) * 5
-            rows.setdefault(y_key, []).append((x0, text.strip()))
+        for b in blocks:
+            text = b[4].strip()
+            y = round(b[1], 1)
+            if text:
+                rows.setdefault(y, []).append(text)
 
         for y in rows:
-            cells = sorted(rows[y], key=lambda c: c[0])
-            line = " ".join(c[1] for c in cells if c[1])
+            row = " ".join(rows[y])
+            m = re.match(r"([A-Za-z \-/]+)\s+([0-9.,]+)\s*([LH]?)", row)
+            if m:
+                label = normalize_label(m.group(1))
+                value = safe_float(m.group(2))
+                if label and value is not None:
+                    results[label] = value
 
-            lower = line.lower()
-            for lbl, key in LABEL_MAP.items():
-                if lbl in lower:
-                    val = safe_float(line)
-                    if val is not None:
-                        out[key] = {"value": val, "raw": line}
+    return results
 
-    return out
-
-# ---------------------------------------------------------
-# OCR ENGINE (FALLBACK)
-# ---------------------------------------------------------
+# ------------------------------------------------------------
+# OCR PIPELINE (SCANNED PDFs)
+# ------------------------------------------------------------
 def preprocess(img: Image.Image) -> Image.Image:
     img = img.convert("L")
     img = ImageOps.autocontrast(img)
     img = img.filter(ImageFilter.MedianFilter(3))
     return img
 
-def parse_ocr(pdf_bytes: bytes) -> Dict[str, Dict[str, Any]]:
-    if not HAS_OCR:
-        return {}
-
-    images = convert_from_bytes(pdf_bytes, dpi=PDF_DPI)
-    out = {}
-
+def ocr_pdf(pdf_bytes: bytes) -> Dict[str, float]:
+    images = convert_from_bytes(pdf_bytes, dpi=300)
+    text = ""
     for img in images:
-        txt = pytesseract.image_to_string(preprocess(img), config="--psm 6")
-        for ln in txt.split("\n"):
-            low = ln.lower()
-            for lbl, key in LABEL_MAP.items():
-                if lbl in low:
-                    val = safe_float(ln)
-                    if val is not None:
-                        out[key] = {"value": val, "raw": ln}
+        img = preprocess(img)
+        text += pytesseract.image_to_string(img)
 
-    return out
+    return parse_text_lines(text)
 
-# ---------------------------------------------------------
+# ------------------------------------------------------------
 # FALLBACK TEXT PARSER
-# ---------------------------------------------------------
-def parse_text_fallback(pdf_bytes: bytes) -> Dict[str, Dict[str, Any]]:
-    try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        text = "\n".join(p.extract_text() or "" for p in reader.pages)
-    except:
-        return {}
-
+# ------------------------------------------------------------
+def parse_text_lines(text: str) -> Dict[str, float]:
     out = {}
-    for ln in text.split("\n"):
-        low = ln.lower()
-        for lbl, key in LABEL_MAP.items():
-            if lbl in low:
-                val = safe_float(ln)
-                if val is not None:
-                    out[key] = {"value": val, "raw": ln}
+    for line in text.splitlines():
+        m = re.match(r"([A-Za-z \-/]+)\s*[:\-]?\s*([0-9.,]+)", line)
+        if m:
+            label = normalize_label(m.group(1))
+            value = safe_float(m.group(2))
+            if label and value is not None:
+                out[label] = value
     return out
 
-# ---------------------------------------------------------
-# MASTER EXTRACTION
-# ---------------------------------------------------------
-def extract_all(pdf_bytes: bytes) -> Tuple[Dict[str, Dict[str, Any]], str]:
-    parsed = parse_tables_pymupdf(pdf_bytes)
-    if len(parsed) >= 5:
-        return parsed, "pymupdf"
+# ------------------------------------------------------------
+# UTILITIES
+# ------------------------------------------------------------
+def safe_float(x: str) -> Optional[float]:
+    try:
+        x = x.replace(",", ".")
+        return float(re.sub(r"[^\d.]", "", x))
+    except:
+        return None
 
-    log.warning("PyMuPDF insufficient — forcing OCR")
-    parsed = parse_ocr(pdf_bytes)
-    if len(parsed) >= 5:
-        return parsed, "ocr"
+def normalize_label(lbl: str) -> Optional[str]:
+    lbl = lbl.lower().strip()
+    MAP = {
+        "hb": "Hb", "hemoglobin": "Hb",
+        "rbc": "RBC",
+        "hct": "HCT",
+        "mcv": "MCV",
+        "mch": "MCH",
+        "mchc": "MCHC",
+        "rdw": "RDW",
+        "wbc": "WBC",
+        "neut": "Neutrophils",
+        "lymph": "Lymphocytes",
+        "mono": "Monocytes",
+        "eos": "Eosinophils",
+        "baso": "Basophils",
+        "plt": "Platelets",
+        "platelets": "Platelets",
+        "crp": "CRP",
+        "creat": "Creatinine",
+        "urea": "Urea",
+        "na": "Sodium",
+        "k": "Potassium",
+        "cl": "Chloride",
+        "alt": "ALT",
+        "ast": "AST",
+        "ck": "CK",
+        "ck-mb": "CK_MB",
+        "albumin": "Albumin",
+        "co2": "CO2",
+        "total co2": "CO2",
+        "calcium": "Calcium",
+    }
+    for k in MAP:
+        if k in lbl:
+            return MAP[k]
+    return None
 
-    log.warning("OCR insufficient — using fallback text")
-    parsed = parse_text_fallback(pdf_bytes)
-    return parsed, "fallback"
+# ------------------------------------------------------------
+# VALIDATION
+# ------------------------------------------------------------
+def validate_values(values: Dict[str, float]) -> Dict[str, float]:
+    valid = {}
+    for k, v in values.items():
+        if k in PHYSIO_LIMITS:
+            lo, hi = PHYSIO_LIMITS[k]
+            if not (lo <= v <= hi):
+                log.warning(f"Rejected impossible value: {k}={v}")
+                continue
+        valid[k] = v
+    return valid
 
-# ---------------------------------------------------------
-# SIMPLE BALANCED INTERPRETATION (SAFE)
-# ---------------------------------------------------------
-def interpret(parsed: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+# ------------------------------------------------------------
+# PATTERN-FIRST CLINICAL ENGINE (DOCTOR STYLE)
+# ------------------------------------------------------------
+def clinical_engine(vals: Dict[str, float]) -> Dict[str, Any]:
     patterns = []
+    dx = []
     actions = []
+
+    Hb = vals.get("Hb")
+    MCV = vals.get("MCV")
+    WBC = vals.get("WBC")
+    Neut = vals.get("Neutrophils")
+    CRP = vals.get("CRP")
+    Plt = vals.get("Platelets")
+    Creat = vals.get("Creatinine")
+    CO2 = vals.get("CO2")
+    CK = vals.get("CK")
+
+    # --- ANEMIA ---
+    if Hb and Hb < 12:
+        if MCV and MCV < 80:
+            patterns.append("Microcytic anemia")
+            dx.append("Iron deficiency anemia — low Hb with microcytosis")
+            actions.append("Order ferritin and reticulocyte count")
+        else:
+            patterns.append("Anemia")
+            dx.append("Anemia — low hemoglobin")
+
+    # --- INFECTION / SEPSIS ---
+    if WBC and WBC > 12 and Neut and Neut > 75 and CRP and CRP > 50:
+        patterns.append("Sepsis pattern")
+        dx.append("Sepsis — neutrophilia with leukocytosis and markedly elevated CRP")
+        actions += [
+            "Urgent clinical assessment for sepsis",
+            "Blood cultures if febrile",
+            "IV fluids and empiric antibiotics if unstable"
+        ]
+
+    # --- AKI ---
+    if Creat and Creat > 120:
+        patterns.append("Acute kidney injury")
+        dx.append("Acute kidney injury — elevated creatinine")
+        actions += [
+            "Repeat creatinine urgently",
+            "Assess urine output and volume status"
+        ]
+        if CO2 and CO2 < 22:
+            dx.append("Possible prerenal AKI — low CO2, check fluid status")
+
+    # --- RHABDOMYOLYSIS ---
+    if CK and CK > 1000:
+        patterns.append("Marked transaminitis / rhabdomyolysis")
+        dx.append("Possible rhabdomyolysis — markedly elevated CK")
+        actions.append("Assess muscle injury; aggressive IV hydration")
+
+    # --- SEVERITY ---
     severity = "normal"
-
-    def abnormal(k, v, low=None, high=None):
-        nonlocal severity
-        if v is None:
-            return False
-        if low is not None and v < low:
-            severity = "moderate"
-            return True
-        if high is not None and v > high:
-            severity = "moderate"
-            return True
-        return False
-
-    hb = parsed.get("Hb", {}).get("value")
-    plt = parsed.get("Platelets", {}).get("value")
-    ck = parsed.get("CK", {}).get("value")
-    ast = parsed.get("AST", {}).get("value")
-    alt = parsed.get("ALT", {}).get("value")
-    crp = parsed.get("CRP", {}).get("value")
-
-    if abnormal("Hb", hb, low=12):
-        patterns.append("Low hemoglobin")
-    if abnormal("Platelets", plt, low=100):
-        patterns.append("Thrombocytopenia")
-        actions.append("Urgent platelet review")
+    if len(patterns) >= 3 or ("Sepsis pattern" in patterns):
         severity = "severe"
-    if abnormal("CRP", crp, high=10):
-        patterns.append("Inflammation")
-    if abnormal("AST", ast, high=100) or abnormal("ALT", alt, high=100):
-        patterns.append("Marked transaminitis")
-        severity = "severe"
-    if abnormal("CK", ck, high=1000):
-        patterns.append("Possible rhabdomyolysis")
-        actions.append("Assess muscle injury, renal risk")
-        severity = "severe"
-
-    if not parsed:
-        severity = "insufficient_data"
+    if CK and CK > 10000 or (Creat and Creat > 250):
+        severity = "critical"
 
     return {
         "severity_text": severity,
         "patterns": patterns,
-        "next_steps": actions,
-        "summary": " | ".join(patterns) if patterns else "No significant abnormalities detected"
+        "diagnostic_possibilities": dx,
+        "immediate_actions": actions
     }
 
-# ---------------------------------------------------------
-# PROCESS REPORT
-# ---------------------------------------------------------
-def process_report(record: Dict[str, Any]):
-    rid = record.get("id")
-    pdf = download_pdf(record)
+# ------------------------------------------------------------
+# MAIN PROCESS
+# ------------------------------------------------------------
+def process_record(rec: Dict[str, Any]):
+    pdf = download_pdf(rec)
 
-    parsed, method = extract_all(pdf)
-    interpretation = interpret(parsed)
+    # 1. Digital first
+    vals = extract_with_pymupdf(pdf)
 
-    result = {
-        "parsed": parsed,
-        "routes": interpretation,
-        "extraction_method": method,
-        "processed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    }
+    # 2. Fallback OCR
+    if len(vals) < 5:
+        log.warning("PyMuPDF insufficient — forcing OCR")
+        vals = ocr_pdf(pdf)
 
-    if supabase:
-        supabase.table(SUPABASE_TABLE).update({
-            "ai_status": "completed",
-            "ai_results": result,
-            "ai_error": None
-        }).eq("id", rid).execute()
+    vals = validate_values(vals)
 
-# ---------------------------------------------------------
-# POLL
-# ---------------------------------------------------------
+    # 3. Safety check
+    if not {"Hb", "WBC", "Platelets"} & vals.keys():
+        result = {
+            "severity_text": "unreliable",
+            "summary": "Insufficient CBC data — manual review required",
+            "parsed": vals
+        }
+    else:
+        result = clinical_engine(vals)
+        result["parsed"] = vals
+
+    supabase.table(SUPABASE_TABLE).update({
+        "ai_status": "completed",
+        "ai_results": result
+    }).eq("id", rec["id"]).execute()
+
+# ------------------------------------------------------------
+# POLLER
+# ------------------------------------------------------------
 def poll():
-    if not supabase:
-        log.error("Supabase not configured")
-        return
-
     while True:
         rows = supabase.table(SUPABASE_TABLE)\
-            .select("*").eq("ai_status", "pending").limit(5).execute().data
-
+            .select("*").eq("ai_status", "pending").limit(3).execute().data
         for r in rows:
-            supabase.table(SUPABASE_TABLE).update({"ai_status": "processing"})\
+            supabase.table(SUPABASE_TABLE)\
+                .update({"ai_status": "processing"})\
                 .eq("id", r["id"]).execute()
-            process_report(r)
-
+            process_record(r)
         time.sleep(POLL_INTERVAL)
 
-# ---------------------------------------------------------
 if __name__ == "__main__":
     poll()
