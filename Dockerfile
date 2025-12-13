@@ -1,6 +1,6 @@
 FROM python:3.10-slim
 
-# Install Poppler (required for pdf2image) + Tesseract OCR
+# Install Poppler + Tesseract OCR
 RUN apt-get update && apt-get install -y \
     poppler-utils \
     tesseract-ocr \
@@ -10,12 +10,11 @@ WORKDIR /app
 
 # Install Python dependencies
 COPY requirements.txt /app/
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
-# Copy ALL source files
+# Copy source
 COPY . /app
 
-# Python unbuffered for better logs
 ENV PYTHONUNBUFFERED=1
 
 CMD ["python", "-u", "worker.py"]
