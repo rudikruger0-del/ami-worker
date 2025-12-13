@@ -113,19 +113,45 @@ def now_iso():
 # PDF reading & scanned detection
 # -----------------------------
 def download_pdf_from_supabase(record: Dict[str, Any]) -> bytes:
-    """Download PDF bytes from Supabase storage or from pdf_url in record."""
+    """
+    Download PDF bytes from Supabase storage or from pdf_url in record.
+    HARDENED against Supabase SDK timeouts.
+    """
+    # Direct URL fallback
     if record.get("pdf_url"):
         import requests
-        r = requests.get(record["pdf_url"])
+        r = requests.get(record["pdf_url"], timeout=30)
         r.raise_for_status()
         return r.content
-    if supabase and record.get("file_path"):
-        res = supabase.storage.from_(SUPABASE_BUCKET).download(record["file_path"])
-        # supabase SDK returns object with .data sometimes
-        if hasattr(res, "data"):
-            return res.data
-        return res
-    raise ValueError("No pdf_url or file_path provided in report record")
+
+    if not supabase or not record.get("file_path"):
+        raise ValueError("No pdf_url or file_path provided in report record")
+
+    last_error = None
+
+    # Retry once (Supabase SDK can fail transiently)
+    for attempt in range(2):
+        try:
+            res = supabase.storage.from_(SUPABASE_BUCKET).download(
+                record["file_path"]
+            )
+
+            # Supabase SDK inconsistency handling
+            if hasattr(res, "data") and res.data:
+                return res.data
+            if isinstance(res, (bytes, bytearray)):
+                return res
+
+            raise RuntimeError("Supabase download returned empty response")
+
+        except Exception as e:
+            last_error = e
+            print(f"⚠️ Supabase download attempt {attempt+1} failed:", e)
+            time.sleep(1.5)
+
+    # If we get here → hard fail cleanly
+    raise RuntimeError(f"Supabase download failed after retries: {last_error}")
+
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     """Extract selectable text using pypdf. Returns large joined string or empty."""
