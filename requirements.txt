@@ -1,9 +1,17 @@
-openai==0.28.0
+# Core
+python-dotenv==1.0.1
+requests==2.31.0
+
+# PDF handling
 pypdf==4.3.1
 pdf2image==1.17.0
 pillow==10.2.0
+
+# OCR
 pytesseract==0.3.10
+
+# Supabase
 supabase==2.7.4
-python-dotenv==1.0.1
-requests==2.31.0
-pymupdf==1.24.10
+
+# OpenAI (NEW SDK – REQUIRED for OpenAI Vision)
+openai==1.51.0
