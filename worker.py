@@ -777,7 +777,7 @@ def main():
         except Exception as e:
             print("LOOP ERROR:", e)
             traceback.print_exc()
-            time.sleep(2)
+            time.sleep(1)
 
 if __name__ == "__main__":
     main()
