@@ -1,242 +1,221 @@
 #!/usr/bin/env python3
-# ============================================================
-# AMI Health — Worker v4 (RESTORED & FIXED)
-# Compatible with openai==0.28.0
-# ============================================================
-
-print(">>> AMI Worker v4 starting — Pattern → Route → Next Steps")
+# ==========================================================
+# AMI Health — Worker (Stable Clinical Edition)
+# Purpose: Deterministic CBC extraction + clinical pattern synthesis
+# ==========================================================
 
 import os
 import io
 import re
 import time
 import json
-import datetime
-import traceback
+import logging
 from typing import Dict, Any, List, Optional
 
 from dotenv import load_dotenv
-from supabase import create_client
 from pypdf import PdfReader
 from pdf2image import convert_from_bytes
 from PIL import Image
 import pytesseract
-import openai
 
-# ============================================================
-# ENV
-# ============================================================
+from supabase import create_client, Client
 
+# ==========================================================
+# ENV + LOGGING
+# ==========================================================
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+log = logging.getLogger("AMI-WORKER")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+SUPABASE_TABLE = "reports"
+SUPABASE_BUCKET = "reports"
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing Supabase credentials")
 
-openai.api_key = OPENAI_API_KEY
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-BUCKET = "reports"
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def now():
-    return datetime.datetime.utcnow().isoformat() + "Z"
-
-def clean_number(x):
-    if x is None:
+# ==========================================================
+# UTILITIES
+# ==========================================================
+def clean_number(val: Any) -> Optional[float]:
+    if val is None:
         return None
-    s = str(x).replace(",", ".")
-    m = re.search(r"-?\d+\.?\d*", s)
+    s = str(val).replace(",", ".")
+    m = re.search(r"-?\d+(\.\d+)?", s)
     return float(m.group()) if m else None
 
-# ============================================================
-# PDF EXTRACTION
-# ============================================================
-
-def extract_text(pdf_bytes: bytes) -> str:
+def extract_pdf_text(pdf_bytes: bytes) -> str:
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         return "\n".join(p.extract_text() or "" for p in reader.pages)
-    except:
+    except Exception:
         return ""
 
 def is_scanned(text: str) -> bool:
     return len(text.strip()) < 40
 
 def ocr_pdf(pdf_bytes: bytes) -> str:
-    images = convert_from_bytes(pdf_bytes, dpi=200)
-    text = []
+    images = convert_from_bytes(pdf_bytes, dpi=250)
+    text = ""
     for img in images:
-        g = img.convert("L")
-        g = g.resize((g.width * 2, g.height * 2))
-        text.append(pytesseract.image_to_string(g))
-    return "\n".join(text)
+        gray = img.convert("L")
+        text += pytesseract.image_to_string(gray) + "\n"
+    return text
 
-# ============================================================
-# CBC PARSER (RESTORED STYLE)
-# ============================================================
-
-CBC_MAP = {
-    "hb": "Hb",
-    "hemoglobin": "Hb",
-    "haemoglobin": "Hb",
-    "wbc": "WBC",
-    "white": "WBC",
-    "platelet": "Platelets",
-    "plt": "Platelets",
-    "neut": "Neutrophils",
-    "lymph": "Lymphocytes",
-    "monocyte": "Monocytes",
-    "eosin": "Eosinophils",
-    "baso": "Basophils",
-    "mcv": "MCV",
-    "mch": "MCH",
-    "mchc": "MCHC",
-    "rdw": "RDW",
-    "creatinine": "Creatinine",
-    "urea": "Urea",
-    "crp": "CRP",
-    "alt": "ALT",
-    "ast": "AST",
-    "ck-mb": "CK_MB",
-    "ck": "CK",
-    "sodium": "Sodium",
-    "potassium": "Potassium",
-    "chloride": "Chloride",
-    "calcium": "Calcium",
+# ==========================================================
+# CBC PARSER (STRICT — NO HALLUCINATION)
+# ==========================================================
+CBC_PATTERNS = {
+    "Hb": r"(Hb|Haemoglobin|Hemoglobin)\s*[:\-]?\s*([\d.,]+)",
+    "MCV": r"(MCV)\s*[:\-]?\s*([\d.,]+)",
+    "WBC": r"(WBC|White cell count)\s*[:\-]?\s*([\d.,]+)",
+    "Neutrophils": r"(Neutrophils?)\s*[:\-]?\s*([\d.,]+)",
+    "Platelets": r"(Platelets?)\s*[:\-]?\s*([\d.,]+)",
+    "CRP": r"(CRP)\s*[:\-]?\s*([\d.,]+)",
+    "CK": r"(CK)\s*[:\-]?\s*([\d.,]+)",
+    "Creatinine": r"(Creatinine)\s*[:\-]?\s*([\d.,]+)",
+    "Urea": r"(Urea)\s*[:\-]?\s*([\d.,]+)",
 }
 
 def parse_cbc(text: str) -> Dict[str, float]:
-    out = {}
-    for line in text.splitlines():
-        low = line.lower()
-        for k, canon in CBC_MAP.items():
-            if k in low:
-                val = clean_number(line)
-                if val is not None:
-                    out[canon] = val
-    return out
+    values = {}
+    for key, pattern in CBC_PATTERNS.items():
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            values[key] = clean_number(m.group(2))
+    return values
 
-# ============================================================
-# ROUTE ENGINE V4 (SIMPLIFIED & SAFE)
-# ============================================================
-
-def route_engine(cbc: Dict[str, float]) -> Dict[str, Any]:
+# ==========================================================
+# CLINICAL INTELLIGENCE (DR-GRADE)
+# ==========================================================
+def generate_report(cbc: Dict[str, float]) -> Dict[str, Any]:
     patterns = []
-    routes = []
-    next_steps = []
-    diff = []
-    severity = "normal"
-    urgency = "low"
+    differentials = []
+    actions = []
 
     Hb = cbc.get("Hb")
+    MCV = cbc.get("MCV")
     WBC = cbc.get("WBC")
     Neut = cbc.get("Neutrophils")
     CRP = cbc.get("CRP")
+    CK = cbc.get("CK")
     Cr = cbc.get("Creatinine")
+    Urea = cbc.get("Urea")
 
-    if Hb and Hb < 11:
-        patterns.append("anaemia")
-        routes.append("Anaemia workup")
-        diff += ["Iron deficiency", "Chronic disease"]
+    # ---- ANAEMIA ----
+    if Hb and Hb < 12:
+        patterns.append(f"anemia: Hb {Hb} g/dL")
+        if MCV and MCV < 80:
+            patterns.append(f"microcytic anemia: MCV {MCV} fL")
+            differentials += [
+                "Iron deficiency anemia",
+                "Thalassaemia trait",
+                "Chronic blood loss"
+            ]
+            actions.append("Order ferritin, reticulocyte count, and peripheral smear")
+            actions.append("Assess menstrual history or occult blood loss")
 
-    if WBC and WBC > 15 and Neut and Neut > 70:
-        patterns.append("leukocytosis with neutrophilia")
-        routes.append("Infection / sepsis route")
-        diff.append("Bacterial infection")
-        severity = "severe"
-        urgency = "high"
+    # ---- INFECTION / SEPSIS ----
+    if WBC and WBC > 12 and Neut and Neut > 75:
+        patterns.append(f"leukocytosis: WBC {WBC} x10^9/L")
+        patterns.append(f"neutrophilic predominance: Neutrophils {Neut}%")
+        if CRP and CRP > 10:
+            patterns.append(f"elevated CRP: CRP {CRP} mg/L")
+            differentials += ["Bacterial infection", "Sepsis"]
+            actions.append("Clinical assessment for sepsis; consider blood cultures")
+            actions.append("Consider IV fluids and empiric antibiotics if unstable")
 
-    if CRP and CRP > 100:
-        patterns.append("very high CRP")
-        routes.append("Severe inflammation / sepsis")
-        urgency = "high"
+    # ---- KIDNEY ----
+    if Cr and Urea and Cr > 120:
+        differentials.append("Acute kidney injury (prerenal?)")
+        actions.append("Assess volume status and hydration")
 
-    if Cr and Cr > 150:
-        patterns.append("renal impairment")
-        routes.append("AKI route")
-        diff.append("Acute kidney injury")
+    # ---- CK ----
+    if CK and CK > 1000:
+        patterns.append(f"rhabdomyolysis signal: CK {CK} U/L")
+        actions.append("Assess muscle pain and urine colour")
+        actions.append("Check renal function and electrolytes; consider urgent fluids")
 
-    if not patterns:
-        patterns.append("no major acute abnormalities")
+    severity = "HIGH" if CRP and CRP > 40 else "MODERATE"
 
     return {
+        "severity": severity,
         "patterns": patterns,
-        "routes": routes,
-        "next_steps": next_steps,
-        "differential": list(set(diff)),
-        "severity_text": severity,
-        "urgency_flag": urgency
+        "differential": list(dict.fromkeys(differentials)),
+        "actions": list(dict.fromkeys(actions))
     }
 
-# ============================================================
+# ==========================================================
 # MAIN PROCESSOR
-# ============================================================
+# ==========================================================
+def process_report(row: Dict[str, Any]):
+    report_id = row["id"]
+    path = row["file_path"]
 
-def process_report(job):
-    report_id = job["id"]
-    path = job["file_path"]
+    log.info(f"Processing report {report_id}")
 
-    print(f"Processing report {report_id}")
+    pdf_resp = supabase.storage.from_(SUPABASE_BUCKET).download(path)
+    pdf_bytes = pdf_resp if isinstance(pdf_resp, bytes) else pdf_resp
 
-    pdf = supabase.storage.from_(BUCKET).download(path).data
-    text = extract_text(pdf)
-
+    text = extract_pdf_text(pdf_bytes)
     if is_scanned(text):
-        text = ocr_pdf(pdf)
+        text = ocr_pdf(pdf_bytes)
 
     cbc = parse_cbc(text)
-
     if not cbc:
-        supabase.table("reports").update({
-            "ai_status": "failed",
-            "ai_error": "No CBC extracted"
-        }).eq("id", report_id).execute()
-        return
+        raise RuntimeError("No CBC extracted")
 
-    routes = route_engine(cbc)
+    report = generate_report(cbc)
 
     ai_results = {
-        "cbc": cbc,
-        "patterns": routes["patterns"],
-        "routes": routes["routes"],
-        "differential": routes["differential"],
-        "severity_text": routes["severity_text"],
-        "urgency_flag": routes["urgency_flag"],
-        "generated_at": now()
+        "severity": report["severity"],
+        "patterns": report["patterns"],
+        "top_differential_diagnoses": report["differential"],
+        "immediate_suggested_actions": report["actions"]
     }
 
-    supabase.table("reports").update({
+    supabase.table(SUPABASE_TABLE).update({
         "ai_status": "completed",
         "ai_results": ai_results
     }).eq("id", report_id).execute()
 
-# ============================================================
+# ==========================================================
 # WORKER LOOP
-# ============================================================
-
+# ==========================================================
 def main():
-    print("Worker running...")
+    log.info("AMI Worker started")
     while True:
+        res = supabase.table(SUPABASE_TABLE)\
+            .select("*")\
+            .eq("ai_status", "pending")\
+            .limit(1)\
+            .execute()
+
+        jobs = res.data or []
+        if not jobs:
+            time.sleep(1)
+            continue
+
+        job = jobs[0]
+        supabase.table(SUPABASE_TABLE).update(
+            {"ai_status": "processing"}
+        ).eq("id", job["id"]).execute()
+
         try:
-            res = supabase.table("reports").select("*").eq("ai_status", "pending").limit(1).execute()
-            jobs = res.data or []
-            if not jobs:
-                time.sleep(1)
-                continue
-            job = jobs[0]
-            supabase.table("reports").update({"ai_status": "processing"}).eq("id", job["id"]).execute()
             process_report(job)
         except Exception as e:
-            print("ERROR:", e)
-            traceback.print_exc()
-            time.sleep(3)
+            log.error(str(e))
+            supabase.table(SUPABASE_TABLE).update({
+                "ai_status": "failed",
+                "ai_error": str(e)
+            }).eq("id", job["id"]).execute()
 
 if __name__ == "__main__":
     main()
