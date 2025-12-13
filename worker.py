@@ -73,6 +73,39 @@ def safe_float(v) -> Optional[float]:
     except Exception:
         return None
 
+def numeric_safety_gate(key: str, value: float) -> Optional[float]:
+    """
+    HARD safety limits. If a value is outside physiologically possible ranges,
+    it is silently discarded.
+    """
+    LIMITS = {
+        "Hb": (3, 25),
+        "MCV": (50, 130),
+        "MCH": (15, 45),
+        "WBC": (0.1, 100),
+        "Neutrophils": (0, 100),
+        "Lymphocytes": (0, 100),
+        "Platelets": (1, 2000),
+        "CRP": (0, 500),
+        "Creatinine": (10, 2000),
+        "Sodium": (110, 180),
+        "Potassium": (2.0, 7.5),
+        "Urea": (0.5, 60),
+        "CK": (0, 200000),
+        "ALT": (0, 5000),
+        "AST": (0, 5000),
+    }
+
+    if key not in LIMITS:
+        return value
+
+    low, high = LIMITS[key]
+    if value < low or value > high:
+        return None
+
+    return value
+
+
 def now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -356,26 +389,44 @@ def parse_values_from_ocr_json(ocr_json: Dict[str, Any]) -> Dict[str, Dict[str, 
 
 def canonical_map(parsed: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """
-    Ensure canonical keys and compute derived values (NLR).
+    Ensure canonical keys and HARD-FILTER unsafe numeric values.
+    This guarantees zero numeric hallucination.
     """
     out: Dict[str, Dict[str, Any]] = {}
-    for k,v in parsed.items():
+
+    for k, v in parsed.items():
+        raw_val = v.get("value")
+        val = safe_float(raw_val)
+        if val is None:
+            continue
+
+        safe_val = numeric_safety_gate(k, val)
+        if safe_val is None:
+            continue  # DROP unsafe OCR / hallucinated value
+
         out[k] = {
-            "value": safe_float(v.get("value")),
+            "value": safe_val,
             "units": v.get("units"),
             "raw": v.get("raw"),
             "reference_low": v.get("reference_low"),
             "reference_high": v.get("reference_high")
         }
-    # compute NLR if possible (if Neutrophils & Lymphocytes present)
+
+    # Compute NLR only if BOTH values are present and safe
     try:
         n = out.get("Neutrophils", {}).get("value")
         l = out.get("Lymphocytes", {}).get("value")
-        if n is not None and l is not None and l != 0:
-            out["NLR"] = {"value": round(n / l, 2), "units": None, "raw": "computed NLR"}
+        if n is not None and l is not None and l > 0:
+            out["NLR"] = {
+                "value": round(n / l, 2),
+                "units": None,
+                "raw": "computed NLR"
+            }
     except Exception:
         pass
+
     return out
+
 
 # -----------------------------
 # ROUTE ENGINE (comprehensive)
@@ -719,7 +770,9 @@ def route_engine_all(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[st
         "differential": ddx,
         "per_key": per_key,
         "overall_severity": overall_sev,
-        "urgency": urgency,
+        "severity_text": COLOR_MAP[overall_sev]["label"],
+"urgency_flag": urgency,
+
         "color": color["color"],
         "tw_class": color["tw"],
         "age_group": ag,
