@@ -1,6 +1,6 @@
 openai==0.28.0
 pypdf==4.3.1
-pdf2image==1.17.0
+pdf2image==1.24.10
 pillow==10.2.0
 pytesseract==0.3.10
 supabase==2.7.4
