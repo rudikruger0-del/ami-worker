@@ -1,20 +1,27 @@
 FROM python:3.10-slim
 
-# Install Poppler + Tesseract OCR
+# --- System dependencies ---
+# poppler-utils → pdf2image
+# tesseract-ocr → pytesseract (fallback OCR)
 RUN apt-get update && apt-get install -y \
     poppler-utils \
     tesseract-ocr \
+    libgl1 \
+    libglib2.0-0 \
  && rm -rf /var/lib/apt/lists/*
 
+# --- App directory ---
 WORKDIR /app
 
-# Install Python dependencies
-COPY requirements.txt /app/
-RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
+# --- Python dependencies ---
+COPY requirements.txt .
+RUN pip install --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
 
-# Copy source
-COPY . /app
+# --- Copy worker ---
+COPY . .
 
+# --- Runtime settings ---
 ENV PYTHONUNBUFFERED=1
 
 CMD ["python", "-u", "worker.py"]
