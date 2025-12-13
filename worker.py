@@ -1,318 +1,224 @@
-print(">>> AMI Worker v4 starting — Pattern → Route → Next Steps")
+#!/usr/bin/env python3
+"""
+AMI Health — Worker v4 (STABLE BASELINE)
+Pattern → Route → Next Steps
 
-import os, time, json, io, traceback, base64, re
-from supabase import create_client, Client
-from openai import OpenAI
+CRITICAL NOTES:
+- Compatible with openai==0.28.0
+- NO OpenAI v1 client
+- NO breaking parser changes
+- NO NORMAL fallback
+"""
+
+import os
+import io
+import re
+import json
+import time
+import logging
+from typing import Dict, Any, List
+
+# ------------------------------
+# ENV + LOGGING
+# ------------------------------
+from dotenv import load_dotenv
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [AMI-WORKER] %(levelname)s: %(message)s"
+)
+log = logging.getLogger("ami-worker")
+
+# ------------------------------
+# OPENAI (OLD SDK — CORRECT)
+# ------------------------------
+import openai
+
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# ------------------------------
+# PDF / OCR
+# ------------------------------
 from pypdf import PdfReader
 from pdf2image import convert_from_bytes
+from PIL import Image
+import pytesseract
 
-# -----------------------------------------------------
-# ENVIRONMENT
-# -----------------------------------------------------
+# ------------------------------
+# SUPABASE
+# ------------------------------
+from supabase import create_client
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "reports")
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "reports")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-client = OpenAI(api_key=OPENAI_API_KEY)
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-BUCKET = "reports"
+# ------------------------------
+# CONSTANTS
+# ------------------------------
+CBC_ANCHORS = {"hb", "wbc", "platelet", "platelets"}
 
-# -----------------------------------------------------
-# PDF TEXT EXTRACTION
-# -----------------------------------------------------
-def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        return "\n\n".join([(page.extract_text() or "") for page in reader.pages]).strip()
-    except:
-        return ""
+# ------------------------------
+# PDF LOADING
+# ------------------------------
+def load_pdf_bytes(path: str) -> bytes:
+    res = supabase.storage.from_(SUPABASE_BUCKET).download(path)
+    return res
 
-def is_scanned_pdf(text: str) -> bool:
-    return len(text.strip()) < 30
+# ------------------------------
+# TEXT EXTRACTION
+# ------------------------------
+def extract_text_digital(pdf_bytes: bytes) -> str:
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    text = ""
+    for page in reader.pages:
+        t = page.extract_text()
+        if t:
+            text += "\n" + t
+    return text.strip()
 
-# -----------------------------------------------------
-# CLEAN NUMBER
-# -----------------------------------------------------
-def clean_number(val):
-    if val is None:
-        return None
-    if isinstance(val, (int, float)):
-        return float(val)
+def extract_text_ocr(pdf_bytes: bytes) -> str:
+    images = convert_from_bytes(pdf_bytes, dpi=300)
+    text = ""
+    for img in images:
+        text += "\n" + pytesseract.image_to_string(img)
+    return text.strip()
 
-    s = str(val).replace(",", ".")
-    nums = re.findall(r"-?\d+\.?\d*", s)
-    return float(nums[0]) if nums else None
+# ------------------------------
+# BASIC LAB PARSER (SAFE)
+# ------------------------------
+def parse_labs(text: str) -> Dict[str, float]:
+    labs = {}
 
-# -----------------------------------------------------
-# OCR — FIXED FOR OPENAI v2024+
-# -----------------------------------------------------
-def extract_cbc_from_image(image_bytes: bytes):
-    b64 = base64.b64encode(image_bytes).decode()
+    patterns = {
+        "hb": r"\bHb\b.*?([\d\.]+)",
+        "wbc": r"\bWBC\b.*?([\d\.]+)",
+        "platelets": r"\bPLT\b.*?([\d\.]+)",
+        "crp": r"\bCRP\b.*?([\d\.]+)",
+        "mcv": r"\bMCV\b.*?([\d\.]+)",
+        "neutrophils": r"\bNeutrophils?\b.*?([\d\.]+)"
+    }
 
-    system_prompt = (
-        "You are an OCR assistant for lab reports. Extract ALL analytes you can see: "
-        "CBC, diff, electrolytes, CRP, urea, creatinine, liver enzymes, CK. "
-        "Return STRICT JSON:\n"
-        "{ 'cbc': [ { 'analyte':'', 'value':'', 'units':'', 'reference_low':'', 'reference_high':'' } ] }"
-    )
+    for key, pat in patterns.items():
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            try:
+                labs[key] = float(m.group(1))
+            except:
+                pass
 
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o",
-            response_format={"type": "json_object"},
-            temperature=0,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{b64}"}
-                        }
-                    ]
-                }
-            ]
-        )
-        return resp.choices[0].message.parsed
-    except Exception as e:
-        print("OCR error:", e)
-        return {"cbc": []}
+    return labs
 
-# -----------------------------------------------------
-# INTERPRETATION
-# -----------------------------------------------------
-def call_ai_on_report(text: str):
-    system_prompt = (
-        "You are AMI, a medical lab interpreter. "
-        "Return STRICT JSON containing: patient, cbc, summary (impression + follow-up). "
-        "Never diagnose, only describe patterns."
-    )
+# ------------------------------
+# ROUTE ENGINE (SAFE, NO NORMAL FALLBACK)
+# ------------------------------
+def route_engine(labs: Dict[str, float]) -> Dict[str, Any]:
 
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        response_format={"type": "json_object"},
-        temperature=0,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": text}
-        ]
-    )
-    return resp.choices[0].message.parsed
+    found = set(labs.keys())
+    has_cbc = CBC_ANCHORS.intersection(found)
 
-# -----------------------------------------------------
-# CBC DICTIONARY NORMALISATION
-# -----------------------------------------------------
-def build_cbc_dict(ai_json):
-    rows = ai_json.get("cbc") or []
-    out = {}
+    if not has_cbc:
+        return {
+            "severity_text": "unreliable",
+            "urgency_flag": "manual_review",
+            "summary": "Incomplete CBC data — interpretation withheld",
+            "patterns": [],
+            "diagnostic_possibilities": [],
+            "next_steps": []
+        }
 
-    for r in rows:
-        name = (r.get("analyte") or "").lower()
+    patterns = []
+    dx = []
+    steps = []
 
-        if "haemo" in name or name == "hb": out["Hb"] = r
-        if name.startswith("mcv"): out["MCV"] = r
-        if name.startswith("mch"): out["MCH"] = r
-        if "white" in name or "wbc" in name: out["WBC"] = r
-        if "neut" in name: out["Neut"] = r
-        if "lymph" in name: out["Lymph"] = r
-        if "plate" in name: out["Plt"] = r
-        if "creatinine" in name: out["Cr"] = r
-        if "urea" in name: out["Urea"] = r
-        if "crp" in name: out["CRP"] = r
-        if "sodium" in name or name == "na": out["Na"] = r
-        if "potassium" in name or name == "k": out["K"] = r
+    if labs.get("wbc", 0) > 12:
+        patterns.append("Leukocytosis")
+        dx.append("Bacterial infection / sepsis — leukocytosis")
+        steps.append("Clinical assessment for infection")
 
-    return out
+    if labs.get("crp", 0) > 20:
+        patterns.append("Elevated CRP")
+        dx.append("Inflammatory or infective process")
+        steps.append("Consider blood cultures if febrile")
 
-# -----------------------------------------------------
-# ROUTE ENGINE V3 — Patterns → Route → Suggested Next Steps
-# -----------------------------------------------------
-def generate_routes(c):
-    v = lambda k: clean_number(c.get(k, {}).get("value"))
-    Hb, MCV, WBC, Neut, Lymph, Plt, Cr, Urea, CRP = (
-        v("Hb"), v("MCV"), v("WBC"), v("Neut"), v("Lymph"), v("Plt"),
-        v("Cr"), v("Urea"), v("CRP")
-    )
+    if labs.get("hb", 99) < 12:
+        patterns.append("Anemia")
+        dx.append("Anemia — consider iron deficiency vs inflammation")
+        steps.append("Order ferritin and reticulocyte count")
 
-    routes = []
+    severity = "mild"
+    if labs.get("wbc", 0) > 15 and labs.get("crp", 0) > 40:
+        severity = "severe"
 
-    # --- ANAEMIA PATTERN ---
-    if Hb is not None and Hb < 13:
-        if MCV and MCV < 80:
-            routes.append({
-                "pattern": "Microcytic anaemia",
-                "route": "Likely iron deficiency / chronic disease pattern",
-                "next_steps": [
-                    "Request ferritin & iron studies",
-                    "Check reticulocyte count",
-                    "Assess for chronic inflammation"
-                ]
-            })
-        elif MCV and MCV > 100:
-            routes.append({
-                "pattern": "Macrocytic anaemia",
-                "route": "Possible B12/folate deficiency / liver pattern",
-                "next_steps": [
-                    "Order B12 & folate",
-                    "Review liver enzymes",
-                    "Check medications (e.g., antiretrovirals)"
-                ]
-            })
-        else:
-            routes.append({
-                "pattern": "Normocytic anaemia",
-                "route": "Common in renal disease / early iron deficiency",
-                "next_steps": [
-                    "Check creatinine & eGFR",
-                    "Order reticulocyte count",
-                    "Review chronic inflammatory markers"
-                ]
-            })
+    return {
+        "severity_text": severity,
+        "urgency_flag": "high" if severity == "severe" else "medium",
+        "summary": "; ".join(patterns),
+        "patterns": patterns,
+        "diagnostic_possibilities": dx,
+        "next_steps": steps
+    }
 
-    # --- INFECTION / INFLAMMATION ---
-    if WBC and WBC > 12:
-        if Neut and Neut > 70:
-            routes.append({
-                "pattern": "Neutrophilia",
-                "route": "Bacterial infection physiology",
-                "next_steps": [
-                    "Correlate with fever, CRP",
-                    "Look for localised infection",
-                    "Consider sepsis markers if unwell"
-                ]
-            })
-
-        if Lymph and Lymph > 45:
-            routes.append({
-                "pattern": "Lymphocytosis",
-                "route": "Viral or recovery-phase pattern",
-                "next_steps": [
-                    "Check recent viral symptoms",
-                    "Review past CBC for trends",
-                    "Repeat CBC in 1–2 weeks"
-                ]
-            })
-
-    if CRP and CRP > 10:
-        routes.append({
-            "pattern": "Raised CRP",
-            "route": "Inflammation / infection",
-            "next_steps": [
-                "Correlate with WBC",
-                "Assess clinical severity",
-                "Consider imaging if focal symptoms exist"
-            ]
-        })
-
-    # --- RENAL FUNCTION ---
-    if Cr and Cr > 120:
-        routes.append({
-            "pattern": "Renal impairment physiology",
-            "route": "Possible dehydration / CKD / medication effect",
-            "next_steps": [
-                "Repeat U&E",
-                "Check hydration & meds",
-                "Order eGFR"
-            ]
-        })
-
-    # Default
-    if not routes:
-        routes.append({
-            "pattern": "No major abnormalities",
-            "route": "All key markers within expected physiology",
-            "next_steps": ["Monitor and correlate clinically"]
-        })
-
-    return routes
-
-# -----------------------------------------------------
-# PROCESS REPORT
-# -----------------------------------------------------
-def process_report(job):
-    rid = job["id"]
-    file_path = job.get("file_path")
-    print(f"Processing {rid}...")
-
-    pdf_bytes = supabase.storage.from_(BUCKET).download(file_path)
-    if hasattr(pdf_bytes, "data"):
-        pdf_bytes = pdf_bytes.data
-
-    text = extract_text_from_pdf(pdf_bytes)
-    scanned = is_scanned_pdf(text)
-
-    extracted_rows = []
-
-    # --- SCANNED PDF → OCR ---
-    if scanned:
-        print("SCANNED PDF → OCR START")
-        pages = convert_from_bytes(pdf_bytes)
-
-        for i, img in enumerate(pages, 1):
-            print(f"OCR page {i}...")
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            result = extract_cbc_from_image(buf.getvalue())
-            rows = result.get("cbc", [])
-            if rows:
-                extracted_rows.extend(rows)
-
-        if not extracted_rows:
-            raise ValueError("No CBC extracted from scanned PDF")
-
-        merged_text = json.dumps({"cbc": extracted_rows})
-
-    else:
-        merged_text = text or job.get("l_text") or ""
-
-    # --- AI INTERPRETATION ---
-    ai_json = call_ai_on_report(merged_text)
-
-    # --- ROUTE ENGINE v3 ---
-    cdict = build_cbc_dict(ai_json)
-    ai_json["routes"] = generate_routes(cdict)
-
-    supabase.table("reports").update(
-        {"ai_status": "completed", "ai_results": ai_json, "ai_error": None}
-    ).eq("id", rid).execute()
-
-    print(f"✓ Completed {rid}")
-
-# -----------------------------------------------------
-# MAIN LOOP — FIXED
-# -----------------------------------------------------
+# ------------------------------
+# MAIN LOOP
+# ------------------------------
 def main():
-    print("Entering main loop...")
+    log.info("AMI Worker v4 starting — Pattern → Route → Next Steps")
+
     while True:
+        rows = supabase.table(SUPABASE_TABLE)\
+            .select("*")\
+            .eq("ai_status", "pending")\
+            .limit(1)\
+            .execute().data
+
+        if not rows:
+            time.sleep(5)
+            continue
+
+        row = rows[0]
+        report_id = row["id"]
+        file_path = row["file_path"]
+
+        log.info(f"Processing report {report_id}")
+
         try:
-            res = (
-                supabase.table("reports")
-                .select("*")
-                .eq("ai_status", "pending")
-                .limit(1)
+            pdf_bytes = load_pdf_bytes(file_path)
+
+            text = extract_text_digital(pdf_bytes)
+            if len(text) < 100:
+                log.warning("Digital text insufficient — using OCR")
+                text = extract_text_ocr(pdf_bytes)
+
+            labs = parse_labs(text)
+            ai = route_engine(labs)
+
+            supabase.table(SUPABASE_TABLE)\
+                .update({
+                    "ai_results": ai,
+                    "ai_status": "completed"
+                })\
+                .eq("id", report_id)\
                 .execute()
-            )
 
-            jobs = res.model or []   # ← FIXED
-
-            if not jobs:
-                print("No jobs...")
-                time.sleep(1)
-                continue
-
-            job = jobs[0]
-            supabase.table("reports").update(
-                {"ai_status": "processing"}
-            ).eq("id", job["id"]).execute()
-
-            process_report(job)
+            log.info(f"Report {report_id} completed")
 
         except Exception as e:
-            print("LOOP ERROR:", e)
-            traceback.print_exc()
-            time.sleep(2)
+            log.exception(f"Failed report {report_id}")
+            supabase.table(SUPABASE_TABLE)\
+                .update({
+                    "ai_status": "error",
+                    "ai_error": str(e)
+                })\
+                .eq("id", report_id)\
+                .execute()
 
+        time.sleep(1)
+
+# ------------------------------
 if __name__ == "__main__":
     main()
