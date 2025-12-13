@@ -1,18 +1,4 @@
-#!/usr/bin/env python3
-"""
-AMI Worker v4+ (Pattern → Route → Next Steps)
-Features:
-- Scanned PDF OCR (OpenAI) -> structured CBC + chemistry extraction
-- Text PDF parsing
-- AI interpretation (GPT-4o-mini style)
-- Route engine (Patterns -> Route -> Next Steps)
-- Urgency flags & Severity grading
-- Differential diagnosis trees (safe, non-prescriptive)
-- Trend comparison with prior completed reports (by patient name)
-- Robust error handling and defensive parsing
-"""
-
-print(">>> AMI Worker v4 starting — Pattern → Route → Next Steps (with urgency, severity, differential, trends)")
+print(">>> AMI Worker starting…")
 
 import os
 import time
@@ -21,141 +7,127 @@ import io
 import traceback
 import base64
 import re
-from datetime import datetime
 
-# Third-party
 from supabase import create_client, Client
 from openai import OpenAI
 from pypdf import PdfReader
 from pdf2image import convert_from_bytes
 
-# ---------------------------
-# Environment / clients
-# ---------------------------
+# =====================================================
+# ENV + CLIENTS
+# =====================================================
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_KEY is missing")
+    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_KEY")
 
 if not OPENAI_API_KEY:
-    print("⚠️ OPENAI_API_KEY not set — OpenAI requests will likely fail (but code will still run).")
+    print("⚠️ OPENAI_API_KEY is not set – OpenAI calls will fail.")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 BUCKET = "reports"
 
-# ---------------------------
-# Utilities
-# ---------------------------
-def safe_get_parsed_from_choice(choice):
-    """Helper: get parsed JSON from various SDK response shapes."""
-    try:
-        # Preferred: parsed property (SDK may populate .message.parsed)
-        msg = getattr(choice, "message", None)
-        if msg:
-            parsed = getattr(msg, "parsed", None)
-            if parsed is not None:
-                return parsed
-            # fallback to content
-            content = getattr(msg, "content", None)
-            if isinstance(content, dict):
-                return content
-            if isinstance(content, list):
-                # search for dict/json in list
-                for item in content:
-                    if isinstance(item, dict) and "json" in item:
-                        return item.get("json")
-                # fallback join strings
-                txt = "".join(part.get("text", "") for part in content if isinstance(part, dict))
-                try:
-                    return json.loads(txt)
-                except:
-                    return txt
-            if isinstance(content, str):
-                try:
-                    return json.loads(content)
-                except:
-                    return content
 
-        # older fallback: choice.get("text")
-        if hasattr(choice, "text"):
-            txt = getattr(choice, "text")
-            try:
-                return json.loads(txt)
-            except:
-                return txt
+# =====================================================
+# GENERIC HELPERS
+# =====================================================
 
-    except Exception:
-        pass
-    return None
-
-def clean_number(val):
-    """Convert things like '88.0%', '11,6 g/dL', '4.2*' -> float or None."""
-    if val is None:
-        return None
-    if isinstance(val, (int, float)):
-        return float(val)
-    s = str(val)
-    s = s.replace(",", ".")
-    # remove percent sign, trailing stars and words, then regex first number
-    nums = re.findall(r"-?\d+\.?\d*", s)
-    if not nums:
-        return None
-    try:
-        return float(nums[0])
-    except:
-        return None
-
-def iso_now():
-    return datetime.utcnow().isoformat() + "Z"
-
-# ---------------------------
-# PDF helpers
-# ---------------------------
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """Extract text from selectable PDFs using pypdf."""
+    """Extract text from selectable text PDFs."""
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         pages = []
-        for p in reader.pages:
-            txt = p.extract_text() or ""
+        for page in reader.pages:
+            txt = page.extract_text() or ""
             pages.append(txt)
         return "\n\n".join(pages).strip()
     except Exception as e:
         print("PDF parse error:", e)
         return ""
 
-def is_scanned_pdf(text: str) -> bool:
-    """Very simple heuristic: nearly no text means scanned image PDF."""
-    if not text:
-        return True
-    return len(text.strip()) < 30
 
-# ---------------------------
-# OCR: Image -> structured CBC (OpenAI Vision via chat completions)
-# ---------------------------
+def is_scanned_pdf(text: str) -> bool:
+    """If very little text, assume scanned image PDF."""
+    return len((text or "").strip()) < 30
+
+
+def clean_number(val):
+    """
+    Safely convert lab values like '88.0%', '11,6 g/dL', '4.2*' → float.
+    Returns None if conversion fails.
+    """
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+
+    s = str(val)
+    s = s.replace(",", ".")
+    nums = re.findall(r"-?\d+\.?\d*", s)
+    if not nums:
+        return None
+    try:
+        return float(nums[0])
+    except Exception:
+        return None
+
+
+def parse_json_from_message(message) -> dict:
+    """
+    OpenAI 1.51.0 + response_format={"type":"json_object"}:
+    message.content can be a string or a list of parts with type="text".
+    """
+    content = message.content
+    if isinstance(content, str):
+        raw = content
+    elif isinstance(content, list):
+        texts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                texts.append(part.get("text", ""))
+        raw = "\n".join(texts)
+    else:
+        raise ValueError("Unsupported message.content type")
+
+    try:
+        return json.loads(raw)
+    except Exception as e:
+        print("JSON parse error:", e, "RAW:", raw[:300])
+        raise
+
+
+# =====================================================
+# OCR – EXTRACT CBC TABLE FROM SCANNED IMAGES
+# =====================================================
+
 def extract_cbc_from_image(image_bytes: bytes) -> dict:
     """
-    Send an image to OpenAI (vision-capable chat completions) to extract CBC/chemistry.
-    Returns: dict with {"cbc": [{analyte, value, units, reference_low, reference_high}, ...]}
-    Defensive: returns {"cbc": []} on failure.
+    Sends a scanned image to OpenAI Vision to extract CBC + chemistry.
+    Returns dict: { "cbc": [ { analyte, value, units, reference_low, reference_high } ] }
     """
-    try:
-        b64 = base64.b64encode(image_bytes).decode("utf-8")
-        system_prompt = (
-            "You are an OCR assistant extracting laboratory values from a scanned blood report. "
-            "Return ONLY strict JSON with this structure:\n"
-            "{ 'cbc': [ { 'analyte':'', 'value':'', 'units':'', 'reference_low':'', 'reference_high':'' } ] }\n"
-            "Include CBC analytes, differential, platelets, electrolytes, urea, creatinine, LFTs, CK, CRP if present. "
-            "Do not add explanatory text."
-        )
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-        # Use chat completions create with image_url object payload (SDK format)
+    system_prompt = (
+        "You are an OCR assistant for medical lab reports.\n"
+        "Read the image and extract ANY numeric analytes you see – full blood count, "
+        "differential, platelets, CRP, ESR, electrolytes, urea, creatinine, liver enzymes, "
+        "CK, CK-MB, etc.\n"
+        "Return STRICT JSON:\n"
+        "{ 'cbc': [ { 'analyte':'', 'value':'', 'units':'', "
+        "'reference_low':'', 'reference_high':'' } ] }.\n"
+        "Do not add explanations or free text."
+    )
+
+    try:
         resp = client.chat.completions.create(
             model="gpt-4o",
+            response_format={"type": "json_object"},
+            temperature=0,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {
@@ -163,621 +135,606 @@ def extract_cbc_from_image(image_bytes: bytes) -> dict:
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{b64}"}
+                            "image_url": {
+                                "url": f"data:image/png;base64,{b64}"
+                            }
                         }
-                    ],
+                    ]
                 },
             ],
-            response_format={"type": "json_object"},
-            temperature=0.0,
         )
 
-        # defensive parsing
-        choice = resp.choices[0]
-        parsed = safe_get_parsed_from_choice(choice)
-        if isinstance(parsed, dict) and "cbc" in parsed:
-            return parsed
-        # if we got a string containing JSON, try loads
-        if isinstance(parsed, str):
-            try:
-                loaded = json.loads(parsed)
-                if isinstance(loaded, dict) and "cbc" in loaded:
-                    return loaded
-            except:
-                pass
-
-        print("OCR: unexpected structure, returning empty CBC. Raw parsed:", parsed)
-        return {"cbc": []}
+        data = parse_json_from_message(resp.choices[0].message)
+        if not isinstance(data, dict):
+            return {"cbc": []}
+        if "cbc" not in data or not isinstance(data["cbc"], list):
+            data["cbc"] = []
+        return data
 
     except Exception as e:
-        print("OCR error:", e)
-        traceback.print_exc()
+        print("OCR PAGE ERROR:", e)
+        # Never crash – just say “no rows”
         return {"cbc": []}
 
-# ---------------------------
-# AI interpretation (text) -> structured ai_json
-# ---------------------------
+
+# =====================================================
+# INTERPRETATION MODEL
+# =====================================================
+
 def call_ai_on_report(text: str) -> dict:
     """
-    Ask model to interpret a JSON-like CBC content or plain text and return a structured JSON with:
-    patient, cbc[], summary (impression, suggested_follow_up).
-    Defensive parsing similar to OCR.
+    Main interpretation model. Produces a structured JSON:
+    patient, cbc, narrative summary, and basic follow-up text.
+    Route engine will enrich this.
     """
-    try:
-        system_prompt = (
-            "You are AMI, a medical lab interpreter for clinicians. "
-            "You MUST NOT give a formal diagnosis or prescribe. Return STRICT JSON with at least:\n"
-            "{\n"
-            '  "patient": {"name": null, "age": null, "sex": "Unknown"},\n'
-            '  "cbc": [ { "analyte":"", "value":"", "units":"", "reference_low":"", "reference_high":"", "flag":"normal|low|high|unknown" } ],\n'
-            '  "summary": { "impression":"", "suggested_follow_up":"" }\n'
-            "}\n"
-            "If input is already JSON with cbc rows, parse those and add concise clinical impression and follow-up."
-        )
+    MAX_CHARS = 12000
+    if text and len(text) > MAX_CHARS:
+        text = text[:MAX_CHARS]
 
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.05,
-        )
+    system_prompt = (
+        "You are an assistive clinical tool interpreting full blood count (CBC) and "
+        "basic chemistry results.\n\n"
+        "CRITICAL:\n"
+        "- You do NOT diagnose.\n"
+        "- You do NOT prescribe.\n"
+        "- Use phrases like 'may suggest', 'can be compatible with'.\n\n"
+        "INPUT is either:\n"
+        "  • Raw extracted lab text, OR\n"
+        "  • A JSON-like object with a 'cbc' array from OCR.\n\n"
+        "Return STRICT JSON only, with at least:\n"
+        "{\n"
+        "  'patient': { 'name': null, 'age': null, 'sex': 'Unknown' },\n"
+        "  'cbc': [\n"
+        "    {\n"
+        "      'analyte': '', 'value': '', 'units': '',\n"
+        "      'reference_low': '', 'reference_high': '',\n"
+        "      'flag': 'low|normal|high|unknown'\n"
+        "    }\n"
+        "  ],\n"
+        "  'summary': {\n"
+        "    'impression': '',\n"
+        "    'suggested_follow_up': ''\n"
+        "  }\n"
+        "}\n"
+        "If there are no numeric lab values, return an EMPTY 'cbc' array and describe "
+        "that no CBC data could be extracted."
+    )
 
-        choice = resp.choices[0]
-        parsed = safe_get_parsed_from_choice(choice)
-        if isinstance(parsed, dict):
-            return parsed
-        # fallback: if it's a string that looks like JSON
-        if isinstance(parsed, str):
-            try:
-                return json.loads(parsed)
-            except:
-                pass
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        response_format={"type": "json_object"},
+        temperature=0.1,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text or "No readable text provided."}
+        ],
+    )
 
-        # Last fallback: return minimal wrapper
-        return {
-            "patient": {"name": None, "age": None, "sex": "Unknown"},
-            "cbc": [],
-            "summary": {"impression": "No structured interpretation produced.", "suggested_follow_up": ""}
+    data = parse_json_from_message(resp.choices[0].message)
+    if not isinstance(data, dict):
+        raise ValueError("Interpretation result is not a JSON object")
+
+    if "cbc" not in data or not isinstance(data["cbc"], list):
+        data["cbc"] = []
+
+    if "summary" not in data or not isinstance(data["summary"], dict):
+        data["summary"] = {
+            "impression": "",
+            "suggested_follow_up": ""
         }
 
-    except Exception as e:
-        print("AI interpretation error:", e)
-        traceback.print_exc()
-        return {
-            "patient": {"name": None, "age": None, "sex": "Unknown"},
-            "cbc": [],
-            "summary": {"impression": f"AI error: {e}", "suggested_follow_up": ""}
-        }
+    return data
 
-# ---------------------------
-# Build canonical CBC dict for the route engine
-# ---------------------------
-def build_cbc_value_dict(ai_json: dict) -> dict:
+
+# =====================================================
+# BUILD CANONICAL CBC DICT FOR ROUTES
+# =====================================================
+
+def build_cbc_dict(ai_json: dict) -> dict:
     """
-    Convert ai_json['cbc'] list into canonical dictionary keyed by common names (Hb, MCV, MCH, WBC, Neutrophils, etc.)
+    Turn ai_json['cbc'] list into a dict with stable keys:
+      Hb, MCV, MCH, WBC, Neut, Lymph, Plt,
+      Cr, Urea, Na, K, CRP, ALT, AST, ALP, GGT, Bili, CK
     """
     out = {}
     rows = ai_json.get("cbc") or []
+    if not isinstance(rows, list):
+        return out
+
     for r in rows:
         if not isinstance(r, dict):
             continue
-        name = (r.get("analyte") or r.get("test") or "").strip().lower()
+        name = (r.get("analyte") or r.get("test") or "").lower().strip()
         if not name:
             continue
 
-        def put(k):
-            if k not in out:
-                out[k] = r
+        def set_if_empty(key):
+            if key not in out:
+                out[key] = r
 
-        if "haemo" in name or name == "hb" or "hemoglobin" in name:
-            put("Hb")
+        # RBC / Anaemia
+        if "haemoglobin" in name or "hemoglobin" in name or name == "hb":
+            set_if_empty("Hb")
         elif name.startswith("mcv"):
-            put("MCV")
+            set_if_empty("MCV")
         elif name.startswith("mch"):
-            put("MCH")
-        elif "red cell" in name or name == "rbc":
-            put("RBC")
-        elif "white" in name or "wbc" in name or "leucocyte" in name or "leukocyte" in name:
-            put("WBC")
+            set_if_empty("MCH")
+        elif "red cell" in name or "rbc" in name:
+            set_if_empty("RBC")
+
+        # White cells
+        elif "white cell" in name or "wbc" in name or "leucocyte" in name or "leukocyte" in name:
+            set_if_empty("WBC")
         elif "neut" in name:
-            put("Neutrophils")
+            set_if_empty("Neut")
         elif "lymph" in name:
-            put("Lymphocytes")
-        elif "platelet" in name or "plt" in name:
-            put("Platelets")
+            set_if_empty("Lymph")
+        elif "mono" in name:
+            set_if_empty("Mono")
+        elif "eosin" in name:
+            set_if_empty("Eos")
+        elif "baso" in name:
+            set_if_empty("Baso")
+
+        # Platelets
+        elif "platelet" in name or name == "plt":
+            set_if_empty("Plt")
+
+        # Renal
         elif "creatinine" in name:
-            put("Creatinine")
-        elif name.startswith("urea"):
-            put("Urea")
-        elif "alt" in name and "alanine" in name:
-            put("ALT")
-        elif name == "alt":
-            put("ALT")
-        elif "ast" in name:
-            put("AST")
-        elif "alp" in name or "alkaline phosphatase" in name:
-            put("ALP")
-        elif "ggt" in name or "gamma" in name:
-            put("GGT")
-        elif "biliru" in name:
-            put("Bilirubin")
-        elif "creatine kinase" in name or name == "ck":
-            put("CK")
-        elif "ck-mb" in name or "ck mb" in name:
-            put("CK-MB")
+            set_if_empty("Cr")
+        elif "urea" in name:
+            set_if_empty("Urea")
+
+        # Inflammation
+        elif name.startswith("crp") or "c-reactive" in name:
+            set_if_empty("CRP")
+        elif "esr" in name or "sed rate" in name:
+            set_if_empty("ESR")
+
+        # Electrolytes
         elif "sodium" in name or name == "na":
-            put("Sodium")
+            set_if_empty("Na")
         elif "potassium" in name or name == "k":
-            put("Potassium")
-        elif "calcium" in name:
-            put("Calcium")
-        elif "crp" in name:
-            put("CRP")
+            set_if_empty("K")
+        elif "chloride" in name or name == "cl":
+            set_if_empty("Cl")
+        elif "bicarbonate" in name or "hco3" in name or "tco2" in name or "co2" == name:
+            set_if_empty("HCO3")
+
+        # Liver
+        elif name == "alt" or "alanine aminotransferase" in name:
+            set_if_empty("ALT")
+        elif name == "ast" or "aspartate aminotransferase" in name:
+            set_if_empty("AST")
+        elif name == "alp" or "alkaline phosphatase" in name:
+            set_if_empty("ALP")
+        elif "ggt" in name or "gamma glutamyl" in name:
+            set_if_empty("GGT")
+        elif "bilirubin" in name:
+            set_if_empty("Bili")
+
+        # Muscle
+        elif name == "ck" or "creatine kinase" in name:
+            set_if_empty("CK")
+        elif "ck-mb" in name or "ck mb" in name:
+            set_if_empty("CKMB")
 
     return out
 
-# ---------------------------
-# Severity grading & urgency flags
-# ---------------------------
-def evaluate_severity_and_urgency(cdict: dict) -> dict:
-    """
-    Returns:
-    {
-      "severity": "low|moderate|high|critical",
-      "urgency_flags": [ { "reason": "...", "level": "urgent|immediate|monitor" } ],
-      "key_issues": [ "...brief strings..." ]
+
+# =====================================================
+# ROUTE ENGINE V3: PATTERN → ROUTE → NEXT STEPS
+# =====================================================
+
+def make_route(name, pattern, route, steps):
+    return {
+        "name": name,
+        "pattern": pattern,
+        "route": route,
+        "steps": steps,
     }
+
+
+def generate_routes(c: dict):
     """
-    sev_score = 0
-    flags = []
-    key_issues = []
-
-    # helper value extraction
-    v = lambda k: clean_number(cdict.get(k, {}).get("value"))
-
-    Hb = v("Hb")
-    Plt = v("Platelets")
-    WBC = v("WBC")
-    Neut = v("Neutrophils")
-    K = v("Potassium")
-    Cr = v("Creatinine")
-    CK = v("CK")
-
-    # Critical thresholds (conservative)
-    if Hb is not None:
-        if Hb < 6.5:
-            sev_score += 5; flags.append({"reason": f"Hb {Hb} g/dL — severe anaemia", "level": "immediate"}); key_issues.append(f"Hb {Hb}")
-        elif Hb < 8:
-            sev_score += 3; flags.append({"reason": f"Hb {Hb} g/dL — significant anaemia", "level": "urgent"}); key_issues.append(f"Hb {Hb}")
-        elif Hb < 11:
-            sev_score += 1; key_issues.append(f"Hb {Hb} (mild-moderate)")
-
-    if Plt is not None:
-        if Plt < 20:
-            sev_score += 5; flags.append({"reason": f"Platelets {Plt} x10^9/L — very high bleeding risk", "level": "immediate"}); key_issues.append(f"Platelets {Plt}")
-        elif Plt < 50:
-            sev_score += 3; flags.append({"reason": f"Platelets {Plt} x10^9/L — bleeding risk", "level": "urgent"}); key_issues.append(f"Platelets {Plt}")
-
-    if K is not None:
-        if K < 3.0 or K > 6.0:
-            sev_score += 5; flags.append({"reason": f"Potassium {K} mmol/L — arrhythmia risk", "level": "immediate"}); key_issues.append(f"K {K}")
-        elif K < 3.3 or K > 5.5:
-            sev_score += 3; flags.append({"reason": f"Potassium {K} mmol/L — significant", "level": "urgent"}); key_issues.append(f"K {K}")
-
-    if Cr is not None:
-        if Cr > 250:
-            sev_score += 4; flags.append({"reason": f"Creatinine {Cr} µmol/L — possible AKI", "level": "urgent"}); key_issues.append(f"Cr {Cr}")
-        elif Cr > 120:
-            sev_score += 2; key_issues.append(f"Cr {Cr}")
-
-    if CK is not None and CK > 5000:
-        sev_score += 4; flags.append({"reason": f"CK {CK} U/L — possible rhabdomyolysis physiology", "level": "urgent"}); key_issues.append(f"CK {CK}")
-
-    if WBC is not None:
-        if WBC > 25 or WBC < 1:
-            sev_score += 4; flags.append({"reason": f"WBC {WBC} x10^9/L — severe leukocyte abnormality", "level": "urgent"}); key_issues.append(f"WBC {WBC}")
-        elif WBC > 12:
-            sev_score += 1; key_issues.append(f"WBC {WBC}")
-
-    # Map score -> severity
-    if sev_score >= 8:
-        severity = "critical"
-    elif sev_score >= 4:
-        severity = "high"
-    elif sev_score >= 2:
-        severity = "moderate"
-    else:
-        severity = "low"
-
-    return {"severity": severity, "urgency_flags": flags, "key_issues": key_issues}
-
-# ---------------------------
-# Differential diagnosis trees (safe)
-# ---------------------------
-def generate_differential_trees(cdict: dict) -> dict:
+    Takes canonical CBC dict → returns a list of
+    {name, pattern, route, steps[]} objects.
     """
-    Return a safe, non-prescriptive differential suggestion tree keyed by patterns.
-    Example:
-    {
-      "Microcytic anaemia": ["Iron deficiency", "Chronic inflammation", "Thalassemia trait (less likely)"],
-      "Macrocytic anaemia": [...]
-    }
-    """
-    out = {}
-    v = lambda k: clean_number(cdict.get(k, {}).get("value"))
+    v = lambda k: clean_number(c.get(k, {}).get("value"))
 
-    Hb = v("Hb"); MCV = v("MCV"); WBC = v("WBC"); Plt = v("Platelets"); Cr = v("Creatinine"); CRP = v("CRP")
+    Hb   = v("Hb")
+    MCV  = v("MCV")
+    MCH  = v("MCH")
+    WBC  = v("WBC")
+    Neut = v("Neut")
+    Lymph = v("Lymph")
+    Plt  = v("Plt")
+    Cr   = v("Cr")
+    Urea = v("Urea")
+    Na   = v("Na")
+    K    = v("K")
+    CRP  = v("CRP")
+    ALT  = v("ALT")
+    AST  = v("AST")
+    ALP  = v("ALP")
+    GGT  = v("GGT")
+    Bili = v("Bili")
+    CK   = v("CK")
 
-    # Anaemia differentials
+    routes = []
+
+    # ---------------- ANAEMIA ROUTES ----------------
     if Hb is not None and Hb < 13:
         if MCV is not None and MCV < 80:
-            out["Microcytic anaemia"] = [
-                "Iron deficiency (common) — check ferritin & iron studies",
-                "Anaemia of chronic disease/inflammation",
-                "Thalassaemia trait (consider if ferritin normal and family history)"
-            ]
+            routes.append(make_route(
+                name="Microcytic anaemia pattern",
+                pattern=f"Hb {Hb} low with MCV {MCV} low ± low MCH",
+                route="Pattern is compatible with iron deficiency or other microcytic anaemias.",
+                steps=[
+                    "Check ferritin and iron studies.",
+                    "Order reticulocyte count.",
+                    "Review menstrual/blood loss history, diet and chronic disease.",
+                ]
+            ))
         elif MCV is not None and MCV > 100:
-            out["Macrocytic anaemia"] = [
-                "Vitamin B12 or folate deficiency",
-                "Drug or alcohol effect",
-                "Bone marrow disorder (less common)"
-            ]
+            routes.append(make_route(
+                name="Macrocytic anaemia pattern",
+                pattern=f"Hb {Hb} low with MCV {MCV} high",
+                route="Pattern may suggest B12/folate deficiency, liver disease or medication effect.",
+                steps=[
+                    "Check vitamin B12 and folate.",
+                    "Review liver function and alcohol/medication history.",
+                    "Consider thyroid function tests if clinically indicated.",
+                ]
+            ))
         else:
-            out["Normocytic anaemia"] = [
-                "Early iron deficiency",
-                "Renal disease / reduced EPO",
-                "Acute blood loss or chronic disease"
-            ]
+            routes.append(make_route(
+                name="Normocytic anaemia pattern",
+                pattern=f"Hb {Hb} low with MCV in normal range",
+                route="Pattern may be compatible with anaemia of chronic disease, renal disease or early iron deficiency.",
+                steps=[
+                    "Check creatinine/eGFR and CRP/ESR.",
+                    "Consider ferritin and reticulocyte count.",
+                    "Correlate with chronic inflammatory or renal history.",
+                ]
+            ))
 
-    # Thrombocytopenia
-    if Plt is not None and Plt < 150:
-        out.setdefault("Thrombocytopenia", []).extend([
-            "Immune-mediated thrombocytopenia (ITP)",
-            "Drug-induced",
-            "Bone marrow suppression / infiltration",
-            "Sepsis or consumptive processes"
-        ])
-
-    # Leukocytosis
-    if WBC is not None and WBC > 12:
-        if CRP and CRP > 10:
-            out.setdefault("Raised WBC (with inflammation)", []).extend([
-                "Bacterial infection (common)",
-                "Severe inflammatory response (e.g., pancreatitis, large tissue injury)"
-            ])
-        else:
-            out.setdefault("Raised WBC", []).extend([
-                "Inflammation or stress leucocytosis",
-                "Haematologic process (if very high or blasts present) — specialist review"
-            ])
-
-    # Renal / metabolic
-    if Cr is not None and Cr > 120:
-        out.setdefault("Renal impairment", []).extend([
-            "AKI (pre-renal dehydration, sepsis, nephrotoxic drugs)",
-            "Chronic kidney disease (look at past creatinine/eGFR)"
-        ])
-
-    if not out:
-        out["No specific differential patterns triggered"] = ["Correlate clinically and review prior results"]
-
-    return out
-
-# ---------------------------
-# Trend comparison (search prior completed reports by patient name)
-# ---------------------------
-def trend_comparison(patient_name: str, current_cdict: dict) -> dict:
-    """
-    Fetch the last N completed reports and compare main analytes to produce a short trend summary.
-    If patient_name is None or no previous reports, returns informative message.
-    """
-    if not patient_name:
-        return {"note": "No patient name available; trend comparison skipped.", "trends": []}
-
-    try:
-        # Fetch recent completed reports (limit 20) and filter in Python by patient name match
-        res = supabase.table("reports").select("*").eq("ai_status", "completed").order("created_at", {"ascending": False}).limit(20).execute()
-        prior = res.model or []
-        matches = []
-        for r in prior:
-            try:
-                ai = r.get("ai_results") or r.get("ai_results_raw") or {}
-                # ai could be a string or dict
-                if isinstance(ai, str):
-                    try:
-                        ai = json.loads(ai)
-                    except:
-                        ai = {}
-                pname = None
-                if isinstance(ai, dict):
-                    pname = (ai.get("patient") or {}).get("name")
-                if pname and patient_name and pname.strip().lower() == patient_name.strip().lower():
-                    matches.append({"created_at": r.get("created_at"), "ai": ai})
-            except Exception:
-                continue
-
-        if not matches:
-            return {"note": "No prior completed reports found for this patient.", "trends": []}
-
-        # For each analyte of interest, create tiny trend strings comparing most recent prior value to current
-        analytes = ["Hb", "WBC", "Platelets", "Neutrophils", "MCV", "Creatinine", "CRP", "Potassium", "Sodium"]
-        trends = []
-        # take the most recent prior (first in matches)
-        for m in matches[:3]:
-            pass  # we will compute pairwise below
-
-        # Build a mapping of analyte -> list of (date, value)
-        series = {}
-        for m in matches:
-            ai = m["ai"] or {}
-            cbc_list = ai.get("cbc") or []
-            row_map = {}
-            for row in cbc_list:
-                if not isinstance(row, dict): continue
-                analyte = (row.get("analyte") or "").strip()
-                if analyte:
-                    row_map[analyte.lower()] = row
-            created = m.get("created_at") or m.get("createdAt") or ""
-            for a in analytes:
-                # try find by canonical keys too
-                val = None
-                # check canonical keys in ai (some reports may store canonical)
-                if isinstance(ai, dict) and ai.get("cbc"):
-                    for row in ai.get("cbc"):
-                        name = (row.get("analyte") or "").lower()
-                        if a.lower() in name or name == a.lower():
-                            val = clean_number(row.get("value"))
-                            break
-                # append if found
-                if val is not None:
-                    series.setdefault(a, []).append({"date": created, "value": val})
-
-        # Compare most recent prior value to current for each analyte with data
-        for a, points in series.items():
-            # sort by date descending if possible
-            points_sorted = [p for p in points]
-            # if current_cdict contains a key, compare
-            cur_val = clean_number(current_cdict.get(a, {}).get("value"))
-            if cur_val is None:
-                continue
-            # find most recent prior (first point)
-            prior_val = points_sorted[0]["value"] if points_sorted else None
-            if prior_val is None:
-                continue
-            if cur_val > prior_val:
-                trends.append(f"{a}: increased from {prior_val} → {cur_val}")
-            elif cur_val < prior_val:
-                trends.append(f"{a}: decreased from {prior_val} → {cur_val}")
-            else:
-                trends.append(f"{a}: stable at {cur_val}")
-
-        note = f"Compared to {len(matches)} prior completed report(s)."
-        return {"note": note, "trends": trends}
-
-    except Exception as e:
-        print("Trend comparison error:", e)
-        traceback.print_exc()
-        return {"note": "Trend comparison failed: " + str(e), "trends": []}
-
-# ---------------------------
-# Route engine aggregator: Patterns -> Route -> Next Steps
-# also includes severity/urgency/differential/trends
-# ---------------------------
-def build_full_clinical_report(ai_json: dict) -> dict:
-    """
-    Given ai_json (from call_ai_on_report), add:
-    - canonical cdict
-    - routes (list of pattern dicts)
-    - severity & urgency
-    - differential_trees
-    - trend_comparison (if patient name found)
-    """
-    # canonical dict
-    cdict = build_cbc_value_dict(ai_json)
-
-    # routes (reuse earlier generate_routes logic but return rich objects)
-    routes = []
-    # simple mapping to reuse code above (we'll implement inline)
-    v = lambda k: clean_number(cdict.get(k, {}).get("value"))
-
-    Hb = v("Hb"); MCV = v("MCV"); WBC = v("WBC"); Neut = v("Neutrophils"); Lymph = v("Lymphocytes")
-    Plt = v("Platelets"); Cr = v("Creatinine"); CRP = v("CRP"); CK = v("CK"); Na = v("Sodium"); K = v("Potassium")
-
-    # Anaemia
-    if Hb is not None and Hb < 13:
-        if MCV is not None:
-            if MCV < 80:
-                routes.append({
-                    "pattern": "Microcytic anaemia",
-                    "route": "Likely iron deficiency / chronic disease pattern",
-                    "next_steps": ["Order ferritin & iron studies", "Reticulocyte count", "Consider inflammation markers (CRP)"]
-                })
-            elif 80 <= MCV <= 100:
-                routes.append({
-                    "pattern": "Normocytic anaemia",
-                    "route": "Possible chronic disease, renal, or early iron deficiency",
-                    "next_steps": ["Check creatinine & eGFR", "Reticulocyte count", "Clinical correlation"]
-                })
-            else:
-                routes.append({
-                    "pattern": "Macrocytic anaemia",
-                    "route": "Possible B12/folate deficiency or hepatic/drug effect",
-                    "next_steps": ["Order B12 & folate", "Review liver enzymes", "Medication review"]
-                })
-        else:
-            routes.append({
-                "pattern": "Anaemia (MCV unknown)",
-                "route": "Low haemoglobin — further classification needed",
-                "next_steps": ["Obtain MCV/MCH", "Order ferritin & reticulocytes"]
-            })
-
-    # WBC
+    # --------------- WHITE CELL / INFECTION ROUTES ---------------
     if WBC is not None:
         if WBC > 12:
-            detail = "Inflammatory/infective physiology"
-            nexts = []
-            if Neut and Neut > 70:
-                detail = "Neutrophil-predominant — bacterial pattern more likely"
-                nexts.append("Correlate with fever, localising signs; consider antibiotics per clinical context")
-            if Lymph and Lymph > 45:
-                nexts.append("Consider viral causes; review symptom timeline")
-            if not nexts:
-                nexts.append("Correlate clinically; consider CRP and cultures if indicated")
-            routes.append({"pattern": "Leucocytosis", "route": detail, "next_steps": nexts})
-
+            if Neut is not None and Neut > 70:
+                routes.append(make_route(
+                    name="Neutrophil-predominant leukocytosis",
+                    pattern=f"WBC {WBC} with neutrophils {Neut}%",
+                    route="Pattern is compatible with an acute bacterial or inflammatory response.",
+                    steps=[
+                        "Look for clinical source of infection or inflammation.",
+                        "Correlate with CRP and temperature.",
+                        "Consider cultures or imaging depending on clinical picture.",
+                    ]
+                ))
+            elif Lymph is not None and Lymph > 45:
+                routes.append(make_route(
+                    name="Lymphocyte-predominant leukocytosis",
+                    pattern=f"WBC {WBC} with lymphocytes {Lymph}%",
+                    route="Pattern can be seen in viral infections or recovery from infection.",
+                    steps=[
+                        "Review history for recent viral illness or atypical infections.",
+                        "Repeat CBC if clinically indicated.",
+                        "Consider specific viral testing if symptoms suggest.",
+                    ]
+                ))
+            else:
+                routes.append(make_route(
+                    name="Raised white cell count",
+                    pattern=f"WBC {WBC} elevated",
+                    route="Non-specific leukocytosis; may reflect infection, inflammation, stress or steroid effect.",
+                    steps=[
+                        "Review medications (especially steroids).",
+                        "Correlate with CRP, temperature and symptoms.",
+                        "Repeat CBC if picture remains unclear.",
+                    ]
+                ))
         elif WBC < 4:
-            routes.append({"pattern": "Leukopenia", "route": "Viral suppression, bone marrow effect, or drugs", "next_steps": ["Medication review", "Repeat CBC", "Consider specialist review if persistent"]})
+            routes.append(make_route(
+                name="Leukopenia route",
+                pattern=f"WBC {WBC} reduced",
+                route="Low white cell count can be seen with viral suppression, marrow disorders or medication effects.",
+                steps=[
+                    "Review recent viral illness and medications (e.g. chemotherapy, immunosuppressants).",
+                    "Check differential count and previous results.",
+                    "Consider repeat CBC and further evaluation if persistent.",
+                ]
+            ))
 
-    # Platelets
+    # --------------- PLATELET ROUTES ---------------
     if Plt is not None:
         if Plt < 150:
-            routes.append({"pattern": "Thrombocytopenia", "route": "Bleeding risk assessment", "next_steps": ["Assess bleeding symptoms", "Review drugs and previous CBCs", "Consider haematology review if <50"]})
+            routes.append(make_route(
+                name="Thrombocytopenia route",
+                pattern=f"Platelet count {Plt} x10^9/L",
+                route="Low platelet count may increase bleeding risk and can be immune, consumptive, marrow or drug related.",
+                steps=[
+                    "Review medication history and infections.",
+                    "Check for bruising/bleeding and correlate with coagulation tests.",
+                    "Consider repeat count and haematology opinion if significantly reduced.",
+                ]
+            ))
         elif Plt > 450:
-            routes.append({"pattern": "Thrombocytosis", "route": "Reactive vs primary thrombocytosis", "next_steps": ["Check CRP/INFLAMMATION", "Repeat CBC", "Consider iron studies"]})
+            routes.append(make_route(
+                name="Thrombocytosis route",
+                pattern=f"Platelet count {Plt} x10^9/L",
+                route="Raised platelets are often reactive (infection, inflammation, iron deficiency) but can be clonal.",
+                steps=[
+                    "Look for infection, inflammation or iron deficiency.",
+                    "Review previous platelet counts.",
+                    "Consider haematology opinion if persistently very high.",
+                ]
+            ))
 
-    # Kidney / LFT / CK
-    if Cr is not None and Cr > 120:
-        routes.append({"pattern": "Renal impairment physiology", "route": "Assess for AKI or CKD", "next_steps": ["Repeat U&E", "Review meds & hydration", "Consider eGFR"]})
+    # --------------- RENAL ROUTES ---------------
+    if Cr is not None:
+        if Cr > 120:
+            routes.append(make_route(
+                name="Renal impairment route",
+                pattern=f"Creatinine {Cr} elevated",
+                route="Pattern suggests reduced renal function (acute or chronic).",
+                steps=[
+                    "Review baseline creatinine and eGFR.",
+                    "Assess hydration status, blood pressure and nephrotoxic drugs.",
+                    "Repeat U&E and monitor trend.",
+                ]
+            ))
 
-    if CK is not None and CK > 1000:
-        routes.append({"pattern": "High CK", "route": "Muscle injury / rhabdomyolysis physiology", "next_steps": ["Check creatinine", "Assess for muscle pain/trauma", "Urgent review if creatinine rising"]})
+    if Urea is not None and Urea > 8:
+        routes.append(make_route(
+            name="Raised urea route",
+            pattern=f"Urea {Urea} elevated",
+            route="May reflect dehydration, high protein load or renal impairment.",
+            steps=[
+                "Interpret together with creatinine and clinical hydration.",
+                "Review gastrointestinal bleeding risk if symptoms suggest.",
+            ]
+        ))
 
-    # Electrolytes urgency included separately in severity function
+    # --------------- ELECTROLYTE ROUTES ---------------
+    if K is not None:
+        if K < 3.3:
+            routes.append(make_route(
+                name="Hypokalaemia route",
+                pattern=f"Potassium {K} mmol/L (low)",
+                route="Low potassium can increase arrhythmia risk.",
+                steps=[
+                    "Review medications (diuretics, β-agonists, insulin).",
+                    "Check for vomiting/diarrhoea and magnesium status.",
+                    "Obtain ECG if symptomatic or markedly low.",
+                ]
+            ))
+        elif K > 5.5:
+            routes.append(make_route(
+                name="Hyperkalaemia route",
+                pattern=f"Potassium {K} mmol/L (high)",
+                route="High potassium may be life-threatening due to arrhythmia risk.",
+                steps=[
+                    "Repeat potassium urgently to exclude sample artefact.",
+                    "Obtain ECG and correlate with symptoms.",
+                    "Consider urgent treatment pathway according to local protocol.",
+                ]
+            ))
+
+    if Na is not None:
+        if Na < 133:
+            routes.append(make_route(
+                name="Hyponatraemia route",
+                pattern=f"Sodium {Na} mmol/L (low)",
+                route="Hyponatraemia can reflect fluid overload, endocrine causes or diuretic use.",
+                steps=[
+                    "Assess volume status (hypo/eu/hypervolaemia).",
+                    "Review medications (diuretics, antidepressants).",
+                    "Check serum and urine osmolality if workup is needed.",
+                ]
+            ))
+        elif Na > 146:
+            routes.append(make_route(
+                name="Hypernatraemia route",
+                pattern=f"Sodium {Na} mmol/L (high)",
+                route="Hypernatraemia usually reflects water loss exceeding sodium loss.",
+                steps=[
+                    "Assess fluid intake and losses (fever, diarrhoea, diabetes insipidus).",
+                    "Correct gradually with careful fluid management.",
+                ]
+            ))
+
+    # --------------- INFLAMMATION ROUTES ---------------
+    if CRP is not None:
+        if CRP > 10:
+            routes.append(make_route(
+                name="Raised CRP route",
+                pattern=f"CRP {CRP} mg/L elevated",
+                route="Elevated CRP indicates an inflammatory or infective process.",
+                steps=[
+                    "Correlate with WBC, temperature and symptoms.",
+                    "Look for source of infection or inflammation.",
+                    "Use trend (rising/falling) to monitor response to treatment.",
+                ]
+            ))
+
+    # --------------- LIVER / MUSCLE ROUTES ---------------
+    liver_vals = [ALT, AST, ALP, GGT, Bili]
+    if any(vv is not None and vv > 1.5 for vv in liver_vals):
+        routes.append(make_route(
+            name="Liver function abnormal route",
+            pattern="One or more liver markers elevated",
+            route="Pattern suggests possible hepatic or cholestatic process.",
+            steps=[
+                "Review medications, alcohol intake and viral risk factors.",
+                "Examine for jaundice or hepatomegaly.",
+                "Consider liver ultrasound or further serology if clinically indicated.",
+            ]
+        ))
+
+    if CK is not None and CK > 300:
+        routes.append(make_route(
+            name="Muscle injury / CK route",
+            pattern=f"CK {CK} U/L elevated",
+            route="Raised CK may indicate muscle injury (exercise, trauma, myositis, statins, etc.).",
+            steps=[
+                "Review recent exercise, trauma and medications (e.g. statins).",
+                "Consider repeat CK and renal function monitoring if markedly raised.",
+            ]
+        ))
 
     if not routes:
-        routes.append({"pattern": "No major patterns detected", "route": "Results within expected ranges", "next_steps": ["Correlate clinically and review prior results"]})
+        routes.append(make_route(
+            name="No major route triggered",
+            pattern="No clearly abnormal CBC or chemistry thresholds met.",
+            route="No specific route-level pattern identified from available results.",
+            steps=[
+                "Correlate with history, examination and prior results.",
+                "Repeat testing if symptoms change or persist.",
+            ]
+        ))
 
-    # severity & urgency
-    sev = evaluate_severity_and_urgency(cdict)
+    return routes
 
-    # differential trees
-    diffs = generate_differential_trees(cdict)
 
-    # trend comparison
-    patient_name = None
-    try:
-        patient_name = (ai_json.get("patient") or {}).get("name")
-    except:
-        patient_name = None
-    trends = trend_comparison(patient_name, cdict)
+# =====================================================
+# PROCESS A SINGLE REPORT
+# =====================================================
 
-    # Compose final augmented report
-    augmented = dict(ai_json)  # shallow copy
-    augmented["_canonical_cbc"] = cdict
-    augmented["_routes"] = routes
-    augmented["_severity"] = sev
-    augmented["_differential_trees"] = diffs
-    augmented["_trend_comparison"] = trends
-    augmented["_generated_at"] = iso_now()
-
-    return augmented
-
-# ---------------------------
-# Main report processing
-# ---------------------------
 def process_report(job: dict) -> dict:
-    report_id = job.get("id")
+    report_id = job["id"]
     file_path = job.get("file_path")
     l_text = job.get("l_text") or ""
 
-    print(f"Processing report {report_id} ...")
-
-    if not file_path:
-        err = f"Missing file_path for report {report_id}"
-        print("⚠️", err)
-        supabase.table("reports").update({"ai_status": "failed", "ai_error": err}).eq("id", report_id).execute()
-        return {"error": err}
-
-    # download file bytes
-    pdf_res = supabase.storage.from_(BUCKET).download(file_path)
-    if hasattr(pdf_res, "data"):
-        pdf_bytes = pdf_res.data
-    else:
-        pdf_bytes = pdf_res
-
-    text = extract_text_from_pdf(pdf_bytes)
-    scanned = is_scanned_pdf(text)
-    print(f"Report {report_id}: scanned={scanned}, extracted_text_len={len(text)}")
-
-    merged_text_for_ai = ""
-    extracted_rows = []
-
     try:
+        if not file_path or str(file_path).strip() == "":
+            err = f"Missing file_path for report {report_id}"
+            print("⚠️", err)
+            supabase.table("reports").update(
+                {"ai_status": "failed", "ai_error": err}
+            ).eq("id", report_id).execute()
+            return {"error": err}
+
+        pdf_bytes = supabase.storage.from_(BUCKET).download(file_path)
+        if hasattr(pdf_bytes, "data"):
+            pdf_bytes = pdf_bytes.data
+
+        text = extract_text_from_pdf(pdf_bytes)
+        scanned = is_scanned_pdf(text)
+        print(f"Report {report_id}: scanned={scanned}, text_length={len(text)}")
+
+        # --------- SCANNED PDF: OCR PATH ----------
         if scanned:
-            print("SCANNED PDF -> running OCR per page")
-            pages = convert_from_bytes(pdf_bytes)
-            for i, page_img in enumerate(pages, start=1):
-                print(f" OCR page {i} ...")
+            print(f"📄 Report {report_id}: SCANNED PDF → OCR pipeline")
+            images = convert_from_bytes(pdf_bytes)
+            all_rows = []
+
+            for idx, img in enumerate(images, start=1):
+                print(f"OCR on page {idx}…")
                 buf = io.BytesIO()
-                page_img.save(buf, format="PNG")
-                page_bytes = buf.getvalue()
-                ocr_out = extract_cbc_from_image(page_bytes)
-                if isinstance(ocr_out, dict) and "cbc" in ocr_out and ocr_out["cbc"]:
-                    extracted_rows.extend(ocr_out["cbc"])
+                img.save(buf, format="PNG")
+                ocr_data = extract_cbc_from_image(buf.getvalue())
+                rows = ocr_data.get("cbc") or []
+                if rows:
+                    print(f" → {len(rows)} rows extracted on page {idx}")
+                    all_rows.extend(rows)
                 else:
-                    print(f"  → no cbc rows found on page {i}")
-            if not extracted_rows:
-                raise ValueError("No CBC extracted from any page via OCR")
-            merged_text_for_ai = json.dumps({"cbc": extracted_rows}, ensure_ascii=False)
+                    print(f" → No CBC rows recognised on page {idx}")
+
+            if all_rows:
+                merged_text = json.dumps({"cbc": all_rows}, ensure_ascii=False)
+            else:
+                print("⚠️ OCR found no numeric CBC data; falling back to text (if any).")
+                merged_text = text or l_text or "No numeric lab values detected."
+
+        # --------- DIGITAL PDF: TEXT PATH ----------
         else:
-            # digital/text PDF
-            merged_text_for_ai = text or l_text
-            if not merged_text_for_ai.strip():
-                raise ValueError("No usable text extracted from digital PDF")
+            print(f"📝 Report {report_id}: Digital PDF → text interpreter")
+            merged_text = text or l_text or "No readable text detected."
 
-        # 1) call AI interpretation
-        print("Calling AI interpretation...")
-        ai_json = call_ai_on_report(merged_text_for_ai)
+        # --------- MAIN INTERPRETATION ----------
+        ai_json = call_ai_on_report(merged_text)
 
-        # 2) build augmented clinical report (routes, severity, diffs, trends)
-        print("Building clinical augmentation...")
-        augmented = build_full_clinical_report(ai_json)
+        # --------- ROUTE ENGINE ----------
+        try:
+            cbc_dict = build_cbc_dict(ai_json)
+            routes = generate_routes(cbc_dict)
+            ai_json["routes"] = routes
 
-        # 3) store results
-        supabase.table("reports").update({
-            "ai_status": "completed",
-            "ai_results": augmented,
-            "ai_error": None
-        }).eq("id", report_id).execute()
+            # Also add a short one-line summary of routes for UIs that only show text
+            route_names = [r["name"] for r in routes] if routes else []
+            if route_names:
+                extra = "Routes considered: " + "; ".join(route_names) + "."
+                summary = ai_json.get("summary", {})
+                old_follow = summary.get("suggested_follow_up", "") or ""
+                summary["suggested_follow_up"] = (old_follow + "\n" + extra).strip()
+                ai_json["summary"] = summary
+        except Exception as e:
+            print("Route engine error:", e)
+            traceback.print_exc()
+
+        supabase.table("reports").update(
+            {
+                "ai_status": "completed",
+                "ai_results": ai_json,
+                "ai_error": None,
+            }
+        ).eq("id", report_id).execute()
 
         print(f"✅ Report {report_id} processed successfully")
-        return {"success": True, "data": augmented}
+        return {"success": True, "data": ai_json}
 
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
         print(f"❌ Error processing report {report_id}: {err}")
         traceback.print_exc()
-        supabase.table("reports").update({"ai_status": "failed", "ai_error": err}).eq("id", report_id).execute()
+
+        supabase.table("reports").update(
+            {"ai_status": "failed", "ai_error": err}
+        ).eq("id", report_id).execute()
+
         return {"error": err}
 
-# ---------------------------
-# Main worker loop (fixed .model handling)
-# ---------------------------
+
+# =====================================================
+# WORKER LOOP
+# =====================================================
+
 def main():
-    print("Entering main loop...")
+    print("AMI Worker with OCR + Route Engine V3 started – watching for jobs.")
     while True:
         try:
-            res = supabase.table("reports").select("*").eq("ai_status", "pending").limit(1).execute()
-            # supabase client returns APIResponse-like object — read `.model` for rows
-            jobs = getattr(res, "model", None) or []
+            res = (
+                supabase.table("reports")
+                .select("*")
+                .eq("ai_status", "pending")
+                .limit(1)
+                .execute()
+            )
+            jobs = res.data or []
+
             if not jobs:
                 print("No jobs...")
                 time.sleep(1)
                 continue
 
             job = jobs[0]
-            print(f"🔎 Found job {job.get('id')}")
-            supabase.table("reports").update({"ai_status": "processing"}).eq("id", job.get("id")).execute()
+            job_id = job["id"]
+            print(f"🔎 Found job {job_id}")
+
+            supabase.table("reports").update(
+                {"ai_status": "processing"}
+            ).eq("id", job_id).execute()
 
             process_report(job)
 
         except Exception as e:
             print("LOOP ERROR:", e)
             traceback.print_exc()
-            time.sleep(1)
+            time.sleep(3)
+
 
 if __name__ == "__main__":
     main()
