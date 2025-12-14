@@ -450,8 +450,56 @@ def canonical_map(parsed: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]
             }
     except Exception:
         pass
+    # -----------------------------
+    # Derived renal metrics (safe)
+    # -----------------------------
+    try:
+        creat = out.get("Creatinine", {}).get("value")
+        age = None
+        sex = None
 
-    return out
+        # age/sex only available later — skip if missing
+        # eGFR is finalized in process_report()
+        if creat is not None:
+            out.setdefault("_derived", {})["creatinine_present"] = True
+    except Exception:
+        pass
+    # -----------------------------
+    # Lipid normalization (naming)
+    # -----------------------------
+    lipid_aliases = {
+        "LDL Cholesterol": "LDL",
+        "LDL-C": "LDL",
+        "Triglyceride": "Triglycerides",
+        "Non HDL": "Non-HDL",
+        "Non-HDL Cholesterol": "Non-HDL",
+        "HDL Cholesterol": "HDL"
+    }
+
+    for src, dest in lipid_aliases.items():
+        if src in out and dest not in out:
+            out[dest] = out[src]
+
+    # -----------------------------
+    # Hard safety flags (never allow "normal")
+    # -----------------------------
+    try:
+        crp = out.get("CRP", {}).get("value")
+        egfr = out.get("eGFR", {}).get("value")
+        plate = out.get("Platelets", {}).get("value")
+
+        if crp is not None and crp >= 10:
+            out.setdefault("_safety_flags", []).append("CRP elevated")
+
+        if egfr is not None and egfr < 60:
+            out.setdefault("_safety_flags", []).append("Reduced eGFR")
+
+        if plate is not None and plate < 100:
+            out.setdefault("_safety_flags", []).append("Thrombocytopenia")
+    except Exception:
+        pass
+
+     return out
 # -----------------------------
 # eGFR calculation (CKD-EPI 2021, race-free)
 # -----------------------------
@@ -872,6 +920,12 @@ def route_engine_all(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[st
     # FINAL SEVERITY & SUMMARY
     # -------------------------
     overall_sev = max(severity_scores) if severity_scores else 1
+    # -----------------------------
+    # DOCTOR TRUST OVERRIDE
+    # -----------------------------
+    if doctor_trust_flags["has_long_term_risk"] and overall_sev == 1:
+        overall_sev = 2  # borderline / non-normal
+
     color = COLOR_MAP.get(overall_sev, COLOR_MAP[1])
     urgency = color["urgency"]
 
@@ -1141,7 +1195,29 @@ def process_report(job: Dict[str, Any]) -> Dict[str, Any]:
             parsed = parse_values_from_text(merged_text_for_ai)
 
         canonical = canonical_map(parsed)
-                # -----------------------------
+        # ==============================
+        # HARD DOCTOR-TRUST GUARDRAILS
+        # ==============================
+        doctor_trust_flags = {
+            "has_acute_risk": False,
+            "has_long_term_risk": False
+        }
+
+        # ---- LONG-TERM CARDIOVASCULAR RISK (NEVER NORMAL) ----
+        ldl = canonical.get("LDL", {}).get("value")
+        triglycerides = canonical.get("Triglycerides", {}).get("value")
+        non_hdl = canonical.get("Non-HDL", {}).get("value")
+
+        if ldl is not None and ldl >= 3.0:
+            doctor_trust_flags["has_long_term_risk"] = True
+
+        if triglycerides is not None and triglycerides >= 1.7:
+            doctor_trust_flags["has_long_term_risk"] = True
+
+        if non_hdl is not None and non_hdl >= 3.4:
+            doctor_trust_flags["has_long_term_risk"] = True
+
+        # -----------------------------
         # eGFR calculation (CKD-EPI 2021, race-free)
         # -----------------------------
         creat = canonical.get("Creatinine", {}).get("value")
