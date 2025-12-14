@@ -890,6 +890,93 @@ def trend_analysis(current: Dict[str, Dict[str, Any]], previous: Optional[Dict[s
         except:
             pass
     return {"trend": diffs}
+# -----------------------------
+# Risk domain analysis (acute vs long-term)
+# -----------------------------
+def compute_risk_domains(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Adds clinician-style risk stratification without changing severity.
+    Separates acute danger from long-term risk.
+    """
+
+    risks = {
+        "acute": [],
+        "cardiovascular": [],
+        "renal": [],
+        "infection": [],
+        "hepatic": [],
+        "metabolic": [],
+        "notes": []
+    }
+
+    age = patient_meta.get("age")
+    sex = (patient_meta.get("sex") or "").lower()
+
+    # -----------------------------
+    # Cardiovascular risk (long-term)
+    # -----------------------------
+    LDL = canonical.get("LDL", {}).get("value")
+    TG = canonical.get("Triglycerides", {}).get("value")
+    HDL = canonical.get("HDL", {}).get("value")
+    NonHDL = canonical.get("Non-HDL", {}).get("value")
+
+    if LDL is not None and LDL > 3.0:
+        risks["cardiovascular"].append("Elevated LDL cholesterol")
+
+    if TG is not None and TG > 1.7:
+        risks["cardiovascular"].append("Elevated triglycerides")
+
+    if NonHDL is not None and NonHDL > 3.4:
+        risks["cardiovascular"].append("Elevated non-HDL cholesterol")
+
+    if HDL is not None:
+        if (sex == "male" and HDL < 1.0) or (sex == "female" and HDL < 1.3):
+            risks["cardiovascular"].append("Low HDL cholesterol")
+
+    if risks["cardiovascular"]:
+        risks["notes"].append(
+            "Lipid abnormalities increase long-term cardiovascular risk but are not acutely dangerous."
+        )
+
+    # -----------------------------
+    # Renal risk
+    # -----------------------------
+    eGFR = canonical.get("eGFR", {}).get("value")
+    Creat = canonical.get("Creatinine", {}).get("value")
+
+    if eGFR is not None:
+        if eGFR < 30:
+            risks["renal"].append("Severe renal impairment")
+        elif eGFR < 60:
+            risks["renal"].append("Moderate chronic kidney disease")
+
+    # -----------------------------
+    # Infection / inflammation
+    # -----------------------------
+    CRP = canonical.get("CRP", {}).get("value")
+    WBC = canonical.get("WBC", {}).get("value")
+
+    if CRP is not None and CRP > 10:
+        risks["infection"].append("Inflammatory or infectious process likely")
+
+    if WBC is not None and WBC > 11:
+        risks["infection"].append("Leukocytosis — correlate clinically")
+
+    # -----------------------------
+    # Liver / bilirubin logic
+    # -----------------------------
+    Bili = canonical.get("Bilirubin", {}).get("value")
+    ALT = canonical.get("ALT", {}).get("value")
+    AST = canonical.get("AST", {}).get("value")
+
+    if Bili is not None and Bili > 21:
+        if not (ALT and ALT > 50) and not (AST and AST > 50):
+            risks["hepatic"].append("Isolated mild bilirubin elevation")
+            risks["notes"].append(
+                "Isolated bilirubin elevation with normal enzymes is commonly benign (e.g. Gilbert syndrome)."
+            )
+
+    return risks
 
 # -----------------------------
 # Interpreter wrapper (final AI summary) - uses gpt-4o-mini
@@ -1034,6 +1121,102 @@ def process_report(job: Dict[str, Any]) -> Dict[str, Any]:
         trends = trend_analysis(canonical, previous)
         route_info = route_engine_all(canonical, {"age": patient_age, "sex": patient_sex}, previous)
 
+        # ==============================
+# RISK DOMAIN ANALYSIS (ACUTE vs LONG-TERM)
+# ==============================
+
+risk_domains = {
+    "acute_risk": [],
+    "long_term_risk": [],
+    "data_quality_flags": []
+}
+
+# ---------- Renal risk ----------
+creat = canonical.get("Creatinine", {}).get("value")
+egfr = canonical.get("eGFR (CKD-EPI)", {}).get("value")
+
+
+if egfr is not None:
+    if egfr < 30:
+        risk_domains["acute_risk"].append({
+            "domain": "renal",
+            "level": "high",
+            "reason": f"Severely reduced eGFR ({egfr}) – possible AKI or advanced CKD"
+        })
+    elif egfr < 60:
+        risk_domains["long_term_risk"].append({
+            "domain": "renal",
+            "level": "moderate",
+            "reason": f"Reduced eGFR ({egfr}) – chronic kidney disease risk"
+        })
+
+# ---------- Inflammation / infection ----------
+crp = canonical.get("CRP", {}).get("value")
+
+if crp is not None:
+    if crp >= 50:
+        risk_domains["acute_risk"].append({
+            "domain": "infection",
+            "level": "high",
+            "reason": f"Markedly elevated CRP ({crp}) – significant inflammatory or infectious process"
+        })
+    elif crp >= 10:
+        risk_domains["acute_risk"].append({
+            "domain": "infection",
+            "level": "moderate",
+            "reason": f"Elevated CRP ({crp}) – active inflammation"
+        })
+
+# ---------- Cardiovascular (long-term) ----------
+ldl = canonical.get("LDL", {}).get("value")
+trig = canonical.get("Triglycerides", {}).get("value")
+non_hdl = canonical.get("Non-HDL", {}).get("value")
+
+if ldl is not None and ldl >= 3.0:
+    risk_domains["long_term_risk"].append({
+        "domain": "cardiovascular",
+        "level": "moderate",
+        "reason": f"Elevated LDL cholesterol ({ldl}) increasing long-term cardiovascular risk"
+    })
+
+if trig is not None and trig >= 2.0:
+    risk_domains["long_term_risk"].append({
+        "domain": "cardiovascular",
+        "level": "moderate",
+        "reason": f"Elevated triglycerides ({trig}) increasing metabolic and cardiovascular risk"
+    })
+
+if non_hdl is not None and non_hdl >= 3.7:
+    risk_domains["long_term_risk"].append({
+        "domain": "cardiovascular",
+        "level": "moderate",
+        "reason": f"Elevated non-HDL cholesterol ({non_hdl})"
+    })
+
+# ---------- Bilirubin consistency ----------
+bili_total = canonical.get("Bilirubin Total", {}).get("value")
+bili_conj = canonical.get("Bilirubin Conjugated", {}).get("value")
+bili_unconj = canonical.get("Bilirubin Unconjugated", {}).get("value")
+
+if None not in (bili_total, bili_conj, bili_unconj):
+    if abs((bili_conj + bili_unconj) - bili_total) > 2:
+        risk_domains["data_quality_flags"].append({
+            "issue": "bilirubin_inconsistency",
+            "reason": "Conjugated + unconjugated bilirubin does not equal total – possible transcription or lab artifact"
+        })
+
+# ---------- Fail-safe ----------
+if not risk_domains["acute_risk"] and not risk_domains["long_term_risk"]:
+    risk_domains["summary"] = "No acute pathology detected. No significant long-term risk markers identified."
+else:
+    risk_domains["summary"] = (
+        "Acute risks present." if risk_domains["acute_risk"]
+        else "No acute pathology. Long-term risk factors identified."
+    )
+
+# ==============================
+
+
         # interpreter: pass structured canonical JSON if available for better outputs
         ai_input = merged_text_for_ai if merged_text_for_ai else json.dumps({"canonical": canonical})
         interpretation = call_ai_on_report(ai_input)
@@ -1043,6 +1226,7 @@ def process_report(job: Dict[str, Any]) -> Dict[str, Any]:
             "scanned": scanned,
             "canonical": canonical,
             "routes": route_info,
+            "risk_domains": risk_domains,
             "trends": trends,
             "ai_interpretation": interpretation
         }
