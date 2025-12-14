@@ -616,7 +616,13 @@ def score_severity_key(key: str, val: Optional[float], ag: str, sex: str) -> int
         return 1
     return 1
 
-def route_engine_all(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[str, Any], previous: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def route_engine_all(
+    canonical: Dict[str, Dict[str, Any]],
+    patient_meta: Dict[str, Any],
+    previous: Optional[Dict[str, Any]] = None,
+    doctor_trust_flags: Optional[Dict[str, bool]] = None
+) -> Dict[str, Any]:
+
     """
     Massive route engine covering many routes. Returns:
     { patterns, routes, next_steps, differential, per_key, overall_severity, urgency, color, tw_class, age_group, age_note, summary }
@@ -630,6 +636,12 @@ def route_engine_all(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[st
     ddx = []
     per_key = {}
     severity_scores = []
+        if not doctor_trust_flags:
+        doctor_trust_flags = {
+            "has_acute_risk": False,
+            "has_long_term_risk": False
+        }
+
 
     # build per_key and severity list
     for k, v in canonical.items():
@@ -1243,7 +1255,13 @@ def process_report(job: Dict[str, Any]) -> Dict[str, Any]:
             previous = None
 
         trends = trend_analysis(canonical, previous)
-        route_info = route_engine_all(canonical, {"age": patient_age, "sex": patient_sex}, previous)
+       route_info = route_engine_all(
+    canonical,
+    {"age": patient_age, "sex": patient_sex},
+    previous,
+    doctor_trust_flags
+)
+
         # ==============================
         # RISK DOMAIN ANALYSIS (ACUTE vs LONG-TERM)
         # ==============================
