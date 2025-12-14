@@ -499,7 +499,7 @@ def canonical_map(parsed: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]
     except Exception:
         pass
 
-     return out
+    return out
 # -----------------------------
 # eGFR calculation (CKD-EPI 2021, race-free)
 # -----------------------------
