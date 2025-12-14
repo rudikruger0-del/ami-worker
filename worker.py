@@ -452,6 +452,41 @@ def canonical_map(parsed: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]
         pass
 
     return out
+# -----------------------------
+# eGFR calculation (CKD-EPI 2021, race-free)
+# -----------------------------
+def calculate_egfr(creatinine_umol: float, age: float, sex: str) -> Optional[float]:
+    """
+    CKD-EPI 2021 equation (race-free)
+    Creatinine in µmol/L
+    """
+    try:
+        if creatinine_umol is None or age is None:
+            return None
+
+        scr = creatinine_umol / 88.4  # convert µmol/L → mg/dL
+        sex = (sex or "").lower()
+
+        if sex == "female":
+            k = 0.7
+            a = -0.241
+            sex_factor = 1.012
+        else:
+            k = 0.9
+            a = -0.302
+            sex_factor = 1.0
+
+        egfr = (
+            142
+            * min(scr / k, 1) ** a
+            * max(scr / k, 1) ** -1.200
+            * (0.9938 ** age)
+            * sex_factor
+        )
+
+        return round(egfr, 1)
+    except Exception:
+        return None
 
 
 # -----------------------------
@@ -1106,6 +1141,19 @@ def process_report(job: Dict[str, Any]) -> Dict[str, Any]:
             parsed = parse_values_from_text(merged_text_for_ai)
 
         canonical = canonical_map(parsed)
+                # -----------------------------
+        # eGFR calculation (CKD-EPI 2021, race-free)
+        # -----------------------------
+        creat = canonical.get("Creatinine", {}).get("value")
+        if creat is not None and patient_age:
+            egfr = calculate_egfr(creat, patient_age, patient_sex)
+            if egfr is not None:
+                canonical["eGFR"] = {
+                    "value": round(egfr, 1),
+                    "units": "mL/min/1.73m²",
+                    "raw": "calculated (CKD-EPI 2021)"
+                }
+
 
         # fetch previous ai_results for trend analysis
         previous = None
