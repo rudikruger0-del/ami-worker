@@ -769,77 +769,77 @@ def route_engine_all(canonical: Dict[str, Dict[str, Any]], patient_meta: Dict[st
     # dedupe ddx
     ddx = list(dict.fromkeys([d for d in ddx if d]))
 
-# =========================
-# DOMINANT THREAT OVERRIDE (doctor-priority logic)
-# =========================
+    # =========================
+    # DOMINANT THREAT OVERRIDE (doctor-priority logic)
+    # =========================
 
-# Severe thrombocytopenia dominates everything
-if Plate is not None:
-    if Plate < 50:
+    # Severe thrombocytopenia dominates everything
+    if Plate is not None:
+        if Plate < 50:
+            severity_scores.append(5)
+            patterns.insert(0, {
+                "pattern": "severe thrombocytopenia",
+                "reason": f"Platelets {Plate}"
+            })
+            routes.insert(0, "Severe thrombocytopenia route")
+        elif Plate < 100:
+            severity_scores.append(4)
+            patterns.insert(0, {
+                "pattern": "high-risk thrombocytopenia",
+                "reason": f"Platelets {Plate}"
+            })
+            routes.insert(0, "High-risk thrombocytopenia route")
+
+    # Rhabdomyolysis overrides anaemia & infection
+    if CK is not None:
+        if CK > 10000:
+            severity_scores.append(5)
+            patterns.insert(0, {
+                "pattern": "severe rhabdomyolysis",
+                "reason": f"CK {CK}"
+            })
+            routes.insert(0, "Rhabdomyolysis / muscle injury route")
+        elif CK > 5000:
+            severity_scores.append(4)
+            patterns.insert(0, {
+                "pattern": "rhabdomyolysis",
+                "reason": f"CK {CK}"
+            })
+            routes.insert(0, "Rhabdomyolysis route")
+
+    # Critical electrolytes
+    if K is not None and (K < 3.0 or K > 6.0):
         severity_scores.append(5)
         patterns.insert(0, {
-            "pattern": "severe thrombocytopenia",
-            "reason": f"Platelets {Plate}"
+            "pattern": "life-threatening potassium disturbance",
+            "reason": f"K {K}"
         })
-        routes.insert(0, "Severe thrombocytopenia route")
-    elif Plate < 100:
-        severity_scores.append(4)
-        patterns.insert(0, {
-            "pattern": "high-risk thrombocytopenia",
-            "reason": f"Platelets {Plate}"
-        })
-        routes.insert(0, "High-risk thrombocytopenia route")
+        routes.insert(0, "Critical electrolyte disturbance route")
 
-# Rhabdomyolysis overrides anaemia & infection
-if CK is not None:
-    if CK > 10000:
+    if Na is not None and (Na < 120 or Na > 160):
         severity_scores.append(5)
         patterns.insert(0, {
-            "pattern": "severe rhabdomyolysis",
-            "reason": f"CK {CK}"
+            "pattern": "life-threatening sodium disturbance",
+            "reason": f"Na {Na}"
         })
-        routes.insert(0, "Rhabdomyolysis / muscle injury route")
-    elif CK > 5000:
-        severity_scores.append(4)
+        routes.insert(0, "Critical electrolyte disturbance route")
+
+    # Severe neutropenia
+    if Neut is not None and Neut < 0.5:
+        severity_scores.append(5)
         patterns.insert(0, {
-            "pattern": "rhabdomyolysis",
-            "reason": f"CK {CK}"
+            "pattern": "severe neutropenia",
+            "reason": f"Neutrophils {Neut}"
         })
-        routes.insert(0, "Rhabdomyolysis route")
+        routes.insert(0, "Severe neutropenia route")
 
-# Critical electrolytes
-if K is not None and (K < 3.0 or K > 6.0):
-    severity_scores.append(5)
-    patterns.insert(0, {
-        "pattern": "life-threatening potassium disturbance",
-        "reason": f"K {K}"
-    })
-    routes.insert(0, "Critical electrolyte disturbance route")
-
-if Na is not None and (Na < 120 or Na > 160):
-    severity_scores.append(5)
-    patterns.insert(0, {
-        "pattern": "life-threatening sodium disturbance",
-        "reason": f"Na {Na}"
-    })
-    routes.insert(0, "Critical electrolyte disturbance route")
-
-# Severe neutropenia
-if Neut is not None and Neut < 0.5:
-    severity_scores.append(5)
-    patterns.insert(0, {
-        "pattern": "severe neutropenia",
-        "reason": f"Neutrophils {Neut}"
-    })
-    routes.insert(0, "Severe neutropenia route")
-
-
-    # compute overall severity
+    # -------------------------
+    # FINAL SEVERITY & SUMMARY
+    # -------------------------
     overall_sev = max(severity_scores) if severity_scores else 1
     color = COLOR_MAP.get(overall_sev, COLOR_MAP[1])
     urgency = color["urgency"]
 
-    # build concise summary for ER
     summary_parts = []
     if patterns:
         summary_parts.append("Patterns: " + "; ".join([p["pattern"] for p in patterns]))
@@ -862,14 +862,14 @@ if Neut is not None and Neut < 0.5:
         "per_key": per_key,
         "overall_severity": overall_sev,
         "severity_text": COLOR_MAP[overall_sev]["label"],
-"urgency_flag": urgency,
-
+        "urgency_flag": urgency,
         "color": color["color"],
         "tw_class": color["tw"],
         "age_group": ag,
         "age_note": age_note,
         "summary": "\n".join(summary_parts) if summary_parts else "No significant abnormalities detected."
     }
+
 
 # -----------------------------
 # Trend analysis: simple diffs
