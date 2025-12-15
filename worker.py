@@ -872,11 +872,23 @@ def build_full_clinical_report(ai_json: dict) -> dict:
             chemistry_context.append(
                 "Normal CRP reduces the likelihood of acute inflammatory or infectious pathology."
             )
+# ---- Lipid age-based cardiovascular context (doctor-grade) ----
+age = cdict.get("_patient_age")
 
-        if triglycerides is not None and triglycerides > 1.7:
-            chemistry_context.append(
-                "Lipid abnormalities are more suggestive of long-term cardiovascular risk rather than acute illness."
-            )
+if (triglycerides is not None or ldl is not None):
+    if age is not None and age < 40:
+        chemistry_context.append(
+            "At this age, absolute short-term cardiovascular risk is generally low; "
+            "lifestyle optimisation is appropriate as first-line management."
+        )
+    else:
+        chemistry_context.append(
+            "Lipid abnormalities suggest increased long-term cardiovascular risk rather than acute illness."
+        )
+
+
+
+       
 
         # ---- Conservative suggested next steps ----
         if triglycerides is not None or ldl is not None:
