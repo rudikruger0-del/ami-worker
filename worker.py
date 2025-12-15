@@ -795,10 +795,16 @@ def build_full_clinical_report(ai_json: dict) -> dict:
         triglycerides = v("Triglycerides")
         ldl = v("LDL") if "LDL" in cdict else None
 
+        def ref_high(k):
+            return clean_number(cdict.get(k, {}).get("reference_high"))
+
         # ---- Clinical context considerations ----
         if bilirubin is not None and bilirubin > 21:
-            if all(x is not None and x <= cdict.get(k, {}).get("reference_high", float("inf"))
-                   for k, x in [("ALT", alt), ("AST", ast), ("ALP", alp), ("GGT", ggt)]):
+            if all(
+                x is not None and
+                (ref_high(k) is None or x <= ref_high(k))
+                for k, x in [("ALT", alt), ("AST", ast), ("ALP", alp), ("GGT", ggt)]
+            ):
                 chemistry_context.append(
                     "Unconjugated hyperbilirubinaemia with normal liver enzymes is commonly benign "
                     "(e.g. Gilbert syndrome), particularly if intermittent."
@@ -825,9 +831,9 @@ def build_full_clinical_report(ai_json: dict) -> dict:
 
         if bilirubin is not None and bilirubin > 21:
             chemistry_next_steps.append(
-                "If bilirubin remains elevated, consider repeat fractionation ± reticulocyte count "
-                "based on clinical context."
+                "If bilirubin remains elevated, consider repeat fractionation ± reticulocyte count if clinically indicated."
             )
+
 
 
     # Compose final augmented report
