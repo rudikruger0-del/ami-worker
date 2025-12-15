@@ -1282,19 +1282,28 @@ def process_report(job: Dict[str, Any]) -> Dict[str, Any]:
                 }
 
 
-        # fetch previous ai_results for trend analysis
-        previous = None
-        try:
-            if supabase and job.get("patient_id"):
-                prev_q = supabase.table(SUPABASE_TABLE).select("ai_results,created_at").eq("patient_id", job.get("patient_id")).order("created_at", desc=True).limit(1).execute()
-                prev_rows = prev_q.data if hasattr(prev_q, "data") else prev_q
-                if prev_rows:
-                    previous = prev_rows[0].get("ai_results")
-        except Exception:
-            previous = None
+# fetch previous ai_results for trend analysis
+previous = None
+try:
+    if supabase and job.get("patient_id"):
+        prev_q = (
+            supabase
+            .table(SUPABASE_TABLE)
+            .select("ai_results,created_at")
+            .eq("patient_id", job.get("patient_id"))
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        prev_rows = prev_q.data if hasattr(prev_q, "data") else prev_q
+        if prev_rows:
+            previous = prev_rows[0].get("ai_results")
+except Exception:
+    previous = None
 
-        trends = trend_analysis(canonical, previous)
-       route_info = route_engine_all(
+trends = trend_analysis(canonical, previous)
+
+route_info = route_engine_all(
     canonical,
     {"age": patient_age, "sex": patient_sex},
     previous,
