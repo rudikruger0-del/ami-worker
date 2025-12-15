@@ -19,6 +19,14 @@ import math
 import logging
 import traceback
 from typing import Dict, Any, Optional, List, Tuple
+# =========================
+# PARSER TYPE DEFINITIONS
+# (MUST EXIST BEFORE USE)
+# =========================
+
+ParsedValue = Dict[str, Any]
+ParsedResults = Dict[str, ParsedValue]
+
 
 from dotenv import load_dotenv
 from pypdf import PdfReader
