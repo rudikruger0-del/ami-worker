@@ -746,94 +746,107 @@ def process_report(job: dict) -> dict:
 
     if not file_path:
         err = f"Missing file_path for report {report_id}"
-        print("⚠️", err)
-        supabase.table("reports").update({"ai_status": "failed", "ai_error": err}).eq("id", report_id).execute()
+        supabase.table("reports").update({
+            "ai_status": "failed",
+            "ai_error": err
+        }).eq("id", report_id).execute()
         return {"error": err}
 
-    # download file bytes
-    pdf_res = supabase.storage.from_(BUCKET).download(file_path)
-    if hasattr(pdf_res, "data"):
-        pdf_bytes = pdf_res.data
-    else:
-        pdf_bytes = pdf_res
-
-    text = extract_text_from_pdf(pdf_bytes)
-    scanned = is_scanned_pdf(text)
-    print(f"Report {report_id}: scanned={scanned}, extracted_text_len={len(text)}")
-
-    merged_text_for_ai = ""
-    extracted_rows = []
-
     try:
+        # --------------------
+        # Download PDF
+        # --------------------
+        pdf_res = supabase.storage.from_(BUCKET).download(file_path)
+        pdf_bytes = pdf_res.data if hasattr(pdf_res, "data") else pdf_res
+
+        text = extract_text_from_pdf(pdf_bytes)
+        scanned = is_scanned_pdf(text)
+        print(f"Report {report_id}: scanned={scanned}, text_len={len(text)}")
+
+        extracted_rows = []
+        merged_text_for_ai = ""
+
+        # --------------------
+        # OCR or text parsing
+        # --------------------
         if scanned:
-            print("SCANNED PDF -> running OCR per page")
+            print("SCANNED PDF → OCR")
             pages = convert_from_bytes(pdf_bytes)
             for i, page_img in enumerate(pages, start=1):
-                print(f" OCR page {i} ...")
                 buf = io.BytesIO()
                 page_img.save(buf, format="PNG")
-                page_bytes = buf.getvalue()
-                ocr_out = extract_cbc_from_image(page_bytes)
-                if isinstance(ocr_out, dict) and "cbc" in ocr_out and ocr_out["cbc"]:
-                    extracted_rows.extend(ocr_out["cbc"])
-                else:
-                    print(f"  → no cbc rows found on page {i}")
+                ocr_out = extract_cbc_from_image(buf.getvalue())
+                extracted_rows.extend(ocr_out.get("cbc", []))
+
             if not extracted_rows:
-                raise ValueError("No CBC extracted from any page via OCR")
-            merged_text_for_ai = json.dumps({"cbc": extracted_rows}, ensure_ascii=False)
+                raise ValueError("No CBC extracted from scanned PDF")
+
+            merged_text_for_ai = json.dumps(
+                {"cbc": extracted_rows},
+                ensure_ascii=False
+            )
+
         else:
-            # digital/text PDF
             merged_text_for_ai = text or l_text
             if not merged_text_for_ai.strip():
                 raise ValueError("No usable text extracted from digital PDF")
 
-        # 1) call AI interpretation
-    print("Calling AI interpretation...")
-    ai_json = call_ai_on_report(merged_text_for_ai)
+        # --------------------
+        # AI interpretation
+        # --------------------
+        print("Calling AI interpretation...")
+        ai_json = call_ai_on_report(merged_text_for_ai)
 
-    # ---- CBC extraction sanity check (doctor-grade) ----
-    cbc_rows = ai_json.get("cbc") or []
+        # --------------------
+        # CBC sanity check (doctor-grade)
+        # --------------------
+        cbc_rows = ai_json.get("cbc") or []
 
-    cbc_present = any(
-        any(
-            key in (r.get("analyte") or "").lower()
-            for key in (
-                "hb", "hemoglobin", "haemoglobin",
-                "wbc", "white", "leuko",
-                "platelet", "plt"
+        cbc_present = any(
+            any(
+                key in (r.get("analyte") or "").lower()
+                for key in (
+                    "hb", "hemoglobin", "haemoglobin",
+                    "wbc", "white", "leuko",
+                    "platelet", "plt"
+                )
             )
+            for r in cbc_rows
+            if isinstance(r, dict)
         )
-        for r in cbc_rows
-        if isinstance(r, dict)
-    )
 
-    if not cbc_present:
-        raise ValueError("CBC expected but not extracted — blocking interpretation")
+        if not cbc_present:
+            raise ValueError(
+                "CBC expected but not extracted — interpretation blocked"
+            )
 
-    print("Building clinical augmentation...")
-    augmented = build_full_clinical_report(ai_json)
-
-
-        # 2) build augmented clinical report (routes, severity, diffs, trends)
+        # --------------------
+        # Clinical augmentation
+        # --------------------
         print("Building clinical augmentation...")
         augmented = build_full_clinical_report(ai_json)
 
-        # 3) store results
+        # --------------------
+        # Store results
+        # --------------------
         supabase.table("reports").update({
             "ai_status": "completed",
             "ai_results": augmented,
             "ai_error": None
         }).eq("id", report_id).execute()
 
-        print(f"✅ Report {report_id} processed successfully")
+        print(f"✅ Report {report_id} completed")
         return {"success": True, "data": augmented}
 
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
-        print(f"❌ Error processing report {report_id}: {err}")
         traceback.print_exc()
-        supabase.table("reports").update({"ai_status": "failed", "ai_error": err}).eq("id", report_id).execute()
+        supabase.table("reports").update({
+            "ai_status": "failed",
+            "ai_error": err
+        }).eq("id", report_id).execute()
         return {"error": err}
+
 
 # ---------------------------
 # Main worker loop (fixed .model handling)
