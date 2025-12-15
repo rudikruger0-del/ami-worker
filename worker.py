@@ -272,65 +272,119 @@ def call_ai_on_report(text: str) -> dict:
 # ---------------------------
 def build_cbc_value_dict(ai_json: dict) -> dict:
     """
-    Convert ai_json['cbc'] list into canonical dictionary keyed by common names (Hb, MCV, MCH, WBC, Neutrophils, etc.)
+    Convert ai_json['cbc'] (and chemistry-style rows) into a canonical dictionary
+    keyed by normalized analyte names (CBC + Chemistry + Lipids).
     """
     out = {}
     rows = ai_json.get("cbc") or []
+
     for r in rows:
         if not isinstance(r, dict):
             continue
-        name = (r.get("analyte") or r.get("test") or "").strip().lower()
-        if not name:
+
+        raw_name = (r.get("analyte") or r.get("test") or "").strip()
+        if not raw_name:
             continue
 
-        def put(k):
-            if k not in out:
-                out[k] = r
+        name = raw_name.lower()
 
+        def put(key):
+            # First-write wins to avoid duplicates
+            if key not in out:
+                out[key] = r
+
+        # -----------------
+        # CBC
+        # -----------------
         if "haemo" in name or name == "hb" or "hemoglobin" in name:
             put("Hb")
+
         elif name.startswith("mcv"):
             put("MCV")
+
         elif name.startswith("mch"):
             put("MCH")
+
         elif "red cell" in name or name == "rbc":
             put("RBC")
+
         elif "white" in name or "wbc" in name or "leucocyte" in name or "leukocyte" in name:
             put("WBC")
+
         elif "neut" in name:
             put("Neutrophils")
+
         elif "lymph" in name:
             put("Lymphocytes")
-        elif "platelet" in name or "plt" in name:
+
+        elif "platelet" in name or name == "plt":
             put("Platelets")
+
+        # -----------------
+        # Renal / Electrolytes
+        # -----------------
         elif "creatinine" in name:
             put("Creatinine")
+
         elif name.startswith("urea"):
             put("Urea")
-        elif "alt" in name and "alanine" in name:
-            put("ALT")
-        elif name == "alt":
-            put("ALT")
-        elif "ast" in name:
-            put("AST")
-        elif "alp" in name or "alkaline phosphatase" in name:
-            put("ALP")
-        elif "ggt" in name or "gamma" in name:
-            put("GGT")
-        elif "biliru" in name:
-            put("Bilirubin")
-        elif "creatine kinase" in name or name == "ck":
-            put("CK")
-        elif "ck-mb" in name or "ck mb" in name:
-            put("CK-MB")
+
         elif "sodium" in name or name == "na":
             put("Sodium")
+
         elif "potassium" in name or name == "k":
             put("Potassium")
+
         elif "calcium" in name:
             put("Calcium")
-        elif "crp" in name:
+
+        # -----------------
+        # Liver / Enzymes
+        # -----------------
+        elif name == "alt" or ("alt" in name and "alanine" in name):
+            put("ALT")
+
+        elif "ast" in name:
+            put("AST")
+
+        elif "alp" in name or "alkaline phosphatase" in name:
+            put("ALP")
+
+        elif "ggt" in name or "gamma gt" in name or "gamma-glutamyl" in name:
+            put("GGT")
+
+        elif "bilirubin" in name:
+            put("Bilirubin")
+
+        elif "creatine kinase" in name or name == "ck":
+            put("CK")
+
+        elif "ck-mb" in name or "ck mb" in name:
+            put("CK-MB")
+
+        # -----------------
+        # Inflammation
+        # -----------------
+        elif name == "crp" or "c-reactive" in name:
             put("CRP")
+
+        # -----------------
+        # LIPIDS (THIS WAS MISSING 🔥)
+        # -----------------
+        elif "triglyceride" in name:
+            put("Triglycerides")
+
+        elif "cholesterol total" in name or name == "cholesterol":
+            put("Cholesterol Total")
+
+        elif "hdl" in name:
+            put("HDL")
+
+        elif "ldl" in name:
+            put("LDL")
+
+        elif "non-hdl" in name or "non hdl" in name:
+            put("Non-HDL")
 
     return out
 
