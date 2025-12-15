@@ -818,6 +818,35 @@ def route_engine_all(
         if Na < 125 or Na > 155:
             patterns.append({"pattern":"significant sodium disturbance", "reason": f"Na {Na}"})
             next_steps.append("Assess for neurologic symptoms; correct sodium carefully and consider admission")
+# -------------------------
+# Isolated bilirubin elevation (Gilbert pattern)
+# -------------------------
+ALT = canonical.get("ALT", {}).get("value")
+AST = canonical.get("AST", {}).get("value")
+
+Bili = (
+    canonical.get("Bilirubin", {}).get("value")
+    or canonical.get("Bilirubin Total", {}).get("value")
+)
+
+if Bili is not None and Bili > 21:
+    alt_ok = ALT is None or ALT <= 50
+    ast_ok = AST is None or AST <= 50
+
+    if alt_ok and ast_ok:
+        patterns.append({
+            "pattern": "isolated bilirubin elevation",
+            "reason": f"Bilirubin {Bili} with normal ALT/AST"
+        })
+
+        next_steps.append(
+            "Isolated bilirubin elevation with normal liver enzymes is commonly benign "
+            "(e.g. Gilbert syndrome). No urgent action required if asymptomatic."
+        )
+
+        # IMPORTANT:
+        # - Do NOT add hepatic routes
+        # - Do NOT increase severity
 
     # -------------------------
     # Liver injury / hepatic patterns
@@ -937,7 +966,7 @@ def route_engine_all(
     # -----------------------------
     # DOCTOR TRUST OVERRIDE
     # -----------------------------
-    if doctor_trust_flags["has_long_term_risk"] and overall_sev == 1:
+    if doctor_trust_flags.get("has_long_term_risk") and overall_sev == 1:
         overall_sev = 2  # borderline / non-normal
 
     color = COLOR_MAP.get(overall_sev, COLOR_MAP[1])
@@ -970,8 +999,12 @@ def route_engine_all(
         "tw_class": color["tw"],
         "age_group": ag,
         "age_note": age_note,
-        "summary": "\n".join(summary_parts) if summary_parts else "No significant abnormalities detected."
-    }
+        "summary": (
+    "\n".join(summary_parts)
+    if summary_parts
+    else "No acute abnormalities detected. Long-term risk assessment recommended."
+)
+
 
 
 # -----------------------------
