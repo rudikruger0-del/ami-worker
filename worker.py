@@ -731,10 +731,10 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     """
     Given ai_json (from call_ai_on_report), add:
     - canonical cdict
-    - routes (list of pattern dicts)
+    - routes
     - severity & urgency
-    - differential_trees
-    - trend_comparison (if patient name found)
+    - differential trees
+    - trend comparison
     """
 
     # ---------------------------
@@ -746,7 +746,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
 
     overall_status = overall_clinical_status(cdict)
 
-    # Pattern-first clinical notes
+    # Pattern-first notes
     patterns = detect_simple_clinical_patterns(cdict)
 
     # ---------------------------
@@ -764,8 +764,6 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     Cr = v("Creatinine")
     CRP = v("CRP")
     CK = v("CK")
-    Na = v("Sodium")
-    K = v("Potassium")
 
     # Anaemia
     if Hb is not None and Hb < 13:
@@ -817,7 +815,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
             nexts = []
 
             if Neut and Neut > 70:
-                detail = "Neutrophil-predominant — reminding bacterial pattern"
+                detail = "Neutrophil-predominant — bacterial pattern more likely"
                 nexts.append(
                     "Correlate with fever, localising signs; treat per clinical context"
                 )
@@ -912,80 +910,75 @@ def build_full_clinical_report(ai_json: dict) -> dict:
 
     trends = trend_comparison(patient_name, cdict)
 
-# ---------------------------
-# Chemistry context & next steps
-# ---------------------------
-chemistry_context = None
-chemistry_next_steps = None
+    # ---------------------------
+    # Chemistry context & next steps
+    # ---------------------------
+    chemistry_context = None
+    chemistry_next_steps = None
 
-if ai_json.get("_chemistry_status") in ("present", "assumed_from_text"):
-    chemistry_context = []
-    chemistry_next_steps = []
+    if ai_json.get("_chemistry_status") in ("present", "assumed_from_text"):
+        chemistry_context = []
+        chemistry_next_steps = []
 
-    v = lambda k: clean_number(cdict.get(k, {}).get("value"))
+        v = lambda k: clean_number(cdict.get(k, {}).get("value"))
 
-    bilirubin = v("Bilirubin")
-    alt = v("ALT")
-    ast = v("AST")
-    alp = v("ALP")
-    ggt = v("GGT")
-    crp = v("CRP")
-    triglycerides = v("Triglycerides")
+        bilirubin = v("Bilirubin")
+        alt = v("ALT")
+        ast = v("AST")
+        alp = v("ALP")
+        ggt = v("GGT")
+        crp = v("CRP")
+        triglycerides = v("Triglycerides")
 
-    ldl = (
-        v("LDL")
-        or v("LDL Chol")
-        or v("LDL Chol (direct)")
-    )
+        ldl = (
+            v("LDL")
+            or v("LDL Chol")
+            or v("LDL Chol (direct)")
+        )
 
-    def ref_high(k):
-        return clean_number(cdict.get(k, {}).get("reference_high"))
+        def ref_high(k):
+            return clean_number(cdict.get(k, {}).get("reference_high"))
 
-    # ---- Bilirubin pattern ----
-    if bilirubin is not None and bilirubin > 21:
-        if all(
-            x is not None and
-            (ref_high(k) is None or x <= ref_high(k))
-            for k, x in [("ALT", alt), ("AST", ast), ("ALP", alp), ("GGT", ggt)]
-        ):
+        if bilirubin is not None and bilirubin > 21:
+            if all(
+                x is not None and
+                (ref_high(k) is None or x <= ref_high(k))
+                for k, x in [("ALT", alt), ("AST", ast), ("ALP", alp), ("GGT", ggt)]
+            ):
+                chemistry_context.append(
+                    "Unconjugated hyperbilirubinaemia with normal liver enzymes is commonly benign "
+                    "(e.g. Gilbert syndrome), particularly if intermittent."
+                )
+
+        if crp is not None and crp < 5:
             chemistry_context.append(
-                "Unconjugated hyperbilirubinaemia with normal liver enzymes is commonly benign "
-                "(e.g. Gilbert syndrome), particularly if intermittent."
+                "Normal CRP reduces the likelihood of acute inflammatory or infectious pathology."
             )
 
-    # ---- CRP ----
-    if crp is not None and crp < 5:
-        chemistry_context.append(
-            "Normal CRP reduces the likelihood of acute inflammatory or infectious pathology."
-        )
+        age = cdict.get("_patient_age")
 
-    # ---- Lipid age-based cardiovascular context (doctor-grade) ----
-    age = cdict.get("_patient_age")
+        if triglycerides is not None or ldl is not None:
+            if age is not None and age < 40:
+                chemistry_context.append(
+                    "At this age, absolute short-term cardiovascular risk is generally low; "
+                    "lifestyle optimisation is appropriate as first-line management."
+                )
+            else:
+                chemistry_context.append(
+                    "Lipid abnormalities suggest increased long-term cardiovascular risk rather than acute illness."
+                )
 
-    if triglycerides is not None or ldl is not None:
-        if age is not None and age < 40:
-            chemistry_context.append(
-                "At this age, absolute short-term cardiovascular risk is generally low; "
-                "lifestyle optimisation is appropriate as first-line management."
+            chemistry_next_steps.append(
+                "Repeat fasting lipid profile in 3–6 months if clinically appropriate."
             )
-        else:
-            chemistry_context.append(
-                "Lipid abnormalities suggest increased long-term cardiovascular risk rather than acute illness."
+            chemistry_next_steps.append(
+                "Consider fasting status and recent alcohol intake when interpreting triglyceride levels."
             )
 
-        # ---- Conservative next steps ----
-        chemistry_next_steps.append(
-            "Repeat fasting lipid profile in 3–6 months if clinically appropriate."
-        )
-        chemistry_next_steps.append(
-            "Consider fasting status and recent alcohol intake when interpreting triglyceride levels."
-        )
-
-    if bilirubin is not None and bilirubin > 21:
-        chemistry_next_steps.append(
-            "If bilirubin remains elevated, consider repeat fractionation ± reticulocyte count if clinically indicated."
-        )
-
+        if bilirubin is not None and bilirubin > 21:
+            chemistry_next_steps.append(
+                "If bilirubin remains elevated, consider repeat fractionation ± reticulocyte count if clinically indicated."
+            )
 
     # ---------------------------
     # Final assembly
@@ -1003,6 +996,7 @@ if ai_json.get("_chemistry_status") in ("present", "assumed_from_text"):
     augmented["_overall_status"] = overall_status
 
     return augmented
+
 
 
 # ---------------------------
