@@ -912,75 +912,80 @@ def build_full_clinical_report(ai_json: dict) -> dict:
 
     trends = trend_comparison(patient_name, cdict)
 
-    # ---------------------------
-    # Chemistry context & next steps
-    # ---------------------------
-    chemistry_context = None
-    chemistry_next_steps = None
+# ---------------------------
+# Chemistry context & next steps
+# ---------------------------
+chemistry_context = None
+chemistry_next_steps = None
 
-    if ai_json.get("_chemistry_status") in ("present", "assumed_from_text"):
-        chemistry_context = []
-        chemistry_next_steps = []
+if ai_json.get("_chemistry_status") in ("present", "assumed_from_text"):
+    chemistry_context = []
+    chemistry_next_steps = []
 
-        v = lambda k: clean_number(cdict.get(k, {}).get("value"))
+    v = lambda k: clean_number(cdict.get(k, {}).get("value"))
 
-        bilirubin = v("Bilirubin")
-        alt = v("ALT")
-        ast = v("AST")
-        alp = v("ALP")
-        ggt = v("GGT")
-        crp = v("CRP")
-        triglycerides = v("Triglycerides")
-        ldl = v("LDL") if "LDL" in cdict else None
+    bilirubin = v("Bilirubin")
+    alt = v("ALT")
+    ast = v("AST")
+    alp = v("ALP")
+    ggt = v("GGT")
+    crp = v("CRP")
+    triglycerides = v("Triglycerides")
 
-        def ref_high(k):
-            return clean_number(cdict.get(k, {}).get("reference_high"))
+    ldl = (
+        v("LDL")
+        or v("LDL Chol")
+        or v("LDL Chol (direct)")
+    )
 
-        # Bilirubin pattern
-        if bilirubin is not None and bilirubin > 21:
-            if all(
-                x is not None and
-                (ref_high(k) is None or x <= ref_high(k))
-                for k, x in [("ALT", alt), ("AST", ast), ("ALP", alp), ("GGT", ggt)]
-            ):
-                chemistry_context.append(
-                    "Unconjugated hyperbilirubinaemia with normal liver enzymes is commonly benign "
-                    "(e.g. Gilbert syndrome), particularly if intermittent."
-                )
+    def ref_high(k):
+        return clean_number(cdict.get(k, {}).get("reference_high"))
 
-        # CRP
-        if crp is not None and crp < 5:
+    # ---- Bilirubin pattern ----
+    if bilirubin is not None and bilirubin > 21:
+        if all(
+            x is not None and
+            (ref_high(k) is None or x <= ref_high(k))
+            for k, x in [("ALT", alt), ("AST", ast), ("ALP", alp), ("GGT", ggt)]
+        ):
             chemistry_context.append(
-                "Normal CRP reduces the likelihood of acute inflammatory or infectious pathology."
+                "Unconjugated hyperbilirubinaemia with normal liver enzymes is commonly benign "
+                "(e.g. Gilbert syndrome), particularly if intermittent."
             )
 
-        # ---- Lipid age-based cardiovascular context (doctor-grade) ----
-        age = cdict.get("_patient_age")
+    # ---- CRP ----
+    if crp is not None and crp < 5:
+        chemistry_context.append(
+            "Normal CRP reduces the likelihood of acute inflammatory or infectious pathology."
+        )
 
-        if triglycerides is not None or ldl is not None:
-            if age is not None and age < 40:
-                chemistry_context.append(
-                    "At this age, absolute short-term cardiovascular risk is generally low; "
-                    "lifestyle optimisation is appropriate as first-line management."
-                )
-            else:
-                chemistry_context.append(
-                    "Lipid abnormalities suggest increased long-term cardiovascular risk rather than acute illness."
-                )
+    # ---- Lipid age-based cardiovascular context (doctor-grade) ----
+    age = cdict.get("_patient_age")
 
-        # Conservative next steps
-        if triglycerides is not None or ldl is not None:
-            chemistry_next_steps.append(
-                "Repeat fasting lipid profile in 3–6 months if clinically appropriate."
+    if triglycerides is not None or ldl is not None:
+        if age is not None and age < 40:
+            chemistry_context.append(
+                "At this age, absolute short-term cardiovascular risk is generally low; "
+                "lifestyle optimisation is appropriate as first-line management."
             )
-            chemistry_next_steps.append(
-                "Consider fasting status and recent alcohol intake when interpreting triglyceride levels."
+        else:
+            chemistry_context.append(
+                "Lipid abnormalities suggest increased long-term cardiovascular risk rather than acute illness."
             )
 
-        if bilirubin is not None and bilirubin > 21:
-            chemistry_next_steps.append(
-                "If bilirubin remains elevated, consider repeat fractionation ± reticulocyte count if clinically indicated."
-            )
+        # ---- Conservative next steps ----
+        chemistry_next_steps.append(
+            "Repeat fasting lipid profile in 3–6 months if clinically appropriate."
+        )
+        chemistry_next_steps.append(
+            "Consider fasting status and recent alcohol intake when interpreting triglyceride levels."
+        )
+
+    if bilirubin is not None and bilirubin > 21:
+        chemistry_next_steps.append(
+            "If bilirubin remains elevated, consider repeat fractionation ± reticulocyte count if clinically indicated."
+        )
+
 
     # ---------------------------
     # Final assembly
