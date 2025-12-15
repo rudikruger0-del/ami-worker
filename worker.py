@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-AMI Health Worker — FULL CLINICAL ENGINE V7.2 (STABLE)
+AMI Health Worker — FULL CLINICAL ENGINE V7.3 (STABLE)
 
-- Digital PDF parsing (chemistry tables)
-- CBC column-table parsing (CRITICAL FIX)
-- OCR fallback (pytesseract only)
-- Route Engine V4 (ER-grade dominance)
-- Built-in parser unit tests
+Guaranteed:
+- CBC column table parsing
+- Chemistry table parsing
+- Inline parsing
+- OCR fallback
+- ER-grade severity logic
+- Supabase-safe PDF download
 """
 
 # ======================================================
@@ -21,7 +23,7 @@ import time
 import json
 import logging
 import traceback
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, Tuple
 
 from dotenv import load_dotenv
 from pypdf import PdfReader
@@ -51,13 +53,11 @@ logging.basicConfig(
 log = logging.getLogger("ami-worker")
 
 # ======================================================
-# SUPABASE (OPTIONAL FOR TEST MODE)
+# SUPABASE
 # ======================================================
 
-supabase = None
-if SUPABASE_URL and SUPABASE_KEY:
-    from supabase import create_client
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+from supabase import create_client
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ======================================================
 # OCR
@@ -85,6 +85,16 @@ def ocr_page(img: Image.Image) -> str:
 # PDF EXTRACTION
 # ======================================================
 
+def safe_download_pdf(path: str) -> bytes:
+    pdf_obj = supabase.storage.from_(SUPABASE_BUCKET).download(path)
+
+    if isinstance(pdf_obj, (bytes, bytearray)):
+        return pdf_obj
+    if hasattr(pdf_obj, "data"):
+        return pdf_obj.data
+
+    raise RuntimeError("Unexpected PDF download return type")
+
 def extract_text_digital(pdf: bytes) -> str:
     try:
         reader = PdfReader(io.BytesIO(pdf))
@@ -95,7 +105,7 @@ def extract_text_digital(pdf: bytes) -> str:
 def looks_scanned(text: str) -> bool:
     if not text or len(text) < 150:
         return True
-    anchors = ("hb", "wbc", "platelet", "creatinine", "crp", "cholesterol")
+    anchors = ("hb", "plt", "platelet", "crp", "creatinine", "ck")
     return not any(a in text.lower() for a in anchors)
 
 def extract_text_scanned(pdf: bytes) -> str:
@@ -108,14 +118,16 @@ def extract_text_scanned(pdf: bytes) -> str:
         txt = ocr_page(preprocess_for_ocr(p))
         if txt.strip():
             out.append(txt)
+
     if not out:
         raise RuntimeError("OCR produced no text")
+
     return "\n".join(out)
 
 def extract_text(pdf: bytes) -> Tuple[str, bool]:
-    text = extract_text_digital(pdf)
-    if text and not looks_scanned(text):
-        return text, False
+    digital = extract_text_digital(pdf)
+    if digital and not looks_scanned(digital):
+        return digital, False
     return extract_text_scanned(pdf), True
 
 # ======================================================
@@ -125,7 +137,6 @@ def extract_text(pdf: bytes) -> Tuple[str, bool]:
 ANALYTE_MAP = {
     "hb": "Hb", "haemoglobin": "Hb", "hemoglobin": "Hb",
     "rbc": "RBC", "hct": "HCT",
-    "wbc": "WBC", "white cell count": "WBC",
     "plt": "Platelets", "platelet": "Platelets",
     "crp": "CRP",
     "k": "Potassium", "potassium": "Potassium",
@@ -133,11 +144,10 @@ ANALYTE_MAP = {
     "alt": "ALT", "ast": "AST",
     "ck": "CK", "ck-mb": "CK-MB",
     "albumin": "Albumin",
-    "calcium": "Calcium", "ca": "Calcium",
-    "ca adj": "Calcium_adj"
+    "ca": "Calcium", "calcium": "Calcium"
 }
 
-def normalize_label(label: str) -> Optional[str]:
+def normalize_label(label: str):
     key = re.sub(r"[^a-z\- ]", "", label.lower()).strip()
     return ANALYTE_MAP.get(key)
 
@@ -145,59 +155,46 @@ def normalize_label(label: str) -> Optional[str]:
 # PARSERS
 # ======================================================
 
-def parse_inline_tables(text: str) -> Dict[str, Dict[str, Any]]:
-    results = {}
-    for ln in text.splitlines():
-        ln = re.sub(r"\s{2,}", " ", ln.strip())
-        m = re.match(r"^([A-Za-z\- ]+)\s+(\d+(?:\.\d+)?)\s*([HL])?$", ln)
-        if not m:
-            continue
-        analyte = normalize_label(m.group(1))
-        if analyte:
-            results[analyte] = {
-                "value": float(m.group(2)),
-                "flag": "high" if m.group(3) == "H" else "low" if m.group(3) == "L" else None,
-                "raw": ln
-            }
-    return results
-
 def parse_chemistry_tables(text: str) -> Dict[str, Dict[str, Any]]:
     results = {}
     for ln in text.splitlines():
-        label_match = re.match(r"^[A-Za-z][A-Za-z \-/()]+", ln)
+        label_match = re.match(r"^[A-Za-z][A-Za-z \-/()]+", ln.strip())
         if not label_match:
             continue
+
         analyte = normalize_label(label_match.group(0))
         if not analyte:
             continue
+
         nums = re.findall(r"\d+(?:\.\d+)?", ln.replace(",", "."))
         if not nums:
             continue
+
         results[analyte] = {
             "value": float(nums[-1]),
             "flag": "high" if " H" in ln else "low" if " L" in ln else None,
-            "raw": ln
+            "raw": ln.strip()
         }
+
     return results
 
 def parse_cbc_column_table(text: str) -> Dict[str, Dict[str, Any]]:
-    """
-    FIX FOR YOUR EXACT FAILURE CASE
-    TEST | RESULT | FLAG split across lines
-    """
     results = {}
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
     i = 0
     while i < len(lines) - 1:
         analyte = normalize_label(lines[i])
         if analyte:
             try:
                 value = float(lines[i + 1])
-            except:
+            except Exception:
                 value = None
+
             flag = None
             if i + 2 < len(lines) and lines[i + 2] in ("H", "L"):
                 flag = "high" if lines[i + 2] == "H" else "low"
+
             if value is not None:
                 results[analyte] = {
                     "value": value,
@@ -207,17 +204,35 @@ def parse_cbc_column_table(text: str) -> Dict[str, Dict[str, Any]]:
                 i += 3
                 continue
         i += 1
+
+    return results
+
+def parse_inline(text: str) -> Dict[str, Dict[str, Any]]:
+    results = {}
+    for ln in text.splitlines():
+        m = re.match(r"^([A-Za-z\- ]+)\s+(\d+(?:\.\d+)?)\s*([HL])?$", ln.strip())
+        if not m:
+            continue
+
+        analyte = normalize_label(m.group(1))
+        if analyte:
+            results[analyte] = {
+                "value": float(m.group(2)),
+                "flag": "high" if m.group(3) == "H" else "low" if m.group(3) == "L" else None,
+                "raw": ln.strip()
+            }
+
     return results
 
 def parse_labs(text: str) -> Dict[str, Dict[str, Any]]:
     labs = {}
     labs.update(parse_chemistry_tables(text))
     labs.update(parse_cbc_column_table(text))
-    labs.update(parse_inline_tables(text))
+    labs.update(parse_inline(text))
     return labs
 
 # ======================================================
-# ROUTE ENGINE V4 (ER DOMINANT)
+# ROUTE ENGINE V4 (ER-DOMINANT)
 # ======================================================
 
 SEVERITY_ORDER = ["normal", "mild", "moderate", "severe", "critical"]
@@ -240,12 +255,12 @@ def route_engine(labs: Dict[str, Any]) -> Dict[str, Any]:
     if v("CK") and v("CK") > 5000:
         patterns.append("Rhabdomyolysis physiology")
         routes.append("High-risk muscle injury")
-        steps.append("Check renal function, urine myoglobin")
+        steps.append("Monitor renal function, urine myoglobin")
         escalate("critical", "high")
 
     if v("Platelets") and v("Platelets") < 50:
         patterns.append("Severe thrombocytopenia")
-        routes.append("Bleeding risk")
+        routes.append("High bleeding risk")
         escalate("severe", "high")
 
     if v("Potassium") and v("Potassium") < 3.0:
@@ -254,15 +269,15 @@ def route_engine(labs: Dict[str, Any]) -> Dict[str, Any]:
         escalate("severe", "high")
 
     if v("CRP") and v("CRP") > 10:
-        patterns.append("Inflammation")
+        patterns.append("Inflammatory response")
         escalate("moderate", "moderate")
 
     if v("ALT") and v("ALT") > 200:
         patterns.append("Transaminitis")
         escalate("severe", "high")
 
-    if not patterns:
-        patterns.append("No acute abnormalities")
+    if severity == "normal" and labs:
+        severity = "mild"
 
     return {
         "patterns": patterns,
@@ -278,7 +293,7 @@ def route_engine(labs: Dict[str, Any]) -> Dict[str, Any]:
 # ======================================================
 
 def process_job(job: Dict[str, Any]):
-    pdf = supabase.storage.from_(SUPABASE_BUCKET).download(job["file_path"]).data
+    pdf = safe_download_pdf(job["file_path"])
     text, scanned = extract_text(pdf)
     labs = parse_labs(text)
     analysis = route_engine(labs)
@@ -289,7 +304,8 @@ def process_job(job: Dict[str, Any]):
             "scanned": scanned,
             "labs": labs,
             "analysis": analysis
-        }
+        },
+        "ai_error": None
     }).eq("id", job["id"]).execute()
 
 # ======================================================
@@ -299,7 +315,7 @@ def process_job(job: Dict[str, Any]):
 def run_tests():
     print("\n🧪 Running parser tests...\n")
 
-    cbc_text = """
+    cbc = """
     HB
     12.5
     L
@@ -313,31 +329,28 @@ def run_tests():
     14028
     H
     """
-
-    labs = parse_labs(cbc_text)
+    labs = parse_labs(cbc)
     assert labs["Hb"]["value"] == 12.5
     assert labs["Platelets"]["value"] == 53
-    assert labs["CK"]["value"] == 14028
     assert labs["CRP"]["flag"] == "high"
-
+    assert labs["CK"]["value"] == 14028
     print("✅ CBC column table test passed")
 
-    chem_text = "Creatinine 88 H\nALT 226 H"
-    labs = parse_labs(chem_text)
+    chem = "Creatinine 88 H\nALT 226 H"
+    labs = parse_labs(chem)
     assert labs["Creatinine"]["value"] == 88
     assert labs["ALT"]["value"] == 226
-
     print("✅ Chemistry table test passed")
 
-    inline_text = "HB 10.2 L"
-    labs = parse_labs(inline_text)
+    inline = "HB 10.2 L"
+    labs = parse_labs(inline)
     assert labs["Hb"]["value"] == 10.2
+    print("✅ Inline test passed\n")
 
-    print("✅ Inline text test passed\n")
     print("🎉 ALL TESTS PASSED\n")
 
 # ======================================================
-# MAIN
+# MAIN LOOP
 # ======================================================
 
 def main():
@@ -345,19 +358,19 @@ def main():
         run_tests()
         return
 
-    if not supabase:
-        raise RuntimeError("Supabase not configured")
+    log.info("AMI Worker started")
 
-    log.info("AMI Worker running")
     while True:
         res = supabase.table(SUPABASE_TABLE).select("*").eq("ai_status", "pending").limit(1).execute()
         jobs = res.data or []
+
         if not jobs:
             time.sleep(POLL_INTERVAL)
             continue
 
         job = jobs[0]
         supabase.table(SUPABASE_TABLE).update({"ai_status": "processing"}).eq("id", job["id"]).execute()
+
         try:
             process_job(job)
         except Exception as e:
