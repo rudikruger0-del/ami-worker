@@ -737,7 +737,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # canonical dict
     cdict = build_cbc_value_dict(ai_json)
     if isinstance(ai_json.get("patient"), dict):
-    cdict["_patient_age"] = ai_json["patient"].get("age")
+        cdict["_patient_age"] = ai_json["patient"].get("age")
 
     overall_status = overall_clinical_status(cdict)
     # pattern-first clinical notes
