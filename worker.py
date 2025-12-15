@@ -335,7 +335,6 @@ def evaluate_severity_and_urgency(cdict: dict) -> dict:
     flags = []
     key_issues = []
 
-    # helper value extraction
     v = lambda k: clean_number(cdict.get(k, {}).get("value"))
 
     Hb = v("Hb")
@@ -345,77 +344,82 @@ def evaluate_severity_and_urgency(cdict: dict) -> dict:
     K = v("Potassium")
     Cr = v("Creatinine")
     CK = v("CK")
-
-    # Critical thresholds (conservative)
-    if Hb is not None:
-        if Hb < 6.5:
-            sev_score += 5; flags.append({"reason": f"Hb {Hb} g/dL — severe anaemia", "level": "immediate"}); key_issues.append(f"Hb {Hb}")
-        elif Hb < 8:
-            sev_score += 3; flags.append({"reason": f"Hb {Hb} g/dL — significant anaemia", "level": "urgent"}); key_issues.append(f"Hb {Hb}")
-        elif Hb < 11:
-            sev_score += 1; key_issues.append(f"Hb {Hb} (mild-moderate)")
-
-    if Plt is not None:
-        if Plt < 20:
-            sev_score += 5; flags.append({"reason": f"Platelets {Plt} x10^9/L — very high bleeding risk", "level": "immediate"}); key_issues.append(f"Platelets {Plt}")
-        elif Plt < 50:
-            sev_score += 3; flags.append({"reason": f"Platelets {Plt} x10^9/L — bleeding risk", "level": "urgent"}); key_issues.append(f"Platelets {Plt}")
-
-    if K is not None:
-        if K < 3.0 or K > 6.0:
-            sev_score += 5; flags.append({"reason": f"Potassium {K} mmol/L — arrhythmia risk", "level": "immediate"}); key_issues.append(f"K {K}")
-        elif K < 3.3 or K > 5.5:
-            sev_score += 3; flags.append({"reason": f"Potassium {K} mmol/L — significant", "level": "urgent"}); key_issues.append(f"K {K}")
-
-    if Cr is not None:
-        if Cr > 250:
-            sev_score += 4; flags.append({"reason": f"Creatinine {Cr} µmol/L — possible AKI", "level": "urgent"}); key_issues.append(f"Cr {Cr}")
-        elif Cr > 120:
-            sev_score += 2; key_issues.append(f"Cr {Cr}")
-
-    if CK is not None and CK > 5000:
-        sev_score += 4; flags.append({"reason": f"CK {CK} U/L — possible rhabdomyolysis physiology", "level": "urgent"}); key_issues.append(f"CK {CK}")
-
-if WBC is not None:
-    if WBC > 25 or WBC < 1:
-        sev_score += 4
-        flags.append({
-            "reason": f"WBC {WBC} x10^9/L — severe leukocyte abnormality",
-            "level": "urgent"
-        })
-        key_issues.append(f"WBC {WBC}")
-
-    # -------------------------------
-    # Inflammatory / infective escalation (ER-grade)
-    # -------------------------------
     CRP = v("CRP")
 
-    if CRP is not None and CRP >= 30:
-        sev_score += 3
-        flags.append({
-            "reason": f"CRP {CRP} mg/L — significant inflammatory response",
-            "level": "urgent"
-        })
-        key_issues.append(f"CRP {CRP}")
+    # ---- Hb ----
+    if Hb is not None:
+        if Hb < 6.5:
+            sev_score += 5
+            flags.append({"reason": f"Hb {Hb} g/dL — severe anaemia", "level": "immediate"})
+            key_issues.append(f"Hb {Hb}")
+        elif Hb < 8:
+            sev_score += 3
+            flags.append({"reason": f"Hb {Hb} g/dL — significant anaemia", "level": "urgent"})
+            key_issues.append(f"Hb {Hb}")
+        elif Hb < 11:
+            sev_score += 1
+            key_issues.append(f"Hb {Hb} (mild)")
 
-    if WBC is not None and WBC >= 18:
-        sev_score += 2
-        flags.append({
-            "reason": f"WBC {WBC} x10^9/L — marked leukocytosis",
-            "level": "urgent"
-        })
-        key_issues.append(f"WBC {WBC}")
+    # ---- Platelets ----
+    if Plt is not None:
+        if Plt < 20:
+            sev_score += 5
+            flags.append({"reason": f"Platelets {Plt} — critical bleeding risk", "level": "immediate"})
+            key_issues.append(f"Platelets {Plt}")
+        elif Plt < 50:
+            sev_score += 3
+            flags.append({"reason": f"Platelets {Plt} — bleeding risk", "level": "urgent"})
+            key_issues.append(f"Platelets {Plt}")
+
+    # ---- Potassium ----
+    if K is not None:
+        if K < 3.0 or K > 6.0:
+            sev_score += 5
+            flags.append({"reason": f"Potassium {K} mmol/L — arrhythmia risk", "level": "immediate"})
+            key_issues.append(f"K {K}")
+        elif K < 3.3 or K > 5.5:
+            sev_score += 3
+            flags.append({"reason": f"Potassium {K} mmol/L — significant abnormality", "level": "urgent"})
+            key_issues.append(f"K {K}")
+
+    # ---- Creatinine ----
+    if Cr is not None:
+        if Cr > 250:
+            sev_score += 4
+            flags.append({"reason": f"Creatinine {Cr} µmol/L — possible AKI", "level": "urgent"})
+            key_issues.append(f"Cr {Cr}")
+        elif Cr > 120:
+            sev_score += 2
+            key_issues.append(f"Cr {Cr}")
+
+    # ---- CK ----
+    if CK is not None and CK > 5000:
+        sev_score += 4
+        flags.append({"reason": f"CK {CK} U/L — rhabdomyolysis physiology", "level": "urgent"})
+        key_issues.append(f"CK {CK}")
+
+    # ---- WBC / Infection ----
+    if WBC is not None:
+        if WBC > 25 or WBC < 1:
+            sev_score += 4
+            flags.append({"reason": f"WBC {WBC} — severe leukocyte abnormality", "level": "urgent"})
+            key_issues.append(f"WBC {WBC}")
+        elif WBC >= 18:
+            sev_score += 2
+            flags.append({"reason": f"WBC {WBC} — marked leukocytosis", "level": "urgent"})
+            key_issues.append(f"WBC {WBC}")
 
     if Neut is not None and Neut >= 15:
         sev_score += 2
-        flags.append({
-            "reason": f"Neutrophils {Neut} x10^9/L — neutrophil-predominant response",
-            "level": "urgent"
-        })
-        key_issues.append(f"Neutrophils {Neut}")
+        flags.append({"reason": f"Neutrophils {Neut} — neutrophil-predominant response", "level": "urgent"})
+        key_issues.append(f"Neut {Neut}")
 
+    if CRP is not None and CRP >= 30:
+        sev_score += 3
+        flags.append({"reason": f"CRP {CRP} mg/L — significant inflammation", "level": "urgent"})
+        key_issues.append(f"CRP {CRP}")
 
-    # Map score -> severity
+    # ---- Severity mapping ----
     if sev_score >= 8:
         severity = "critical"
     elif sev_score >= 4:
@@ -425,7 +429,11 @@ if WBC is not None:
     else:
         severity = "low"
 
-    return {"severity": severity, "urgency_flags": flags, "key_issues": key_issues}
+    return {
+        "severity": severity,
+        "urgency_flags": flags,
+        "key_issues": key_issues
+    }
 
 # ---------------------------
 # Differential diagnosis trees (safe)
