@@ -566,7 +566,7 @@ def build_chemistry_context_and_steps(cdict: dict) -> dict:
         )
 
     if Chol is not None or LDL is not None:
-    age = cdict.get("_patient_age")
+        age = cdict.get("_patient_age")
 
     if age is not None and age < 40:
         context.append(
