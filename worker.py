@@ -788,26 +788,30 @@ def process_report(job: dict) -> dict:
                 raise ValueError("No usable text extracted from digital PDF")
 
         # 1) call AI interpretation
-        print("Calling AI interpretation...")
-        ai_json = call_ai_on_report(merged_text_for_ai)
-        # ---- CBC extraction sanity check (doctor-grade) ----
-cbc_rows = ai_json.get("cbc") or []
-cbc_present = any(
-    any(
-        key in (r.get("analyte") or "").lower()
-        for key in (
-            "hb", "hemoglobin", "haemoglobin",
-            "wbc", "white", "leuko",
-            "platelet", "plt"
+    print("Calling AI interpretation...")
+    ai_json = call_ai_on_report(merged_text_for_ai)
+
+    # ---- CBC extraction sanity check (doctor-grade) ----
+    cbc_rows = ai_json.get("cbc") or []
+
+    cbc_present = any(
+        any(
+            key in (r.get("analyte") or "").lower()
+            for key in (
+                "hb", "hemoglobin", "haemoglobin",
+                "wbc", "white", "leuko",
+                "platelet", "plt"
+            )
         )
+        for r in cbc_rows
+        if isinstance(r, dict)
     )
-    for r in cbc_rows
-    if isinstance(r, dict)
-)
 
+    if not cbc_present:
+        raise ValueError("CBC expected but not extracted — blocking interpretation")
 
-if not cbc_present:
-    raise ValueError("CBC expected but not extracted — blocking interpretation")
+    print("Building clinical augmentation...")
+    augmented = build_full_clinical_report(ai_json)
 
 
         # 2) build augmented clinical report (routes, severity, diffs, trends)
