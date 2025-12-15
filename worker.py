@@ -560,7 +560,7 @@ def build_chemistry_context_and_steps(cdict: dict) -> dict:
                 "(e.g. Gilbert syndrome), particularly if intermittent"
             )
 
-       if CRP is not None and CRP < 5:
+    if CRP is not None and CRP < 5:
         context.append(
             "Absence of inflammatory marker elevation reduces likelihood of acute inflammatory or infectious pathology"
         )
