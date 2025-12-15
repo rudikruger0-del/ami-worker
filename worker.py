@@ -565,18 +565,18 @@ def build_chemistry_context_and_steps(cdict: dict) -> dict:
             "Absence of inflammatory marker elevation reduces likelihood of acute inflammatory or infectious pathology"
         )
 
-    if Chol is not None or LDL is not None:
-        age = cdict.get("_patient_age")
+    age = cdict.get("_patient_age")
 
-    if age is not None and age < 40:
-        context.append(
-            "At this age, absolute short-term cardiovascular risk is low; "
-            "lifestyle optimisation is appropriate as first-line management."
-        )
-    else:
-        context.append(
-            "Lipid abnormalities suggest increased long-term cardiovascular risk rather than acute illness."
-        )
+if (Chol is not None or LDL is not None) and age is not None and age < 40:
+    context.append(
+        "At this age, absolute short-term cardiovascular risk is low; "
+        "lifestyle optimisation is appropriate as first-line management."
+    )
+elif Chol is not None or LDL is not None:
+    context.append(
+        "Lipid abnormalities suggest increased long-term cardiovascular risk rather than acute illness."
+    )
+
 
 
     return {
