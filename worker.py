@@ -633,6 +633,8 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     """
     # canonical dict
     cdict = build_cbc_value_dict(ai_json)
+    overall_status = overall_clinical_status(cdict)
+
 
     # routes (reuse earlier generate_routes logic but return rich objects)
     routes = []
