@@ -560,12 +560,12 @@ def build_chemistry_context_and_steps(cdict: dict) -> dict:
                 "(e.g. Gilbert syndrome), particularly if intermittent"
             )
 
-    if CRP is not None and CRP < 5:
+       if CRP is not None and CRP < 5:
         context.append(
             "Absence of inflammatory marker elevation reduces likelihood of acute inflammatory or infectious pathology"
         )
 
-        age = cdict.get("_patient_age")
+    age = cdict.get("_patient_age")
 
     if (Chol is not None or LDL is not None) and age is not None and age < 40:
         context.append(
@@ -576,6 +576,7 @@ def build_chemistry_context_and_steps(cdict: dict) -> dict:
         context.append(
             "Lipid abnormalities suggest increased long-term cardiovascular risk rather than acute illness."
         )
+
 
 
 
