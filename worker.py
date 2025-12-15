@@ -421,24 +421,23 @@ def canonical_map(parsed: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]
     out: Dict[str, Dict[str, Any]] = {}
 
     for k, v in parsed.items():
-        raw_val = v.get("value")
-        val = safe_float(raw_val)
+        val = safe_float(v.get("value"))
         if val is None:
             continue
 
         safe_val = numeric_safety_gate(k, val)
         if safe_val is None:
-            continue  # DROP unsafe OCR / hallucinated value
+            continue
 
         out[k] = {
             "value": safe_val,
             "units": v.get("units"),
             "raw": v.get("raw"),
             "reference_low": v.get("reference_low"),
-            "reference_high": v.get("reference_high")
+            "reference_high": v.get("reference_high"),
         }
 
-    # Compute NLR only if BOTH values are present and safe
+    # Compute NLR
     try:
         n = out.get("Neutrophils", {}).get("value")
         l = out.get("Lymphocytes", {}).get("value")
@@ -446,10 +445,13 @@ def canonical_map(parsed: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]
             out["NLR"] = {
                 "value": round(n / l, 2),
                 "units": None,
-                "raw": "computed NLR"
+                "raw": "computed NLR",
             }
     except Exception:
         pass
+
+    return out
+
     # -----------------------------
     # Derived renal metrics (safe)
     # -----------------------------
@@ -1274,7 +1276,8 @@ def process_report(job: Dict[str, Any]) -> Dict[str, Any]:
 
         # ---------- Renal risk ----------
         creat = canonical.get("Creatinine", {}).get("value")
-        egfr = canonical.get("eGFR (CKD-EPI)", {}).get("value")
+        egfr = canonical.get("eGFR", {}).get("value")
+
 
         if egfr is not None:
             if egfr < 30:
