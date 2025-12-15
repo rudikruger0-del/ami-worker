@@ -637,12 +637,14 @@ def route_engine_all(
     next_steps = []
     ddx = []
     per_key = {}
-    severity_scores = []
-        if not doctor_trust_flags:
-        doctor_trust_flags = {
-            "has_acute_risk": False,
-            "has_long_term_risk": False
-        }
+severity_scores = []
+
+if not doctor_trust_flags:
+    doctor_trust_flags = {
+        "has_acute_risk": False,
+        "has_long_term_risk": False
+    }
+
 
 
     # build per_key and severity list
