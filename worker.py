@@ -945,19 +945,26 @@ def process_report(job: dict) -> dict:
             if isinstance(r, dict)
         )
 
+        # ---- Allow chemistry-only interpretation for DIGITAL PDFs ----
         if not cbc_present and not chemistry_present:
-            raise ValueError(
-                "No interpretable laboratory data extracted — interpretation blocked"
-            )
-
-        ai_json["_cbc_status"] = "present" if cbc_present else "missing"
-        ai_json["_chemistry_status"] = "present" if chemistry_present else "missing"
+            if scanned:
+                raise ValueError(
+                    "No interpretable laboratory data extracted — interpretation blocked"
+                )
+            else:
+                # Chemistry likely exists in text (digital PDF)
+                ai_json["_cbc_status"] = "missing"
+                ai_json["_chemistry_status"] = "assumed_from_text"
+        else:
+            ai_json["_cbc_status"] = "present" if cbc_present else "missing"
+            ai_json["_chemistry_status"] = "present" if chemistry_present else "missing"
 
         # --------------------
         # Clinical augmentation
         # --------------------
         print("Building clinical augmentation...")
         augmented = build_full_clinical_report(ai_json)
+
 
 
         
