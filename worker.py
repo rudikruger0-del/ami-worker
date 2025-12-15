@@ -824,7 +824,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     chemistry_context = None
     chemistry_next_steps = None
 
-    if ai_json.get("_chemistry_status") == "present":
+    if ai_json.get("_chemistry_status") in ("present", "assumed_from_text"):
         chemistry_context = []
         chemistry_next_steps = []
 
