@@ -774,6 +774,61 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     except:
         patient_name = None
     trends = trend_comparison(patient_name, cdict)
+    # ---------------------------
+    # Chemistry-specific clinical context & conservative next steps
+    # ---------------------------
+    chemistry_context = None
+    chemistry_next_steps = None
+
+    if ai_json.get("_chemistry_status") == "present":
+        chemistry_context = []
+        chemistry_next_steps = []
+
+        v = lambda k: clean_number(cdict.get(k, {}).get("value"))
+
+        bilirubin = v("Bilirubin")
+        alt = v("ALT")
+        ast = v("AST")
+        alp = v("ALP")
+        ggt = v("GGT")
+        crp = v("CRP")
+        triglycerides = v("Triglycerides")
+        ldl = v("LDL") if "LDL" in cdict else None
+
+        # ---- Clinical context considerations ----
+        if bilirubin is not None and bilirubin > 21:
+            if all(x is not None and x <= cdict.get(k, {}).get("reference_high", float("inf"))
+                   for k, x in [("ALT", alt), ("AST", ast), ("ALP", alp), ("GGT", ggt)]):
+                chemistry_context.append(
+                    "Unconjugated hyperbilirubinaemia with normal liver enzymes is commonly benign "
+                    "(e.g. Gilbert syndrome), particularly if intermittent."
+                )
+
+        if crp is not None and crp < 5:
+            chemistry_context.append(
+                "Normal CRP reduces the likelihood of acute inflammatory or infectious pathology."
+            )
+
+        if triglycerides is not None and triglycerides > 1.7:
+            chemistry_context.append(
+                "Lipid abnormalities are more suggestive of long-term cardiovascular risk rather than acute illness."
+            )
+
+        # ---- Conservative suggested next steps ----
+        if triglycerides is not None or ldl is not None:
+            chemistry_next_steps.append(
+                "Repeat fasting lipid profile in 3–6 months if clinically appropriate."
+            )
+            chemistry_next_steps.append(
+                "Consider fasting status and recent alcohol intake when interpreting triglyceride levels."
+            )
+
+        if bilirubin is not None and bilirubin > 21:
+            chemistry_next_steps.append(
+                "If bilirubin remains elevated, consider repeat fractionation ± reticulocyte count "
+                "based on clinical context."
+            )
+
 
     # Compose final augmented report
     augmented = dict(ai_json)  # shallow copy
@@ -782,6 +837,8 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     augmented["_severity"] = sev
     augmented["_differential_trees"] = diffs
     augmented["_trend_comparison"] = trends
+    augmented["_clinical_context"] = chemistry_context
+    augmented["_suggested_next_steps"] = chemistry_next_steps
     augmented["_generated_at"] = iso_now()
     augmented["_overall_status"] = overall_status
 
