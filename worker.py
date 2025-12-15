@@ -813,7 +813,8 @@ def process_report(job: dict) -> dict:
             )
             for r in cbc_rows
             if isinstance(r, dict)
-        )        # ---- Chemistry detection (doctor-grade) ----
+        )       
+        # ---- Chemistry detection (doctor-grade) ----
         chemistry_keys = (
             "crp", "creatinine", "egfr",
             "bilirubin", "alt", "ast", "alp", "ggt",
