@@ -670,12 +670,8 @@ def trend_comparison(patient_name: str, current_cdict: dict) -> dict:
         print("Trend comparison error:", e)
         traceback.print_exc()
         return {"note": "Trend comparison failed: " + str(e), "trends": []}
-        def detect_simple_clinical_patterns(cdict: dict) -> list:
-    """
-    Conservative, pattern-first clinical notes.
-    Text-only. No diagnoses. No severity changes.
-    Safe to ignore if empty.
-    """
+       
+def detect_simple_clinical_patterns(cdict: dict) -> list:
     notes = []
 
     v = lambda k: clean_number(cdict.get(k, {}).get("value"))
@@ -690,21 +686,20 @@ def trend_comparison(patient_name: str, current_cdict: dict) -> dict:
     ldl = v("LDL")
     hdl = v("HDL")
 
-   # ---- Isolated bilirubin pattern ----
-if bilirubin is not None and bilirubin > 21:
-    def ref_high(k):
-        return clean_number(cdict.get(k, {}).get("reference_high"))
+    # ---- Isolated bilirubin pattern ----
+    if bilirubin is not None and bilirubin > 21:
+        def ref_high(k):
+            return clean_number(cdict.get(k, {}).get("reference_high"))
 
-    if all(
-        x is not None and
-        (ref_high(k) is None or x <= ref_high(k))
-        for k, x in [("ALT", alt), ("AST", ast), ("ALP", alp), ("GGT", ggt)]
-    ):
-        notes.append(
-            "Pattern: Isolated unconjugated hyperbilirubinaemia with normal liver enzymes — "
-            "commonly benign (e.g. Gilbert syndrome), particularly if intermittent."
-        )
-
+        if all(
+            x is not None and
+            (ref_high(k) is None or x <= ref_high(k))
+            for k, x in [("ALT", alt), ("AST", ast), ("ALP", alp), ("GGT", ggt)]
+        ):
+            notes.append(
+                "Pattern: Isolated unconjugated hyperbilirubinaemia with normal liver enzymes — "
+                "commonly benign (e.g. Gilbert syndrome), particularly if intermittent."
+            )
 
     # ---- Lipid pattern ----
     if tg is not None or ldl is not None:
@@ -714,6 +709,7 @@ if bilirubin is not None and bilirubin > 21:
         )
 
     return notes
+
 
 
 # ---------------------------
@@ -732,6 +728,9 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # canonical dict
     cdict = build_cbc_value_dict(ai_json)
     overall_status = overall_clinical_status(cdict)
+    # pattern-first clinical notes
+    patterns = detect_simple_clinical_patterns(cdict)
+
 
 
     # routes (reuse earlier generate_routes logic but return rich objects)
@@ -890,6 +889,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     augmented["_trend_comparison"] = trends
     augmented["_clinical_context"] = chemistry_context
     augmented["_suggested_next_steps"] = chemistry_next_steps
+    augmented["_clinical_patterns"] = patterns
     augmented["_generated_at"] = iso_now()
     augmented["_overall_status"] = overall_status
 
