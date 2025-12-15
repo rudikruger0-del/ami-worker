@@ -795,47 +795,50 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # Canonical dict
     # ---------------------------
     cdict = build_cbc_value_dict(ai_json)
-   # -----------------------------------
-# Merge chemistry rows into canonical dict (SAFE)
-# -----------------------------------
-for r in (ai_json.get("chemistry") or []):
-    if not isinstance(r, dict):
-        continue
 
-    raw = (r.get("analyte") or r.get("test") or "").lower().strip()
-    if not raw:
-        continue
+    # -----------------------------------
+    # Merge chemistry rows into canonical dict (SAFE)
+    # -----------------------------------
+    for r in (ai_json.get("chemistry") or []):
+        if not isinstance(r, dict):
+            continue
 
-    def put(k):
-        if k not in cdict:
-            cdict[k] = r
+        raw = (r.get("analyte") or r.get("test") or "").lower().strip()
+        if not raw:
+            continue
 
-    if "bilirubin" in raw:
-        put("Bilirubin")
-    elif raw == "alt" or "alanine" in raw:
-        put("ALT")
-    elif raw == "ast" or "aspartate" in raw:
-        put("AST")
-    elif "alkaline phosphatase" in raw or raw == "alp":
-        put("ALP")
-    elif "gamma" in raw or "ggt" in raw:
-        put("GGT")
-    elif "triglyceride" in raw:
-        put("Triglycerides")
-    elif "ldl" in raw:
-        put("LDL")
-    elif "hdl" in raw:
-        put("HDL")
-    elif "cholesterol" in raw and "non" in raw:
-        put("Non-HDL")
-    elif "cholesterol" in raw:
-        put("Cholesterol")
-    elif "crp" in raw:
-        put("CRP")
-    elif "creatinine" in raw:
-        put("Creatinine")
+        def put(k):
+            if k not in cdict:
+                cdict[k] = r
 
+        if "bilirubin" in raw:
+            put("Bilirubin")
+        elif raw == "alt" or "alanine" in raw:
+            put("ALT")
+        elif raw == "ast" or "aspartate" in raw:
+            put("AST")
+        elif "alkaline phosphatase" in raw or raw == "alp":
+            put("ALP")
+        elif "gamma" in raw or "ggt" in raw:
+            put("GGT")
+        elif "triglyceride" in raw:
+            put("Triglycerides")
+        elif "ldl" in raw:
+            put("LDL")
+        elif "hdl" in raw:
+            put("HDL")
+        elif "cholesterol" in raw and "non" in raw:
+            put("Non-HDL")
+        elif "cholesterol" in raw:
+            put("Cholesterol")
+        elif "crp" in raw:
+            put("CRP")
+        elif "creatinine" in raw:
+            put("Creatinine")
 
+    # ---------------------------
+    # Patient context
+    # ---------------------------
     if isinstance(ai_json.get("patient"), dict):
         cdict["_patient_age"] = ai_json["patient"].get("age")
 
@@ -1001,7 +1004,7 @@ for r in (ai_json.get("chemistry") or []):
     try:
         patient_name = (ai_json.get("patient") or {}).get("name")
     except Exception:
-        patient_name = None
+        pass
 
     trends = trend_comparison(patient_name, cdict)
 
@@ -1014,8 +1017,6 @@ for r in (ai_json.get("chemistry") or []):
     if ai_json.get("_chemistry_status") in ("present", "assumed_from_text"):
         chemistry_context = []
         chemistry_next_steps = []
-
-        v = lambda k: clean_number(cdict.get(k, {}).get("value"))
 
         bilirubin = v("Bilirubin")
         alt = v("ALT")
@@ -1091,6 +1092,8 @@ for r in (ai_json.get("chemistry") or []):
     augmented["_overall_status"] = overall_status
 
     return augmented
+
+
 
 
 
