@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 """
-AMI Health Worker — Production Clinical Pipeline
+AMI Health Worker — Clinical-Safe Deterministic Engine
 SAFETY-CRITICAL SYSTEM
 
-PART 1 / 7
-- Imports
-- Environment & config
-- Age / sex reference framework
-- Safety helpers
-- Parser contracts (NO interpretation)
+Design principles:
+- Deterministic (no AI interpretation)
+- Conservative wording
+- Explicit limitations
+- Age & sex aware
+- CBC ≠ Chemistry (never blurred)
 """
+
+# =========================
+# Imports
+# =========================
 
 import os
 import io
 import re
 import time
 import json
-import math
 import logging
 import traceback
 from typing import Dict, Any, Optional, List, Tuple
@@ -24,11 +27,11 @@ from typing import Dict, Any, Optional, List, Tuple
 from dotenv import load_dotenv
 from pypdf import PdfReader
 from pdf2image import convert_from_bytes
-from PIL import Image, ImageOps, ImageFilter
+from PIL import Image, ImageOps
 
-# -------------------------
-# ENVIRONMENT
-# -------------------------
+# =========================
+# Environment
+# =========================
 
 load_dotenv()
 
@@ -36,26 +39,25 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "reports")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "reports")
-
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "6"))
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("Supabase credentials missing")
+    raise RuntimeError("Missing Supabase credentials")
 
-# -------------------------
-# LOGGING (DOCTOR-SAFE)
-# -------------------------
+# =========================
+# Logging (doctor-safe)
+# =========================
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [AMI-WORKER] %(levelname)s: %(message)s"
+    format="%(asctime)s [AMI] %(levelname)s: %(message)s"
 )
 
 log = logging.getLogger("ami-worker")
 
-# -------------------------
-# SUPABASE CLIENT
-# -------------------------
+# =========================
+# Supabase client
+# =========================
 
 try:
     from supabase import create_client
@@ -64,24 +66,27 @@ except Exception as e:
     supabase = None
     log.error("Supabase init failed: %s", e)
 
-# -------------------------
-# OCR CONFIG (SAFE DEFAULTS)
-# -------------------------
+# =========================
+# OCR availability
+# =========================
 
-MAX_OCR_WIDTH = int(os.getenv("AMI_OCR_MAX_WIDTH", "1400"))
-OCR_JPEG_QUALITY = int(os.getenv("AMI_OCR_JPEG_QUALITY", "70"))
+try:
+    import pytesseract
+    HAS_PYTESSERACT = True
+except Exception:
+    HAS_PYTESSERACT = False
+    log.warning("pytesseract not available — OCR disabled")
 
-# -------------------------
-# TIME HELPERS
-# -------------------------
+# =========================
+# Time helpers
+# =========================
 
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-# -------------------------
-# AGE GROUPING (CRITICAL)
-# -------------------------
-# Used everywhere downstream. Must be deterministic.
+# =========================
+# Age & sex handling
+# =========================
 
 def age_group(age: Optional[float]) -> str:
     if age is None:
@@ -101,10 +106,6 @@ def age_group(age: Optional[float]) -> str:
         return "adult"
     return "elderly"
 
-# -------------------------
-# SEX NORMALISATION
-# -------------------------
-
 def normalize_sex(sex: Optional[str]) -> str:
     if not sex:
         return "unknown"
@@ -115,11 +116,9 @@ def normalize_sex(sex: Optional[str]) -> str:
         return "female"
     return "unknown"
 
-# -------------------------
-# HARD NUMERIC SAFETY GATES
-# -------------------------
-# If a value breaches these → DROP IT
-# Never hallucinate, never clip
+# =========================
+# Numeric safety
+# =========================
 
 PHYSIOLOGIC_LIMITS = {
     "Hb": (3.0, 25.0),
@@ -135,46 +134,141 @@ PHYSIOLOGIC_LIMITS = {
     "AST": (0, 5000),
 }
 
-def safe_float(v: Any) -> Optional[float]:
+def safe_float(val: Any) -> Optional[float]:
     try:
-        return float(v)
+        return float(val)
     except Exception:
         return None
 
-def numeric_safety_gate(key: str, value: float) -> Optional[float]:
-    if key not in PHYSIOLOGIC_LIMITS:
+def numeric_safety_gate(analyte: str, value: float) -> Optional[float]:
+    if analyte not in PHYSIOLOGIC_LIMITS:
         return value
-    low, high = PHYSIOLOGIC_LIMITS[key]
+    low, high = PHYSIOLOGIC_LIMITS[analyte]
     if value < low or value > high:
         return None
     return value
+# =========================
+# PART 2 — PDF INGESTION & OCR
+# =========================
+
+MAX_OCR_WIDTH = int(os.getenv("AMI_OCR_MAX_WIDTH", "1400"))
+OCR_JPEG_QUALITY = int(os.getenv("AMI_OCR_JPEG_QUALITY", "70"))
 
 # -------------------------
-# PARSER CONTRACT (IMPORTANT)
+# Download PDF
 # -------------------------
-# Parser MUST return:
-# {
-#   analyte: {
-#     value: float,
-#     units: str | None,
-#     flag: "H" | "L" | None,
-#     ref_low: float | None,
-#     ref_high: float | None,
-#     raw: str
-#   }
-# }
-#
-# Parser must NEVER:
-# - guess
-# - infer
-# - normalise
-# - interpret
+
+def download_pdf_from_supabase(job: Dict[str, Any]) -> bytes:
+    if job.get("pdf_url"):
+        import requests
+        r = requests.get(job["pdf_url"], timeout=30)
+        r.raise_for_status()
+        return r.content
+
+    if not supabase or not job.get("file_path"):
+        raise RuntimeError("No PDF source available")
+
+    res = supabase.storage.from_(SUPABASE_BUCKET).download(job["file_path"])
+    if hasattr(res, "data") and res.data:
+        return res.data
+    if isinstance(res, (bytes, bytearray)):
+        return res
+
+    raise RuntimeError("Empty PDF download")
+
+# -------------------------
+# Digital text extraction
+# -------------------------
+
+def extract_text_digital(pdf_bytes: bytes) -> str:
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        pages = []
+        for page in reader.pages:
+            try:
+                pages.append(page.extract_text() or "")
+            except Exception:
+                pages.append("")
+        return "\n".join(pages).strip()
+    except Exception:
+        return ""
+
+# -------------------------
+# Scanned detection
+# -------------------------
+
+def is_scanned_pdf(pdf_bytes: bytes, min_chars: int = 100) -> bool:
+    text = extract_text_digital(pdf_bytes)
+    return len(text.strip()) < min_chars
+
+# -------------------------
+# OCR preprocessing
+# -------------------------
+
+def preprocess_image_for_ocr(img: Image.Image) -> Image.Image:
+    img = ImageOps.exif_transpose(img)
+    img = img.convert("L")
+    w, h = img.size
+    if w > MAX_OCR_WIDTH:
+        new_h = int((MAX_OCR_WIDTH / w) * h)
+        img = img.resize((MAX_OCR_WIDTH, new_h), Image.LANCZOS)
+    return img
+
+# -------------------------
+# OCR page
+# -------------------------
+
+def ocr_image(img: Image.Image) -> str:
+    if not HAS_PYTESSERACT:
+        raise RuntimeError("OCR requested but pytesseract unavailable")
+    return pytesseract.image_to_string(img, config="--psm 6")
+
+# -------------------------
+# OCR full PDF
+# -------------------------
+
+def extract_text_scanned(pdf_bytes: bytes) -> str:
+    if not HAS_PYTESSERACT:
+        raise RuntimeError("Scanned PDF but OCR disabled")
+
+    pages = convert_from_bytes(pdf_bytes, dpi=300)
+    all_text: List[str] = []
+
+    for page in pages:
+        try:
+            img = preprocess_image_for_ocr(page)
+            txt = ocr_image(img)
+            if txt.strip():
+                all_text.append(txt)
+        except Exception:
+            continue
+
+    final = "\n".join(all_text).strip()
+    if not final:
+        raise RuntimeError("OCR produced no text")
+
+    return final
+
+# -------------------------
+# Unified extraction
+# -------------------------
+
+def extract_text_from_pdf(pdf_bytes: bytes) -> Tuple[str, bool]:
+    digital = extract_text_digital(pdf_bytes)
+    if digital and len(digital) >= 100:
+        return digital, False
+
+    log.info("Scanned PDF detected — running OCR")
+    return extract_text_scanned(pdf_bytes), True
+# =========================
+# PART 3 — PARSER (FACTS ONLY)
+# =========================
 
 ParsedValue = Dict[str, Any]
 ParsedResults = Dict[str, ParsedValue]
 
 # -------------------------
-# ANALYTE NORMALISATION MAP
+# Analyte normalization
 # -------------------------
 
 ANALYTE_SYNONYMS = {
@@ -183,21 +277,26 @@ ANALYTE_SYNONYMS = {
     "hemoglobin": "Hb",
     "wbc": "WBC",
     "white cell count": "WBC",
+    "leukocytes": "WBC",
     "platelets": "Platelets",
     "plt": "Platelets",
     "mcv": "MCV",
     "rdw": "RDW",
+    "neutrophils": "Neutrophils",
+    "lymphocytes": "Lymphocytes",
     "crp": "CRP",
     "creatinine": "Creatinine",
-    "na": "Sodium",
     "sodium": "Sodium",
-    "k": "Potassium",
+    "na": "Sodium",
     "potassium": "Potassium",
+    "k": "Potassium",
     "ck": "CK",
     "alt": "ALT",
     "ast": "AST",
     "bilirubin total": "Bilirubin",
     "bilirubin": "Bilirubin",
+    "bilirubin conjugated": "Bilirubin Conjugated",
+    "bilirubin unconjugated": "Bilirubin Unconjugated",
     "ldl": "LDL",
     "hdl": "HDL",
     "triglycerides": "Triglycerides",
@@ -210,188 +309,8 @@ def normalize_analyte(label: str) -> Optional[str]:
     key = re.sub(r"[^a-z0-9\- ]", "", label.lower()).strip()
     return ANALYTE_SYNONYMS.get(key)
 
-# =========================
-# END PART 1
-# =========================
-"""
-PART 2 / 7
-- Download PDF from Supabase
-- Detect digital vs scanned PDF
-- OCR using pytesseract ONLY
-- Text extraction with hard fallbacks
-"""
-
 # -------------------------
-# OPTIONAL OCR DEPENDENCY
-# -------------------------
-
-try:
-    import pytesseract
-    HAS_PYTESSERACT = True
-except Exception:
-    HAS_PYTESSERACT = False
-    log.warning("pytesseract not available — OCR disabled")
-
-# -------------------------
-# PDF DOWNLOAD
-# -------------------------
-
-def download_pdf_from_supabase(job: Dict[str, Any]) -> bytes:
-    """
-    Returns raw PDF bytes.
-    FAILS HARD if unavailable.
-    """
-    if job.get("pdf_url"):
-        import requests
-        r = requests.get(job["pdf_url"], timeout=30)
-        r.raise_for_status()
-        return r.content
-
-    if not supabase or not job.get("file_path"):
-        raise RuntimeError("No pdf_url or file_path available")
-
-    try:
-        res = supabase.storage.from_(SUPABASE_BUCKET).download(job["file_path"])
-        if hasattr(res, "data") and res.data:
-            return res.data
-        if isinstance(res, (bytes, bytearray)):
-            return res
-    except Exception as e:
-        raise RuntimeError(f"Supabase download failed: {e}")
-
-    raise RuntimeError("Empty PDF download response")
-
-# -------------------------
-# DIGITAL TEXT EXTRACTION
-# -------------------------
-
-def extract_text_digital(pdf_bytes: bytes) -> str:
-    """
-    Extract selectable text using pypdf.
-    Returns EMPTY STRING if none found.
-    """
-    try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        pages = []
-        for page in reader.pages:
-            try:
-                txt = page.extract_text() or ""
-            except Exception:
-                txt = ""
-            pages.append(txt)
-        return "\n".join(pages).strip()
-    except Exception as e:
-        log.warning("Digital text extraction failed: %s", e)
-        return ""
-
-# -------------------------
-# SCANNED PDF DETECTION
-# -------------------------
-
-def is_scanned_pdf(pdf_bytes: bytes, min_chars: int = 100) -> bool:
-    """
-    Heuristic:
-    If digital text < min_chars → treat as scanned.
-    """
-    text = extract_text_digital(pdf_bytes)
-    return len(text) < min_chars
-
-# -------------------------
-# OCR IMAGE PREPROCESSING
-# -------------------------
-
-def preprocess_image_for_ocr(img: Image.Image) -> Image.Image:
-    """
-    Conservative preprocessing.
-    Do NOT destroy numeric clarity.
-    """
-    img = ImageOps.exif_transpose(img)
-    img = img.convert("L")  # grayscale
-    w, h = img.size
-    if w > MAX_OCR_WIDTH:
-        new_h = int((MAX_OCR_WIDTH / w) * h)
-        img = img.resize((MAX_OCR_WIDTH, new_h), Image.LANCZOS)
-    return img
-
-# -------------------------
-# OCR PAGE
-# -------------------------
-
-def ocr_image(img: Image.Image) -> str:
-    if not HAS_PYTESSERACT:
-        raise RuntimeError("OCR requested but pytesseract not installed")
-
-    try:
-        return pytesseract.image_to_string(
-            img,
-            config="--psm 6"
-        )
-    except Exception as e:
-        log.error("OCR failed: %s", e)
-        return ""
-
-# -------------------------
-# OCR FULL PDF
-# -------------------------
-
-def extract_text_scanned(pdf_bytes: bytes) -> str:
-    """
-    OCR each page and concatenate text.
-    FAILS CLOSED if OCR yields nothing.
-    """
-    if not HAS_PYTESSERACT:
-        raise RuntimeError("Scanned PDF but OCR unavailable")
-
-    pages = convert_from_bytes(pdf_bytes, dpi=300)
-    all_text = []
-
-    for idx, page in enumerate(pages):
-        try:
-            img = preprocess_image_for_ocr(page)
-            txt = ocr_image(img)
-            if txt.strip():
-                all_text.append(txt)
-        except Exception as e:
-            log.warning(f"OCR page {idx} failed: {e}")
-
-    final_text = "\n".join(all_text).strip()
-
-    if not final_text:
-        raise RuntimeError("OCR produced no text")
-
-    return final_text
-
-# -------------------------
-# MASTER TEXT EXTRACTION
-# -------------------------
-
-def extract_text_from_pdf(pdf_bytes: bytes) -> Tuple[str, bool]:
-    """
-    Returns (text, scanned_flag)
-    """
-    digital_text = extract_text_digital(pdf_bytes)
-
-    if digital_text and len(digital_text) >= 100:
-        return digital_text, False
-
-    log.info("PDF appears scanned — running OCR")
-    scanned_text = extract_text_scanned(pdf_bytes)
-    return scanned_text, True
-
-# =========================
-# END PART 2
-# =========================
-"""
-PART 3 / 7
-- Robust CBC + chemistry parsing
-- Extract value, units, H/L flag
-- Extract reference ranges
-- Preserve lab comments
-- ZERO interpretation
-"""
-
-# -------------------------
-# REGEX BUILDING BLOCKS
+# Regex blocks
 # -------------------------
 
 NUM = r"(-?\d+(?:\.\d+)?)"
@@ -400,26 +319,14 @@ UNIT = r"([a-zA-Z/%µ\^\-\d]+)"
 FLAG = r"\b(H|L)\b"
 
 # -------------------------
-# LINE PARSERS
+# Parse a single line
 # -------------------------
 
 def parse_result_line(line: str) -> Optional[Tuple[str, ParsedValue]]:
-    """
-    Parses a single lab line.
-    Returns (analyte, parsed_dict) or None
-    """
-
     raw = line.strip()
-    if not raw or len(raw) < 4:
+    if len(raw) < 4:
         return None
 
-    # Example patterns handled:
-    # Hb 11.6 g/dL L (12.4 - 16.7)
-    # Platelets 376 x10^9/L (150 - 450)
-    # Neutrophils 88.0 % H
-    # WBC 19.41 x10^9/L H 4.0 - 12.0
-
-    # Extract analyte label
     label_match = re.match(r"^([A-Za-z\-\s/]+)", raw)
     if not label_match:
         return None
@@ -429,7 +336,6 @@ def parse_result_line(line: str) -> Optional[Tuple[str, ParsedValue]]:
     if not analyte:
         return None
 
-    # Extract numeric value
     value_match = re.search(NUM, raw)
     if not value_match:
         return None
@@ -438,24 +344,20 @@ def parse_result_line(line: str) -> Optional[Tuple[str, ParsedValue]]:
     if value is None:
         return None
 
-    # Units
     unit_match = re.search(UNIT, raw[value_match.end():])
     units = unit_match.group(1) if unit_match else None
 
-    # H/L flag
     flag_match = re.search(FLAG, raw)
     flag = flag_match.group(1) if flag_match else None
 
-    # Reference range
     ref_low = None
     ref_high = None
-
     range_match = re.search(RANGE, raw)
     if range_match:
         ref_low = safe_float(range_match.group(1))
         ref_high = safe_float(range_match.group(2))
 
-    parsed: ParsedValue = {
+    return analyte, {
         "value": value,
         "units": units,
         "flag": flag,
@@ -464,20 +366,11 @@ def parse_result_line(line: str) -> Optional[Tuple[str, ParsedValue]]:
         "raw": raw
     }
 
-    return analyte, parsed
-
 # -------------------------
-# FULL TEXT PARSER
+# Parse full text
 # -------------------------
 
 def parse_lab_text(text: str) -> Tuple[ParsedResults, List[str]]:
-    """
-    Parses entire extracted text.
-    Returns:
-    - parsed results dict
-    - lab comments list
-    """
-
     results: ParsedResults = {}
     comments: List[str] = []
 
@@ -489,7 +382,6 @@ def parse_lab_text(text: str) -> Tuple[ParsedResults, List[str]]:
     for line in lines:
         lower = line.lower()
 
-        # Capture lab comments verbatim
         if lower.startswith("comment") or "suggested" in lower:
             comments.append(line)
             continue
@@ -500,7 +392,6 @@ def parse_lab_text(text: str) -> Tuple[ParsedResults, List[str]]:
 
         analyte, data = parsed
 
-        # Safety gate numeric
         safe_val = numeric_safety_gate(analyte, data["value"])
         if safe_val is None:
             continue
@@ -511,7 +402,7 @@ def parse_lab_text(text: str) -> Tuple[ParsedResults, List[str]]:
     return results, comments
 
 # -------------------------
-# CBC PRESENCE CHECK
+# CBC presence detection
 # -------------------------
 
 CBC_KEYS = {
@@ -521,21 +412,9 @@ CBC_KEYS = {
 
 def cbc_present(parsed: ParsedResults) -> bool:
     return any(k in parsed for k in CBC_KEYS)
-
 # =========================
-# END PART 3
+# PART 4 — CANONICAL MAP (FACTS ONLY)
 # =========================
-"""
-PART 4 / 7
-- Canonical mapping (validated facts only)
-- Age / sex context attached
-- CBC presence explicitly flagged
-- No interpretation, no routes yet
-"""
-
-# -------------------------
-# CANONICAL MAP
-# -------------------------
 
 def canonical_map(
     parsed: ParsedResults,
@@ -544,8 +423,8 @@ def canonical_map(
     patient_sex: Optional[str]
 ) -> Dict[str, Any]:
     """
-    Converts parsed results into a canonical, context-aware structure.
-    This function MUST NOT interpret severity.
+    Converts parsed lab values into a canonical structure.
+    No severity, no routing, no interpretation.
     """
 
     canonical: Dict[str, Any] = {}
@@ -553,7 +432,10 @@ def canonical_map(
     age_grp = age_group(patient_age)
     sex = normalize_sex(patient_sex)
 
-    # Attach metadata early
+    # -------------------------
+    # Metadata
+    # -------------------------
+
     canonical["_meta"] = {
         "age": patient_age,
         "age_group": age_grp,
@@ -562,7 +444,10 @@ def canonical_map(
         "parser_comments": comments,
     }
 
+    # -------------------------
     # Copy analytes verbatim
+    # -------------------------
+
     for analyte, data in parsed.items():
         canonical[analyte] = {
             "value": data.get("value"),
@@ -577,7 +462,7 @@ def canonical_map(
     # SAFE DERIVED VALUES ONLY
     # -------------------------
 
-    # Neutrophil–Lymphocyte Ratio (only if both absolute)
+    # Neutrophil–Lymphocyte Ratio
     try:
         n = canonical.get("Neutrophils", {}).get("value")
         l = canonical.get("Lymphocytes", {}).get("value")
@@ -588,7 +473,7 @@ def canonical_map(
                 "flag": None,
                 "ref_low": None,
                 "ref_high": None,
-                "raw": "calculated NLR",
+                "raw": "Calculated NLR"
             }
     except Exception:
         pass
@@ -596,27 +481,21 @@ def canonical_map(
     return canonical
 
 # -------------------------
-# CBC AVAILABILITY GUARD
+# CBC availability guard
 # -------------------------
 
 def assert_cbc_or_flag(canonical: Dict[str, Any]) -> None:
-    """
-    If CBC missing, insert explicit safety flag.
-    """
     if not canonical.get("_meta", {}).get("cbc_present"):
         canonical["_safety"] = canonical.get("_safety", [])
         canonical["_safety"].append(
-            "CBC not detected — interpretation limited to chemistry only"
+            "CBC not available — interpretation limited to chemistry only"
         )
 
 # -------------------------
-# BILIRUBIN NUANCE (FACT ONLY)
+# Bilirubin factual context
 # -------------------------
 
 def annotate_bilirubin_context(canonical: Dict[str, Any]) -> None:
-    """
-    Adds factual bilirubin relationships without interpretation.
-    """
     total = canonical.get("Bilirubin", {}).get("value")
     conj = canonical.get("Bilirubin Conjugated", {}).get("value")
     unconj = canonical.get("Bilirubin Unconjugated", {}).get("value")
@@ -625,19 +504,17 @@ def annotate_bilirubin_context(canonical: Dict[str, Any]) -> None:
         if abs((conj + unconj) - total) <= 2:
             canonical["_facts"] = canonical.get("_facts", [])
             canonical["_facts"].append(
-                "Bilirubin fractions consistent with isolated elevation"
+                "Isolated bilirubin elevation with normal fractions"
             )
 
 # -------------------------
-# LONG-TERM RISK FLAGS (FACTUAL)
+# Long-term risk flags (FACT ONLY)
 # -------------------------
 
-def apply_long_term_risk_flags(canonical: Dict[str, Any], trust_flags: Dict[str, bool]) -> None:
-    """
-    Marks presence of long-term risk factors.
-    Does NOT change severity here.
-    """
-
+def apply_long_term_risk_flags(
+    canonical: Dict[str, Any],
+    trust_flags: Dict[str, bool]
+) -> None:
     ldl = canonical.get("LDL", {}).get("value")
     tg = canonical.get("Triglycerides", {}).get("value")
     non_hdl = canonical.get("Non-HDL", {}).get("value")
@@ -648,36 +525,19 @@ def apply_long_term_risk_flags(canonical: Dict[str, Any], trust_flags: Dict[str,
         trust_flags["has_long_term_risk"] = True
     if non_hdl is not None and non_hdl >= 3.4:
         trust_flags["has_long_term_risk"] = True
-
 # =========================
-# END PART 4
+# PART 5 — SEVERITY & ROUTING LOGIC
 # =========================
-"""
-PART 5 / 7
-- Per-analyte severity (TEXT ONLY)
-- Age-aware thresholds
-- Acute vs long-term separation
-- No admission language
-- No false reassurance
-"""
 
-# -------------------------
-# SEVERITY SCALE (TEXT ONLY)
-# -------------------------
-
-SEVERITY_ORDER = [
-    "normal",
-    "mild",
-    "moderate",
-    "severe",
-    "critical"
-]
+SEVERITY_ORDER = ["normal", "mild", "moderate", "severe", "critical"]
 
 def max_severity(a: str, b: str) -> str:
-    return SEVERITY_ORDER[max(SEVERITY_ORDER.index(a), SEVERITY_ORDER.index(b))]
+    return SEVERITY_ORDER[
+        max(SEVERITY_ORDER.index(a), SEVERITY_ORDER.index(b))
+    ]
 
 # -------------------------
-# AGE / SEX AWARE THRESHOLDS
+# Age / sex aware Hb limits
 # -------------------------
 
 def hb_lower_limit(age_group: str, sex: str) -> float:
@@ -688,7 +548,7 @@ def hb_lower_limit(age_group: str, sex: str) -> float:
     return 12.0 if sex == "female" else 13.0
 
 # -------------------------
-# PER-ANALYTE SEVERITY
+# Per-analyte severity
 # -------------------------
 
 def severity_for_analyte(
@@ -777,7 +637,7 @@ def severity_for_analyte(
     return "normal"
 
 # -------------------------
-# ROUTE ENGINE
+# Route engine
 # -------------------------
 
 def route_engine(
@@ -794,19 +654,12 @@ def route_engine(
 
     acute_findings = []
     chronic_findings = []
-    suggestions = []
-    differentials = []
 
-    # -------------------------
     # CBC missing guard
-    # -------------------------
-
     if not meta.get("cbc_present"):
-        chronic_findings.append("CBC not available — chemistry-only interpretation")
-
-    # -------------------------
-    # PER ANALYTE PASS
-    # -------------------------
+        chronic_findings.append(
+            "CBC unavailable — chemistry-only interpretation"
+        )
 
     for analyte, data in canonical.items():
         if analyte.startswith("_"):
@@ -826,20 +679,13 @@ def route_engine(
 
         overall_severity = max_severity(overall_severity, sev)
 
-        # -------------------------
-        # ACUTE vs CHRONIC LOGIC
-        # -------------------------
-
         if sev in ("severe", "critical"):
             acute_findings.append(f"{analyte} markedly abnormal")
 
-        elif analyte in ("LDL", "Triglycerides", "Non-HDL") and value is not None:
+        if analyte in ("LDL", "Triglycerides", "Non-HDL") and value is not None:
             chronic_findings.append(f"{analyte} elevated")
 
-    # -------------------------
-    # BILIRUBIN NUANCE
-    # -------------------------
-
+    # Bilirubin nuance (chronic, non-acute)
     if "Bilirubin" in canonical:
         b = canonical["Bilirubin"]["value"]
         if b is not None and b > 21:
@@ -847,50 +693,22 @@ def route_engine(
                 "Mild isolated bilirubin elevation — benign causes possible"
             )
 
-    # -------------------------
-    # TRUST OVERRIDE
-    # -------------------------
-
+    # Trust-based downgrade
     if trust_flags.get("has_long_term_risk") and overall_severity == "normal":
         overall_severity = "mild"
-
-    # -------------------------
-    # SUMMARY (DEFENSIVE)
-    # -------------------------
-
-    if not acute_findings and chronic_findings:
-        summary = (
-            "No acute abnormalities detected. "
-            "Long-term risk factors identified."
-        )
-    elif acute_findings:
-        summary = "Acute laboratory abnormalities detected."
-    else:
-        summary = "No acute laboratory abnormalities detected."
 
     return {
         "overall_severity": overall_severity,
         "per_analyte": per_analyte,
         "acute_findings": acute_findings,
         "chronic_findings": chronic_findings,
-        "suggestions": suggestions,
-        "differentials": differentials,
-        "summary": summary
     }
-
 # =========================
-# END PART 5
+# PART 6 — TRENDS + FINAL SUMMARY
 # =========================
-"""
-PART 6 / 7
-- Trend analysis (non-alarmist)
-- Final wording guardrails
-- GP-friendly soft suggestions
-- No imperatives
-"""
 
 # -------------------------
-# TREND ANALYSIS
+# Trend analysis (numeric only)
 # -------------------------
 
 def trend_analysis(
@@ -898,16 +716,19 @@ def trend_analysis(
     previous: Optional[Dict[str, Any]]
 ) -> Dict[str, Any]:
     """
-    Computes simple deltas only when safe.
-    Never interprets trends clinically.
+    Compares current vs previous canonical values.
+    FACTUAL deltas only.
+    No clinical interpretation.
     """
 
     if not previous or "canonical" not in previous:
-        return {"status": "no_previous"}
-
-    trends = {}
+        return {
+            "status": "no_previous",
+            "changes": {}
+        }
 
     prev_canon = previous.get("canonical", {})
+    changes = {}
 
     for analyte, data in current.items():
         if analyte.startswith("_"):
@@ -923,7 +744,7 @@ def trend_analysis(
             delta = cur_val - prev_val
             pct = (delta / prev_val) * 100 if prev_val != 0 else None
 
-            trends[analyte] = {
+            changes[analyte] = {
                 "previous": prev_val,
                 "current": cur_val,
                 "delta": round(delta, 2),
@@ -933,12 +754,12 @@ def trend_analysis(
             continue
 
     return {
-        "status": "available" if trends else "no_numeric_overlap",
-        "changes": trends
+        "status": "available" if changes else "no_numeric_overlap",
+        "changes": changes
     }
 
 # -------------------------
-# GP-SAFE SUMMARY BUILDER
+# Doctor-safe final summary
 # -------------------------
 
 def build_final_summary(
@@ -947,8 +768,8 @@ def build_final_summary(
     trust_flags: Dict[str, bool]
 ) -> Dict[str, Any]:
     """
-    Constructs the final clinician-facing summary.
-    This is the ONLY place where wording is assembled.
+    Final GP-facing wording.
+    This is the ONLY place wording is generated.
     """
 
     meta = canonical.get("_meta", {})
@@ -960,7 +781,7 @@ def build_final_summary(
     suggestions = []
 
     # -------------------------
-    # CBC DISCLAIMER
+    # CBC availability guard
     # -------------------------
 
     if not meta.get("cbc_present"):
@@ -969,25 +790,29 @@ def build_final_summary(
         )
 
     # -------------------------
-    # ACUTE STATUS
+    # Acute status
     # -------------------------
 
     if acute:
-        summary_lines.append("Acute laboratory abnormalities detected.")
+        summary_lines.append(
+            "Acute laboratory abnormalities detected."
+        )
     else:
-        summary_lines.append("No acute laboratory abnormalities detected.")
+        summary_lines.append(
+            "No acute laboratory abnormalities detected."
+        )
 
     # -------------------------
-    # CHRONIC / LONG-TERM RISK
+    # Chronic / long-term risk
     # -------------------------
 
     if chronic:
         summary_lines.append(
-            "Mild to moderate long-term risk markers are present."
+            "Mild to moderate long-term or metabolic abnormalities are present."
         )
 
     # -------------------------
-    # BILIRUBIN REASSURANCE
+    # Bilirubin nuance
     # -------------------------
 
     facts = canonical.get("_facts", [])
@@ -998,12 +823,12 @@ def build_final_summary(
             )
 
     # -------------------------
-    # SOFT SUGGESTIONS (NON-DIRECTIVE)
+    # Soft suggestions (NON-DIRECTIVE)
     # -------------------------
 
-    if "LDL elevated" in " ".join(chronic):
+    if any("LDL" in c or "Triglycerides" in c for c in chronic):
         suggestions.append(
-            "Consider repeat fasting lipid profile if not fasting at time of sampling."
+            "Consider repeat fasting lipid profile if the sample was non-fasting."
         )
 
     if trust_flags.get("has_long_term_risk"):
@@ -1011,17 +836,19 @@ def build_final_summary(
             "Lifestyle modification may be beneficial depending on overall cardiovascular risk."
         )
 
-    if "bilirubin" in canonical:
+    if "Bilirubin" in canonical:
         suggestions.append(
-            "Repeat bilirubin may be considered if clinically indicated."
+            "Repeat bilirubin testing may be considered if clinically indicated."
         )
 
     # -------------------------
-    # FINAL SEVERITY WORDING
+    # Final severity wording
     # -------------------------
 
     if severity == "normal" and trust_flags.get("has_long_term_risk"):
         severity_text = "clinically stable with long-term risk factors"
+    elif severity == "normal":
+        severity_text = "no acute abnormalities detected"
     else:
         severity_text = severity
 
@@ -1030,20 +857,12 @@ def build_final_summary(
         "summary": " ".join(summary_lines),
         "suggested_follow_up": suggestions
     }
-
 # =========================
-# END PART 6
+# PART 7 — EXECUTION PIPELINE
 # =========================
-"""
-PART 7 / 7
-- process_report()
-- Supabase persistence
-- Trend fetch
-- Poll loop
-"""
 
 # -------------------------
-# SAVE RESULTS
+# Save AI results
 # -------------------------
 
 def save_ai_results(report_id: str, payload: Dict[str, Any]) -> None:
@@ -1071,7 +890,7 @@ def save_ai_results(report_id: str, payload: Dict[str, Any]) -> None:
             pass
 
 # -------------------------
-# FETCH PREVIOUS RESULTS
+# Fetch previous completed report
 # -------------------------
 
 def fetch_previous_results(job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1088,6 +907,7 @@ def fetch_previous_results(job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             .table(SUPABASE_TABLE)
             .select("ai_results,created_at")
             .eq("patient_id", patient_id)
+            .eq("ai_status", "completed")
             .order("created_at", desc=True)
             .limit(1)
             .execute()
@@ -1103,7 +923,7 @@ def fetch_previous_results(job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 # -------------------------
-# MAIN REPORT PROCESSOR
+# Main report processor
 # -------------------------
 
 def process_report(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -1115,20 +935,20 @@ def process_report(job: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         # -------------------------
-        # PDF INGESTION
+        # PDF ingestion
         # -------------------------
 
         pdf_bytes = download_pdf_from_supabase(job)
         text, scanned = extract_text_from_pdf(pdf_bytes)
 
         # -------------------------
-        # PARSE
+        # Parse lab text
         # -------------------------
 
         parsed, comments = parse_lab_text(text)
 
         # -------------------------
-        # CANONICAL MAP
+        # Canonical mapping
         # -------------------------
 
         canonical = canonical_map(
@@ -1143,7 +963,7 @@ def process_report(job: Dict[str, Any]) -> Dict[str, Any]:
         annotate_bilirubin_context(canonical)
 
         # -------------------------
-        # TRUST FLAGS
+        # Trust flags
         # -------------------------
 
         doctor_trust_flags = {
@@ -1154,7 +974,7 @@ def process_report(job: Dict[str, Any]) -> Dict[str, Any]:
         apply_long_term_risk_flags(canonical, doctor_trust_flags)
 
         # -------------------------
-        # ROUTES & SEVERITY
+        # Route engine
         # -------------------------
 
         route_info = route_engine(
@@ -1163,14 +983,14 @@ def process_report(job: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         # -------------------------
-        # TRENDS
+        # Trend analysis
         # -------------------------
 
         previous = fetch_previous_results(job)
         trends = trend_analysis(canonical, previous)
 
         # -------------------------
-        # FINAL SUMMARY
+        # Final summary
         # -------------------------
 
         final_summary = build_final_summary(
@@ -1180,7 +1000,7 @@ def process_report(job: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         # -------------------------
-        # FINAL PAYLOAD
+        # Final payload
         # -------------------------
 
         ai_results = {
@@ -1214,7 +1034,7 @@ def process_report(job: Dict[str, Any]) -> Dict[str, Any]:
         return {"success": False, "error": err}
 
 # -------------------------
-# POLL LOOP
+# Poll loop
 # -------------------------
 
 def poll_loop() -> None:
@@ -1231,7 +1051,7 @@ def poll_loop() -> None:
                 .table(SUPABASE_TABLE)
                 .select("*")
                 .eq("ai_status", "pending")
-                .limit(5)
+                .limit(3)
                 .execute()
             )
 
@@ -1255,12 +1075,8 @@ def poll_loop() -> None:
             time.sleep(5)
 
 # -------------------------
-# ENTRY POINT
+# Entry point
 # -------------------------
 
 if __name__ == "__main__":
     poll_loop()
-
-# =========================
-# END PART 7
-# =========================
