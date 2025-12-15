@@ -111,6 +111,21 @@ def clean_number(val):
 
 def iso_now():
     return datetime.utcnow().isoformat() + "Z"
+    
+def overall_clinical_status(cdict: dict) -> str:
+    """
+    High-level clinical wording.
+    Never uses the word 'NORMAL' if any abnormality exists.
+    """
+    for row in cdict.values():
+        if not isinstance(row, dict):
+            continue
+        flag = (row.get("flag") or "").lower()
+        if flag in ("high", "low"):
+            return "No acute pathology detected. Mild abnormalities noted."
+
+    return "No acute abnormalities detected."
+
 
 # ---------------------------
 # PDF helpers
