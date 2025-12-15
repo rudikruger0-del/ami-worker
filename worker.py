@@ -670,6 +670,51 @@ def trend_comparison(patient_name: str, current_cdict: dict) -> dict:
         print("Trend comparison error:", e)
         traceback.print_exc()
         return {"note": "Trend comparison failed: " + str(e), "trends": []}
+        def detect_simple_clinical_patterns(cdict: dict) -> list:
+    """
+    Conservative, pattern-first clinical notes.
+    Text-only. No diagnoses. No severity changes.
+    Safe to ignore if empty.
+    """
+    notes = []
+
+    v = lambda k: clean_number(cdict.get(k, {}).get("value"))
+
+    bilirubin = v("Bilirubin")
+    alt = v("ALT")
+    ast = v("AST")
+    alp = v("ALP")
+    ggt = v("GGT")
+
+    tg = v("Triglycerides")
+    ldl = v("LDL")
+    hdl = v("HDL")
+
+   # ---- Isolated bilirubin pattern ----
+if bilirubin is not None and bilirubin > 21:
+    def ref_high(k):
+        return clean_number(cdict.get(k, {}).get("reference_high"))
+
+    if all(
+        x is not None and
+        (ref_high(k) is None or x <= ref_high(k))
+        for k, x in [("ALT", alt), ("AST", ast), ("ALP", alp), ("GGT", ggt)]
+    ):
+        notes.append(
+            "Pattern: Isolated unconjugated hyperbilirubinaemia with normal liver enzymes — "
+            "commonly benign (e.g. Gilbert syndrome), particularly if intermittent."
+        )
+
+
+    # ---- Lipid pattern ----
+    if tg is not None or ldl is not None:
+        notes.append(
+            "Pattern: Mild mixed dyslipidaemia — lipid abnormalities at this age "
+            "are more suggestive of long-term cardiovascular risk rather than acute illness."
+        )
+
+    return notes
+
 
 # ---------------------------
 # Route engine aggregator: Patterns -> Route -> Next Steps
