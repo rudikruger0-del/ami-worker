@@ -813,12 +813,31 @@ def process_report(job: dict) -> dict:
             )
             for r in cbc_rows
             if isinstance(r, dict)
+        )        # ---- Chemistry detection (doctor-grade) ----
+        chemistry_keys = (
+            "crp", "creatinine", "egfr",
+            "bilirubin", "alt", "ast", "alp", "ggt",
+            "cholesterol", "ldl", "hdl", "triglyceride",
+            "albumin", "total protein", "globulin"
         )
 
-        if not cbc_present:
-            raise ValueError(
-                "CBC expected but not extracted — interpretation blocked"
+        chemistry_present = any(
+            any(
+                key in (r.get("analyte") or "").lower()
+                for key in chemistry_keys
             )
+            for r in cbc_rows
+            if isinstance(r, dict)
+        )
+
+        if not cbc_present and not chemistry_present:
+            raise ValueError(
+                "No interpretable laboratory data extracted — interpretation blocked"
+            )
+            ai_json["_cbc_status"] = "present" if cbc_present else "missing"
+            ai_json["_chemistry_status"] = "present" if chemistry_present else "missing"
+
+
 
         # --------------------
         # Clinical augmentation
