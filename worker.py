@@ -736,24 +736,36 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     - differential_trees
     - trend_comparison (if patient name found)
     """
-    # canonical dict
+
+    # ---------------------------
+    # Canonical dict
+    # ---------------------------
     cdict = build_cbc_value_dict(ai_json)
     if isinstance(ai_json.get("patient"), dict):
         cdict["_patient_age"] = ai_json["patient"].get("age")
 
     overall_status = overall_clinical_status(cdict)
-    # pattern-first clinical notes
+
+    # Pattern-first clinical notes
     patterns = detect_simple_clinical_patterns(cdict)
 
-
-
-    # routes (reuse earlier generate_routes logic but return rich objects)
+    # ---------------------------
+    # Routes
+    # ---------------------------
     routes = []
-    # simple mapping to reuse code above (we'll implement inline)
     v = lambda k: clean_number(cdict.get(k, {}).get("value"))
 
-    Hb = v("Hb"); MCV = v("MCV"); WBC = v("WBC"); Neut = v("Neutrophils"); Lymph = v("Lymphocytes")
-    Plt = v("Platelets"); Cr = v("Creatinine"); CRP = v("CRP"); CK = v("CK"); Na = v("Sodium"); K = v("Potassium")
+    Hb = v("Hb")
+    MCV = v("MCV")
+    WBC = v("WBC")
+    Neut = v("Neutrophils")
+    Lymph = v("Lymphocytes")
+    Plt = v("Platelets")
+    Cr = v("Creatinine")
+    CRP = v("CRP")
+    CK = v("CK")
+    Na = v("Sodium")
+    K = v("Potassium")
 
     # Anaemia
     if Hb is not None and Hb < 13:
@@ -762,25 +774,40 @@ def build_full_clinical_report(ai_json: dict) -> dict:
                 routes.append({
                     "pattern": "Microcytic anaemia",
                     "route": "Likely iron deficiency / chronic disease pattern",
-                    "next_steps": ["Order ferritin & iron studies", "Reticulocyte count", "Consider inflammation markers (CRP)"]
+                    "next_steps": [
+                        "Order ferritin & iron studies",
+                        "Reticulocyte count",
+                        "Consider inflammation markers (CRP)"
+                    ]
                 })
             elif 80 <= MCV <= 100:
                 routes.append({
                     "pattern": "Normocytic anaemia",
                     "route": "Possible chronic disease, renal, or early iron deficiency",
-                    "next_steps": ["Check creatinine & eGFR", "Reticulocyte count", "Clinical correlation"]
+                    "next_steps": [
+                        "Check creatinine & eGFR",
+                        "Reticulocyte count",
+                        "Clinical correlation"
+                    ]
                 })
             else:
                 routes.append({
                     "pattern": "Macrocytic anaemia",
                     "route": "Possible B12/folate deficiency or hepatic/drug effect",
-                    "next_steps": ["Order B12 & folate", "Review liver enzymes", "Medication review"]
+                    "next_steps": [
+                        "Order B12 & folate",
+                        "Review liver enzymes",
+                        "Medication review"
+                    ]
                 })
         else:
             routes.append({
                 "pattern": "Anaemia (MCV unknown)",
                 "route": "Low haemoglobin — further classification needed",
-                "next_steps": ["Obtain MCV/MCH", "Order ferritin & reticulocytes"]
+                "next_steps": [
+                    "Obtain MCV/MCH",
+                    "Order ferritin & reticulocytes"
+                ]
             })
 
     # WBC
@@ -788,52 +815,105 @@ def build_full_clinical_report(ai_json: dict) -> dict:
         if WBC > 12:
             detail = "Inflammatory/infective physiology"
             nexts = []
+
             if Neut and Neut > 70:
-                detail = "Neutrophil-predominant — bacterial pattern more likely"
-                nexts.append("Correlate with fever, localising signs; consider antibiotics per clinical context")
+                detail = "Neutrophil-predominant — reminding bacterial pattern"
+                nexts.append(
+                    "Correlate with fever, localising signs; treat per clinical context"
+                )
+
             if Lymph and Lymph > 45:
                 nexts.append("Consider viral causes; review symptom timeline")
+
             if not nexts:
                 nexts.append("Correlate clinically; consider CRP and cultures if indicated")
-            routes.append({"pattern": "Leucocytosis", "route": detail, "next_steps": nexts})
+
+            routes.append({
+                "pattern": "Leucocytosis",
+                "route": detail,
+                "next_steps": nexts
+            })
 
         elif WBC < 4:
-            routes.append({"pattern": "Leukopenia", "route": "Viral suppression, bone marrow effect, or drugs", "next_steps": ["Medication review", "Repeat CBC", "Consider specialist review if persistent"]})
+            routes.append({
+                "pattern": "Leukopenia",
+                "route": "Viral suppression, marrow effect, or drugs",
+                "next_steps": [
+                    "Medication review",
+                    "Repeat CBC",
+                    "Consider specialist review if persistent"
+                ]
+            })
 
     # Platelets
     if Plt is not None:
         if Plt < 150:
-            routes.append({"pattern": "Thrombocytopenia", "route": "Bleeding risk assessment", "next_steps": ["Assess bleeding symptoms", "Review drugs and previous CBCs", "Consider haematology review if <50"]})
+            routes.append({
+                "pattern": "Thrombocytopenia",
+                "route": "Bleeding risk assessment",
+                "next_steps": [
+                    "Assess bleeding symptoms",
+                    "Review drugs and prior CBCs",
+                    "Haematology review if <50"
+                ]
+            })
         elif Plt > 450:
-            routes.append({"pattern": "Thrombocytosis", "route": "Reactive vs primary thrombocytosis", "next_steps": ["Check CRP/INFLAMMATION", "Repeat CBC", "Consider iron studies"]})
+            routes.append({
+                "pattern": "Thrombocytosis",
+                "route": "Reactive vs primary thrombocytosis",
+                "next_steps": [
+                    "Check CRP",
+                    "Repeat CBC",
+                    "Consider iron studies"
+                ]
+            })
 
-    # Kidney / LFT / CK
+    # Kidney / CK
     if Cr is not None and Cr > 120:
-        routes.append({"pattern": "Renal impairment physiology", "route": "Assess for AKI or CKD", "next_steps": ["Repeat U&E", "Review meds & hydration", "Consider eGFR"]})
+        routes.append({
+            "pattern": "Renal impairment physiology",
+            "route": "Assess for AKI or CKD",
+            "next_steps": [
+                "Repeat U&E",
+                "Review medications & hydration",
+                "Consider eGFR"
+            ]
+        })
 
     if CK is not None and CK > 1000:
-        routes.append({"pattern": "High CK", "route": "Muscle injury / rhabdomyolysis physiology", "next_steps": ["Check creatinine", "Assess for muscle pain/trauma", "Urgent review if creatinine rising"]})
-
-    # Electrolytes urgency included separately in severity function
+        routes.append({
+            "pattern": "High CK",
+            "route": "Muscle injury / rhabdomyolysis physiology",
+            "next_steps": [
+                "Check creatinine",
+                "Assess muscle pain / trauma",
+                "Urgent review if creatinine rising"
+            ]
+        })
 
     if not routes:
-        routes.append({"pattern": "No major patterns detected", "route": "Results within expected ranges", "next_steps": ["Correlate clinically and review prior results"]})
+        routes.append({
+            "pattern": "No major patterns detected",
+            "route": "Results within expected ranges",
+            "next_steps": ["Correlate clinically and review prior results"]
+        })
 
-    # severity & urgency
+    # ---------------------------
+    # Severity / differentials / trends
+    # ---------------------------
     sev = evaluate_severity_and_urgency(cdict)
-
-    # differential trees
     diffs = generate_differential_trees(cdict)
 
-    # trend comparison
     patient_name = None
     try:
         patient_name = (ai_json.get("patient") or {}).get("name")
-    except:
+    except Exception:
         patient_name = None
+
     trends = trend_comparison(patient_name, cdict)
+
     # ---------------------------
-    # Chemistry-specific clinical context & conservative next steps
+    # Chemistry context & next steps
     # ---------------------------
     chemistry_context = None
     chemistry_next_steps = None
@@ -856,7 +936,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
         def ref_high(k):
             return clean_number(cdict.get(k, {}).get("reference_high"))
 
-        # ---- Clinical context considerations ----
+        # Bilirubin pattern
         if bilirubin is not None and bilirubin > 21:
             if all(
                 x is not None and
@@ -868,29 +948,27 @@ def build_full_clinical_report(ai_json: dict) -> dict:
                     "(e.g. Gilbert syndrome), particularly if intermittent."
                 )
 
+        # CRP
         if crp is not None and crp < 5:
             chemistry_context.append(
                 "Normal CRP reduces the likelihood of acute inflammatory or infectious pathology."
             )
-# ---- Lipid age-based cardiovascular context (doctor-grade) ----
-age = cdict.get("_patient_age")
 
-if (triglycerides is not None or ldl is not None):
-    if age is not None and age < 40:
-        chemistry_context.append(
-            "At this age, absolute short-term cardiovascular risk is generally low; "
-            "lifestyle optimisation is appropriate as first-line management."
-        )
-    else:
-        chemistry_context.append(
-            "Lipid abnormalities suggest increased long-term cardiovascular risk rather than acute illness."
-        )
+        # ---- Lipid age-based cardiovascular context (doctor-grade) ----
+        age = cdict.get("_patient_age")
 
+        if triglycerides is not None or ldl is not None:
+            if age is not None and age < 40:
+                chemistry_context.append(
+                    "At this age, absolute short-term cardiovascular risk is generally low; "
+                    "lifestyle optimisation is appropriate as first-line management."
+                )
+            else:
+                chemistry_context.append(
+                    "Lipid abnormalities suggest increased long-term cardiovascular risk rather than acute illness."
+                )
 
-
-       
-
-        # ---- Conservative suggested next steps ----
+        # Conservative next steps
         if triglycerides is not None or ldl is not None:
             chemistry_next_steps.append(
                 "Repeat fasting lipid profile in 3–6 months if clinically appropriate."
@@ -904,10 +982,10 @@ if (triglycerides is not None or ldl is not None):
                 "If bilirubin remains elevated, consider repeat fractionation ± reticulocyte count if clinically indicated."
             )
 
-
-
-    # Compose final augmented report
-    augmented = dict(ai_json)  # shallow copy
+    # ---------------------------
+    # Final assembly
+    # ---------------------------
+    augmented = dict(ai_json)
     augmented["_canonical_cbc"] = cdict
     augmented["_routes"] = routes
     augmented["_severity"] = sev
@@ -920,6 +998,7 @@ if (triglycerides is not None or ldl is not None):
     augmented["_overall_status"] = overall_status
 
     return augmented
+
 
 # ---------------------------
 # Main report processing
