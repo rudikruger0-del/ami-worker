@@ -521,6 +521,59 @@ def generate_differential_trees(cdict: dict) -> dict:
         out["No specific differential patterns triggered"] = ["Correlate clinically and review prior results"]
 
     return out
+    
+def build_chemistry_context_and_steps(cdict: dict) -> dict:
+    """
+    Conservative, doctor-facing chemistry interpretation support.
+    No diagnoses. No admission language.
+    """
+
+    steps = []
+    context = []
+
+    v = lambda k: clean_number(cdict.get(k, {}).get("value"))
+
+    CRP = v("CRP")
+    Bil = v("Bilirubin")
+    ALT = v("ALT")
+    AST = v("AST")
+    ALP = v("ALP")
+    GGT = v("GGT")
+
+    Chol = v("Cholesterol")
+    LDL = v("LDL")
+    TG = v("Triglycerides")
+
+    # ---- Suggested next steps (optional, conservative) ----
+    if Chol is not None or LDL is not None or TG is not None:
+        steps.append("Repeat fasting lipid profile in 3–6 months if clinically appropriate")
+        steps.append("Consider fasting status and recent alcohol intake when interpreting triglycerides")
+
+    if Bil is not None:
+        steps.append("If bilirubin remains elevated, consider repeat fractionation if clinically indicated")
+
+    # ---- Clinical context considerations (reassurance framing) ----
+    if Bil is not None and (ALT is not None and AST is not None and ALP is not None and GGT is not None):
+        if ALT <= 50 and AST <= 50 and ALP <= 130 and GGT <= 60:
+            context.append(
+                "Unconjugated hyperbilirubinaemia with normal ALT, AST, ALP, and GGT is commonly benign "
+                "(e.g. Gilbert syndrome), particularly if intermittent"
+            )
+
+    if CRP is not None and CRP < 5:
+        context.append(
+            "Absence of inflammatory marker elevation reduces likelihood of acute inflammatory or infectious pathology"
+        )
+
+    if Chol is not None or LDL is not None:
+        context.append(
+            "Lipid abnormalities suggest increased long-term cardiovascular risk rather than acute illness"
+        )
+
+    return {
+        "next_steps": steps,
+        "clinical_context": context
+    }
 
 # ---------------------------
 # Trend comparison (search prior completed reports by patient name)
