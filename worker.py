@@ -989,23 +989,25 @@ if Bili is not None and Bili > 21:
         age_note = "Elderly patient — broaden differential to include chronic disease and malignancy."
 
     return {
-        "patterns": patterns,
-        "routes": routes,
-        "next_steps": next_steps,
-        "differential": ddx,
-        "per_key": per_key,
-        "overall_severity": overall_sev,
-        "severity_text": COLOR_MAP[overall_sev]["label"],
-        "urgency_flag": urgency,
-        "color": color["color"],
-        "tw_class": color["tw"],
-        "age_group": ag,
-        "age_note": age_note,
-        "summary": (
-    "\n".join(summary_parts)
-    if summary_parts
-    else "No acute abnormalities detected. Long-term risk assessment recommended."
-)
+    "patterns": patterns,
+    "routes": routes,
+    "next_steps": next_steps,
+    "differential": ddx,
+    "per_key": per_key,
+    "overall_severity": overall_sev,
+    "severity_text": COLOR_MAP[overall_sev]["label"],
+    "urgency_flag": urgency,
+    "color": color["color"],
+    "tw_class": color["tw"],
+    "age_group": ag,
+    "age_note": age_note,
+    "summary": (
+        "\n".join(summary_parts)
+        if summary_parts
+        else "No acute abnormalities detected. Long-term risk assessment recommended."
+    )
+}
+
 
 
 
