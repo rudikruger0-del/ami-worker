@@ -376,11 +376,44 @@ def evaluate_severity_and_urgency(cdict: dict) -> dict:
     if CK is not None and CK > 5000:
         sev_score += 4; flags.append({"reason": f"CK {CK} U/L — possible rhabdomyolysis physiology", "level": "urgent"}); key_issues.append(f"CK {CK}")
 
-    if WBC is not None:
-        if WBC > 25 or WBC < 1:
-            sev_score += 4; flags.append({"reason": f"WBC {WBC} x10^9/L — severe leukocyte abnormality", "level": "urgent"}); key_issues.append(f"WBC {WBC}")
-        elif WBC > 12:
-            sev_score += 1; key_issues.append(f"WBC {WBC}")
+if WBC is not None:
+    if WBC > 25 or WBC < 1:
+        sev_score += 4
+        flags.append({
+            "reason": f"WBC {WBC} x10^9/L — severe leukocyte abnormality",
+            "level": "urgent"
+        })
+        key_issues.append(f"WBC {WBC}")
+
+    # -------------------------------
+    # Inflammatory / infective escalation (ER-grade)
+    # -------------------------------
+    CRP = v("CRP")
+
+    if CRP is not None and CRP >= 30:
+        sev_score += 3
+        flags.append({
+            "reason": f"CRP {CRP} mg/L — significant inflammatory response",
+            "level": "urgent"
+        })
+        key_issues.append(f"CRP {CRP}")
+
+    if WBC is not None and WBC >= 18:
+        sev_score += 2
+        flags.append({
+            "reason": f"WBC {WBC} x10^9/L — marked leukocytosis",
+            "level": "urgent"
+        })
+        key_issues.append(f"WBC {WBC}")
+
+    if Neut is not None and Neut >= 15:
+        sev_score += 2
+        flags.append({
+            "reason": f"Neutrophils {Neut} x10^9/L — neutrophil-predominant response",
+            "level": "urgent"
+        })
+        key_issues.append(f"Neutrophils {Neut}")
+
 
     # Map score -> severity
     if sev_score >= 8:
