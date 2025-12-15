@@ -1,621 +1,365 @@
 #!/usr/bin/env python3
 """
 AMI Health Worker — Production Medical AI Pipeline
-
-SAFETY-CRITICAL SYSTEM
-• Zero hallucinations
-• No inferred labs
-• Conservative, doctor-trust first
-• CBC + Chemistry
-• Severity TEXT only
-• No admission recommendations
+Safety-critical. Zero hallucinations. Doctor-trust first.
 """
-
-# =====================================================
-# STANDARD LIBRARY IMPORTS
-# =====================================================
 
 import os
 import io
 import re
-import time
 import json
-import base64
+import time
 import traceback
 from typing import Dict, Any, Optional, List
-
-# =====================================================
-# THIRD-PARTY IMPORTS
-# =====================================================
 
 from dotenv import load_dotenv
 from pypdf import PdfReader
 from pdf2image import convert_from_bytes
 from PIL import Image, ImageOps
 
-# Optional OCR (local)
-try:
-    import pytesseract
-    HAS_PYTESSERACT = True
-except Exception:
-    HAS_PYTESSERACT = False
-
-# Supabase
-from supabase import create_client, Client
-
-# OpenAI (Vision + interpreter later)
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
-
-# =====================================================
-# ENVIRONMENT VARIABLES
-# =====================================================
-
+# =========================
+# ENV + CLIENTS
+# =========================
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = (
-    os.getenv("SUPABASE_SERVICE_KEY")
-    or os.getenv("SUPABASE_KEY")
-)
-
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "reports")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "reports")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "6"))
-
-MAX_OCR_WIDTH = int(os.getenv("AMI_OCR_MAX_WIDTH", "1000"))
-JPEG_QUALITY = int(os.getenv("AMI_OCR_JPEG_QUALITY", "55"))
-
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError(
-        "SUPABASE_URL or SUPABASE_KEY missing — worker cannot start"
-    )
+    raise RuntimeError("Missing Supabase credentials")
 
-# =====================================================
-# CLIENT INITIALISATION
-# =====================================================
+from supabase import create_client
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-supabase: Optional[Client] = None
-try:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-except Exception as e:
-    print("⚠️ Supabase client initialisation failed:", e)
+# =========================
+# HARD SAFETY HELPERS
+# =========================
 
-openai_client = None
-if OpenAI and OPENAI_API_KEY:
+def safe_float(v) -> Optional[float]:
     try:
-        openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    except Exception as e:
-        print("⚠️ OpenAI client initialisation failed:", e)
-
-# =====================================================
-# TIME / NUMERIC UTILITIES
-# =====================================================
-
-def now_iso() -> str:
-    """
-    UTC timestamp in ISO-8601 format.
-    """
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-def safe_float(value: Any) -> Optional[float]:
-    """
-    Convert to float safely.
-    Returns None if conversion fails.
-    """
-    try:
-        return float(value)
+        return float(str(v).replace(",", "").strip())
     except Exception:
         return None
 
 
-def numeric_safety_gate(key: str, value: float) -> Optional[float]:
-    """
-    HARD physiologic safety limits.
-    Values outside these ranges are discarded.
-    This prevents hallucinated or corrupted numbers.
-    """
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    LIMITS = {
-        "Hb": (3, 25),
-        "MCV": (50, 130),
-        "MCH": (15, 45),
-        "WBC": (0.1, 100),
-        "Neutrophils": (0, 100),
-        "Lymphocytes": (0, 100),
-        "Platelets": (1, 2000),
-        "CRP": (0, 500),
-        "Creatinine": (10, 2000),
-        "Sodium": (110, 180),
-        "Potassium": (2.0, 7.5),
-        "Urea": (0.5, 60),
-        "CK": (0, 200000),
-        "ALT": (0, 5000),
-        "AST": (0, 5000),
-    }
 
-    if key not in LIMITS:
-        return value
+# Physiological hard limits — NEVER GUESS
+PHYS_LIMITS = {
+    "Hb": (3, 25),
+    "WBC": (0.1, 100),
+    "Platelets": (1, 2000),
+    "CRP": (0, 500),
+    "Creatinine": (10, 2000),
+    "ALT": (0, 5000),
+    "AST": (0, 5000),
+    "CK": (0, 200000),
+    "Potassium": (2.0, 7.5),
+    "Sodium": (110, 180),
+}
 
-    low, high = LIMITS[key]
 
-    if value < low or value > high:
+def numeric_safety_gate(key: str, val: float) -> Optional[float]:
+    if key not in PHYS_LIMITS:
+        return val
+    lo, hi = PHYS_LIMITS[key]
+    if val < lo or val > hi:
         return None
-
-    return value
-
-# =====================================================
-# END PART 1
-# =====================================================
-# =====================================================
+    return val
+# =========================
 # PDF INGESTION
-# =====================================================
+# =========================
 
-def download_pdf_from_supabase(job: Dict[str, Any]) -> bytes:
+def download_pdf_from_supabase(record: Dict[str, Any]) -> bytes:
     """
-    Download PDF bytes from Supabase storage or direct pdf_url.
-    HARDENED: retries and defensive handling.
+    Download PDF bytes from Supabase storage or pdf_url.
     """
-
-    # Direct URL override (used in some pipelines)
-    if job.get("pdf_url"):
+    if record.get("pdf_url"):
         import requests
-        resp = requests.get(job["pdf_url"], timeout=30)
-        resp.raise_for_status()
-        return resp.content
+        r = requests.get(record["pdf_url"], timeout=30)
+        r.raise_for_status()
+        return r.content
 
-    if not supabase or not job.get("file_path"):
-        raise RuntimeError("No pdf_url or file_path provided")
+    if not record.get("file_path"):
+        raise RuntimeError("Missing file_path and pdf_url")
 
-    last_error = None
+    res = supabase.storage.from_(SUPABASE_BUCKET).download(record["file_path"])
 
-    for attempt in range(2):
-        try:
-            res = supabase.storage.from_(SUPABASE_BUCKET).download(
-                job["file_path"]
-            )
+    if hasattr(res, "data") and res.data:
+        return res.data
 
-            # Supabase SDK inconsistencies
-            if hasattr(res, "data") and res.data:
-                return res.data
+    if isinstance(res, (bytes, bytearray)):
+        return res
 
-            if isinstance(res, (bytes, bytearray)):
-                return res
-
-            raise RuntimeError("Empty response from Supabase")
-
-        except Exception as e:
-            last_error = e
-            print(f"⚠️ Supabase download attempt {attempt + 1} failed:", e)
-            time.sleep(1.5)
-
-    raise RuntimeError(f"Supabase download failed: {last_error}")
+    raise RuntimeError("Supabase PDF download failed")
 
 
-# =====================================================
-# PDF TEXT EXTRACTION (DIGITAL)
-# =====================================================
+# =========================
+# DIGITAL VS SCANNED
+# =========================
 
-def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """
-    Extract selectable text using pypdf.
-    Returns empty string if extraction fails.
-    """
+def extract_text_digital(pdf_bytes: bytes) -> str:
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         pages = []
-        for page in reader.pages:
+        for p in reader.pages:
             try:
-                pages.append(page.extract_text() or "")
+                pages.append(p.extract_text() or "")
             except Exception:
-                continue
-        return "\n\n".join(pages).strip()
-    except Exception as e:
-        print("pypdf extraction failed:", e)
+                pass
+        return "\n".join(pages).strip()
+    except Exception:
         return ""
 
 
-def is_scanned_pdf(pdf_bytes: bytes, threshold_chars: int = 80) -> bool:
-    """
-    Heuristic:
-    - Very little or no selectable text → scanned PDF
-    """
-    text = extract_text_from_pdf(pdf_bytes)
-    if not text or len(text.strip()) < threshold_chars:
-        return True
-    return False
+def is_scanned_pdf(pdf_bytes: bytes, min_chars: int = 80) -> bool:
+    text = extract_text_digital(pdf_bytes)
+    return not text or len(text) < min_chars
 
 
-# =====================================================
-# OCR IMAGE PREPROCESSING
-# =====================================================
+# =========================
+# OCR (PYTESSERACT ONLY)
+# =========================
 
-def preprocess_image_for_ocr(
-    img: Image.Image,
-    max_width: int = MAX_OCR_WIDTH,
-    quality: int = JPEG_QUALITY
-) -> bytes:
-    """
-    Resize + grayscale + compress image for OCR.
-    """
-
-    try:
-        img = ImageOps.exif_transpose(img)
-        w, h = img.size
-
-        if w > max_width:
-            new_h = int((max_width / float(w)) * h)
-            img = img.resize((max_width, new_h), Image.LANCZOS)
-
-        img = img.convert("L")
-
-        buf = io.BytesIO()
-        img.save(
-            buf,
-            format="JPEG",
-            quality=quality,
-            optimize=True
-        )
-        return buf.getvalue()
-
-    except Exception as e:
-        print("Image preprocess failed:", e)
-        buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="JPEG", quality=quality)
-        return buf.getvalue()
+try:
+    import pytesseract
+    HAS_TESSERACT = True
+except Exception:
+    HAS_TESSERACT = False
 
 
-# =====================================================
-# OCR (VISION)
-# =====================================================
-
-def ocr_image_with_openai(img_bytes: bytes) -> Dict[str, Any]:
-    """
-    Send image to OpenAI Vision.
-    STRICT JSON ONLY.
-    """
-
-    if not openai_client:
-        return {"cbc": []}
-
-    b64 = base64.b64encode(img_bytes).decode("utf-8")
-
-    system_prompt = (
-        "You are an OCR assistant for laboratory reports. "
-        "Extract numeric lab values with analyte name, value, and units. "
-        "Return STRICT JSON only:\n"
-        "{ \"cbc\": [ { \"analyte\": \"Hb\", \"value\": 11.6, \"units\": \"g/dL\" } ] }"
-    )
-
-    try:
-        resp = openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Extract lab values from this image."},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{b64}"
-                            }
-                        }
-                    ]
-                }
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.0,
-        )
-
-        raw = resp.choices[0].message.content
-
-        if isinstance(raw, dict):
-            return raw
-
-        if isinstance(raw, str):
-            try:
-                return json.loads(raw)
-            except Exception:
-                m = re.search(r"\{.*\}", raw, re.S)
-                if m:
-                    try:
-                        return json.loads(m.group(0))
-                    except Exception:
-                        pass
-
-        return {"cbc": []}
-
-    except Exception as e:
-        print("OpenAI OCR failed:", e)
-        return {"cbc": []}
+def preprocess_for_ocr(img: Image.Image) -> Image.Image:
+    img = ImageOps.exif_transpose(img)
+    img = img.convert("L")  # grayscale
+    w, h = img.size
+    if w > 1600:
+        img = img.resize((1600, int(h * 1600 / w)))
+    return img
 
 
-def do_ocr_on_pdf(pdf_bytes: bytes) -> List[Dict[str, Any]]:
-    """
-    Render PDF pages and OCR each page.
-    Returns list of OCR JSON dicts.
-    """
+def ocr_pdf_pages(pdf_bytes: bytes) -> str:
+    if not HAS_TESSERACT:
+        raise RuntimeError("pytesseract not available")
 
-    outputs: List[Dict[str, Any]] = []
+    pages = convert_from_bytes(pdf_bytes, dpi=200)
+    text_blocks: List[str] = []
 
-    try:
-        pages = convert_from_bytes(pdf_bytes, dpi=200)
-    except Exception as e:
-        print("pdf2image failed:", e)
-        return outputs
-
-    for idx, page in enumerate(pages):
+    for p in pages:
         try:
-            img_bytes = preprocess_image_for_ocr(page)
-            ocr_json = ocr_image_with_openai(img_bytes)
-            outputs.append(ocr_json)
-        except Exception as e:
-            print(f"OCR failed on page {idx}:", e)
-            outputs.append({"cbc": []})
+            img = preprocess_for_ocr(p)
+            t = pytesseract.image_to_string(img)
+            if t:
+                text_blocks.append(t)
+        except Exception:
+            continue
 
-    return outputs
+    return "\n".join(text_blocks).strip()
 
-# =====================================================
-# END PART 2
-# =====================================================
-# =====================================================
-# LABEL NORMALISATION
-# =====================================================
 
-SYNONYMS = {
+# =========================
+# TEXT EXTRACTION ENTRYPOINT
+# =========================
+
+def extract_report_text(pdf_bytes: bytes) -> Dict[str, Any]:
+    """
+    Returns:
+    {
+      "text": extracted_text,
+      "scanned": bool
+    }
+    """
+    if is_scanned_pdf(pdf_bytes):
+        text = ocr_pdf_pages(pdf_bytes)
+        return {"text": text, "scanned": True}
+
+    text = extract_text_digital(pdf_bytes)
+    return {"text": text, "scanned": False}
+# =========================
+# PARSER — TABLE + INLINE
+# =========================
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+
+# -------------------------
+# ANALYTE ALIASES
+# -------------------------
+ANALYTE_ALIASES = {
     # CBC
     "hb": "Hb",
     "haemoglobin": "Hb",
     "hemoglobin": "Hb",
-    "wbc": "WBC",
-    "white cell count": "WBC",
-    "leukocytes": "WBC",
-    "leucocytes": "WBC",
-    "neutrophils": "Neutrophils",
-    "lymphocytes": "Lymphocytes",
-    "monocytes": "Monocytes",
-    "eosinophils": "Eosinophils",
-    "basophils": "Basophils",
+    "rbc": "RBC",
+    "hct": "HCT",
+    "haematocrit": "HCT",
+    "mcv": "MCV",
+    "mch": "MCH",
+    "mchc": "MCHC",
+    "rdw": "RDW",
+    "plt": "Platelets",
     "platelets": "Platelets",
+    "wbc": "WBC",
+    "neut": "Neutrophils",
+    "neutrophils": "Neutrophils",
+    "lymph": "Lymphocytes",
+    "lymphocytes": "Lymphocytes",
+    "mono": "Monocytes",
+    "eos": "Eosinophils",
+    "baso": "Basophils",
 
-    # Inflammation / renal
+    # Chemistry
     "crp": "CRP",
-    "c reactive protein": "CRP",
+    "creat": "Creatinine",
     "creatinine": "Creatinine",
-    "urea": "Urea",
-
-    # Electrolytes
+    "egfr": "eGFR",
+    "alt": "ALT",
+    "ast": "AST",
+    "ck": "CK",
+    "ck-mb": "CK-MB",
     "sodium": "Sodium",
     "na": "Sodium",
     "potassium": "Potassium",
     "k": "Potassium",
-    "chloride": "Chloride",
-    "cl": "Chloride",
-
-    # Liver
+    "albumin": "Albumin",
     "bilirubin": "Bilirubin",
     "bilirubin total": "Bilirubin Total",
     "bilirubin conjugated": "Bilirubin Conjugated",
     "bilirubin unconjugated": "Bilirubin Unconjugated",
-    "alt": "ALT",
-    "ast": "AST",
-    "alp": "ALP",
-    "alkaline phosphatase": "ALP",
-    "ggt": "GGT",
-
-    # Lipids
     "cholesterol": "Cholesterol",
-    "cholesterol total": "Cholesterol",
-    "triglycerides": "Triglycerides",
-    "hdl": "HDL",
     "ldl": "LDL",
-    "non hdl": "Non-HDL",
+    "hdl": "HDL",
+    "triglycerides": "Triglycerides",
     "non-hdl": "Non-HDL",
-
-    # Muscle
-    "ck": "CK",
-    "creatine kinase": "CK",
 }
 
 
-def normalize_label(label: str) -> Optional[str]:
-    """
-    Map raw label text to canonical analyte name.
-    """
+def normalize_analyte(label: str) -> Optional[str]:
     if not label:
         return None
-
-    clean = re.sub(r"[^a-z0-9 ]", "", label.lower()).strip()
-
-    for k, v in SYNONYMS.items():
-        if k in clean:
-            return v
-
-    return None
+    key = _norm(label)
+    key = re.sub(r"[^a-z0-9\-\s]", "", key)
+    return ANALYTE_ALIASES.get(key)
 
 
-# =====================================================
-# FLAG EXTRACTION (H / L)
-# =====================================================
-
-def extract_hl_flag(token: Optional[str]) -> Optional[str]:
+# -------------------------
+# TABLE ROW PARSER
+# -------------------------
+def parse_table_rows(text: str) -> Dict[str, Dict[str, Any]]:
     """
-    Convert H / L markers to semantic flags.
+    Matches rows like:
+      HB 12.5 L
+      PLT 53 L
+      CRP 20 H
+      CK 14028 H
+      ALT 226 H
     """
-    if not token:
-        return None
+    results: Dict[str, Dict[str, Any]] = {}
 
-    token = token.strip().upper()
+    lines = [_norm(l) for l in text.splitlines() if l.strip()]
 
-    if token == "H":
-        return "high"
-    if token == "L":
-        return "low"
-
-    return None
-
-
-# =====================================================
-# CHEMISTRY TABLE PARSER (COLUMN-BASED)
-# =====================================================
-
-def parse_chemistry_table(text: str) -> Dict[str, Dict[str, Any]]:
-    """
-    Parse chemistry-style tables like:
-    CRP        < 5 mg/L     3
-    Creatinine 64-104 umol  81
-    """
-
-    out: Dict[str, Dict[str, Any]] = {}
-
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or len(line) < 6:
-            continue
-
-        # Try: LABEL ..... VALUE [H/L]
+    for line in lines:
         m = re.match(
-            r'^([A-Za-z][A-Za-z\s\-\(\)]+?)\s{2,}'
-            r'(-?\d+\.?\d*)\s*([A-Za-z/%µ]+)?\s*([HL])?$',
+            r"^([a-zA-Z\-\s\/]+)\s+(-?\d+(?:\.\d+)?)\s*([hHlL]{1,2})?$",
             line
         )
-
         if not m:
             continue
 
-        label_raw, value_raw, units, flag = m.groups()
+        raw_label, raw_val, flag = m.groups()
+        analyte = normalize_analyte(raw_label)
+        val = safe_float(raw_val)
 
-        key = normalize_label(label_raw)
-        val = safe_float(value_raw)
-
-        if not key or val is None:
+        if not analyte or val is None:
             continue
 
-        out[key] = {
+        results[analyte] = {
             "value": val,
-            "units": units,
-            "flag": extract_hl_flag(flag),
+            "flag": flag.upper() if flag else None,
             "raw": line,
         }
 
-    return out
+    return results
 
 
-# =====================================================
-# INLINE VALUE PARSER (LABEL: VALUE UNIT H/L)
-# =====================================================
-
+# -------------------------
+# INLINE / SENTENCE PARSER
+# -------------------------
 def parse_inline_values(text: str) -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
+    """
+    Catches:
+      Creatinine 81 umol/L
+      CRP < 5 mg/L
+      LDL Chol 3.5 H
+    """
+    results: Dict[str, Dict[str, Any]] = {}
 
-    for line in text.splitlines():
-        matches = re.findall(
-            r'([A-Za-z][A-Za-z\s\-/]{2,40})[:\s]{1,4}'
-            r'(-?\d+\.?\d*)\s*([A-Za-z/%µ]+)?\s*([HL])?',
-            line
-        )
+    pattern = re.compile(
+        r"([A-Za-z\-\s\/]+)\s*[:=]?\s*(<|>)?\s*(-?\d+(?:\.\d+)?)\s*([a-zA-Z\/µ%]+)?\s*([hHlL])?",
+        re.IGNORECASE
+    )
 
-        for label_raw, value_raw, units, flag in matches:
-            key = normalize_label(label_raw)
-            val = safe_float(value_raw)
+    for m in pattern.finditer(text):
+        raw_label, comp, raw_val, unit, flag = m.groups()
+        analyte = normalize_analyte(raw_label)
+        val = safe_float(raw_val)
 
-            if not key or val is None:
-                continue
-
-            out[key] = {
-                "value": val,
-                "units": units,
-                "flag": extract_hl_flag(flag),
-                "raw": line,
-            }
-
-    return out
-
-
-# =====================================================
-# OCR JSON PARSER
-# =====================================================
-
-def parse_values_from_ocr_json(
-    ocr_json: Dict[str, Any]
-) -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
-
-    items = ocr_json.get("cbc") or []
-    if not isinstance(items, list):
-        return out
-
-    for it in items:
-        if not isinstance(it, dict):
+        if not analyte or val is None:
             continue
 
-        label_raw = it.get("analyte") or it.get("label") or ""
-        key = normalize_label(label_raw)
-        val = safe_float(it.get("value"))
-
-        if not key or val is None:
-            continue
-
-        out[key] = {
+        results.setdefault(analyte, {})
+        results[analyte].update({
             "value": val,
-            "units": it.get("units"),
-            "flag": extract_hl_flag(it.get("flag")),
-            "raw": it,
-        }
+            "unit": unit,
+            "flag": flag.upper() if flag else None,
+            "raw": m.group(0),
+        })
 
-    return out
+    return results
 
 
-# =====================================================
-# MASTER PARSER ENTRYPOINT
-# =====================================================
-
-def parse_values_from_text(text: str) -> Dict[str, Dict[str, Any]]:
+# -------------------------
+# MASTER PARSER
+# -------------------------
+def parse_report_text(text: str) -> Dict[str, Dict[str, Any]]:
     """
-    Three-pass parser:
-    1) Inline values
-    2) Chemistry tables
-    3) Deduplication (inline wins)
+    1. Table rows FIRST (highest accuracy)
+    2. Inline fallback
     """
-
     parsed: Dict[str, Dict[str, Any]] = {}
 
-    inline = parse_inline_values(text)
-    table = parse_chemistry_table(text)
+    table_hits = parse_table_rows(text)
+    parsed.update(table_hits)
 
-    # Inline has priority
-    parsed.update(table)
-    parsed.update(inline)
+    inline_hits = parse_inline_values(text)
+    for k, v in inline_hits.items():
+        parsed.setdefault(k, v)
+
+    if not parsed:
+        raise RuntimeError("Parser failure: no analytes detected")
 
     return parsed
+# =========================
+# CANONICAL MAP (HARD SAFETY)
+# =========================
 
-# =====================================================
-# END PART 3
-# =====================================================
-# =====================================================
-# CANONICAL MAP (PURE, NO CLINICAL LOGIC)
-# =====================================================
-
-def canonical_map(
-    parsed: Dict[str, Dict[str, Any]]
-) -> Dict[str, Dict[str, Any]]:
+def canonical_map(parsed: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """
-    HARD safety gate + canonical normalization.
-    NO interpretation here.
+    Pure normalization layer.
+    - No clinical logic
+    - No severity logic
+    - No early returns
     """
 
     canonical: Dict[str, Dict[str, Any]] = {}
 
     for key, item in parsed.items():
-        val = safe_float(item.get("value"))
+        raw_val = item.get("value")
+        val = safe_float(raw_val)
         if val is None:
             continue
 
@@ -625,35 +369,40 @@ def canonical_map(
 
         canonical[key] = {
             "value": safe_val,
-            "units": item.get("units"),
+            "unit": item.get("unit"),
             "flag": item.get("flag"),
             "raw": item.get("raw"),
         }
 
-    # -----------------------------
+    # -------------------------
     # SAFE DERIVED VALUES
-    # -----------------------------
+    # -------------------------
 
     try:
         neut = canonical.get("Neutrophils", {}).get("value")
         lymph = canonical.get("Lymphocytes", {}).get("value")
-
         if neut is not None and lymph is not None and lymph > 0:
             canonical["NLR"] = {
                 "value": round(neut / lymph, 2),
-                "units": None,
+                "unit": None,
                 "flag": None,
                 "raw": "derived NLR",
             }
     except Exception:
         pass
 
+    # -------------------------
+    # HARD FAIL IF EMPTY
+    # -------------------------
+    if not canonical:
+        raise RuntimeError("Canonical map empty after safety filtering")
+
     return canonical
 
 
-# =====================================================
-# eGFR (CKD-EPI 2021, RACE-FREE)
-# =====================================================
+# =========================
+# eGFR (CKD-EPI 2021)
+# =========================
 
 def calculate_egfr(
     creatinine_umol: float,
@@ -661,7 +410,7 @@ def calculate_egfr(
     sex: str
 ) -> Optional[float]:
     """
-    CKD-EPI 2021 equation.
+    CKD-EPI 2021, race-free.
     Creatinine in µmol/L.
     """
 
@@ -693,13 +442,9 @@ def calculate_egfr(
 
     except Exception:
         return None
-
-# =====================================================
-# END PART 4
-# =====================================================
-# =====================================================
-# ROUTE ENGINE — PATTERNS → ROUTES → NEXT STEPS
-# =====================================================
+# =========================
+# ROUTE ENGINE
+# =========================
 
 SEVERITY_MAP = {
     1: "normal",
@@ -710,117 +455,97 @@ SEVERITY_MAP = {
 }
 
 
-def age_group(age: Optional[float]) -> str:
-    if age is None:
-        return "adult"
-    try:
-        a = float(age)
-    except Exception:
-        return "adult"
-    if a < 1:
-        return "infant"
-    if a < 13:
-        return "child"
-    if a < 18:
-        return "teen"
-    if a < 65:
-        return "adult"
-    return "elderly"
-
-
-def score_severity(key: str, value: Optional[float], sex: str) -> int:
+def score_severity(analyte: str, value: Optional[float], flag: Optional[str]) -> int:
     """
     Conservative per-analyte severity.
+    Flags (H/L) ALWAYS up-weight severity.
     """
+
     if value is None:
         return 1
 
-    k = key.lower()
-    sex = (sex or "").lower()
+    a = analyte.lower()
 
     try:
-        if k == "hb":
-            low = 12.0 if sex == "female" else 13.0
-            if value < low - 4:
-                return 5
-            if value < low - 2:
-                return 4
-            if value < low:
-                return 3
-            return 1
+        # -------------------------
+        # H/L FLAG OVERRIDE
+        # -------------------------
+        if flag == "L":
+            base = 2
+        elif flag == "H":
+            base = 2
+        else:
+            base = 1
 
-        if k == "wbc":
-            if value > 25:
+        # -------------------------
+        # CRITICAL DOMAINS
+        # -------------------------
+        if a == "ck":
+            if value >= 10000:
                 return 5
-            if value > 15:
+            if value >= 5000:
                 return 4
-            if value > 11:
+            if value >= 2000:
                 return 3
-            return 1
+            return max(base, 2)
 
-        if k == "platelets":
-            if value < 20:
-                return 5
+        if a == "platelets":
             if value < 50:
-                return 4
+                return 5
             if value < 100:
-                return 3
-            return 1
-
-        if k == "crp":
-            if value > 200:
-                return 5
-            if value > 100:
                 return 4
-            if value > 50:
+            if value < 150:
                 return 3
-            if value > 10:
-                return 2
-            return 1
+            return base
 
-        if k == "creatinine":
-            if value > 350:
+        if a == "crp":
+            if value >= 100:
                 return 5
-            if value > 200:
+            if value >= 50:
                 return 4
-            if value > 120:
+            if value >= 10:
                 return 3
-            return 1
+            return base
 
-        if k == "potassium":
+        if a == "potassium":
             if value < 3.0 or value > 6.0:
                 return 5
             if value < 3.5 or value > 5.5:
                 return 3
-            return 1
+            return base
 
-        if k == "sodium":
+        if a == "sodium":
             if value < 120 or value > 160:
                 return 5
             if value < 125 or value > 155:
                 return 3
-            return 1
+            return base
 
-        if k == "ck":
-            if value > 10000:
+        if a == "creatinine":
+            if value >= 350:
                 return 5
-            if value > 5000:
+            if value >= 200:
                 return 4
-            if value > 2000:
+            if value >= 120:
                 return 3
-            return 1
+            return base
 
-        if k == "nlr":
-            if value > 10:
+        if a == "hb":
+            if value < 8:
+                return 5
+            if value < 10:
                 return 4
-            if value > 5:
+            if value < 12:
                 return 3
-            return 1
+            return base
+
+        # -------------------------
+        # DEFAULT
+        # -------------------------
+        return base
 
     except Exception:
         return 1
-
-    return 1
 
 
 def route_engine_all(
@@ -829,13 +554,6 @@ def route_engine_all(
     previous: Optional[Dict[str, Any]],
     doctor_trust_flags: Dict[str, bool],
 ) -> Dict[str, Any]:
-    """
-    Core clinical reasoning engine.
-    """
-
-    age = patient_meta.get("age")
-    sex = patient_meta.get("sex") or "unknown"
-    ag = age_group(age)
 
     patterns: List[Dict[str, str]] = []
     routes: List[str] = []
@@ -845,290 +563,154 @@ def route_engine_all(
 
     severity_scores: List[int] = []
 
-    # ----------------------------------
-    # Per-analyte scoring
-    # ----------------------------------
+    # -------------------------
+    # PER-ANALYTE SCORING
+    # -------------------------
+    for analyte, data in canonical.items():
+        val = data.get("value")
+        flag = data.get("flag")
 
-    for key, item in canonical.items():
-        val = item.get("value")
-        sev = score_severity(key, val, sex)
-        per_analyte[key] = {
-            "value": val,
-            "units": item.get("units"),
-            "flag": item.get("flag"),
-            "severity": SEVERITY_MAP[sev],
-        }
+        sev = score_severity(analyte, val, flag)
         severity_scores.append(sev)
 
-    # ----------------------------------
-    # Convenience values
-    # ----------------------------------
+        per_analyte[analyte] = {
+            "value": val,
+            "unit": data.get("unit"),
+            "flag": flag,
+            "severity": SEVERITY_MAP[sev],
+        }
 
-    Hb = canonical.get("Hb", {}).get("value")
-    MCV = canonical.get("MCV", {}).get("value")
-    WBC = canonical.get("WBC", {}).get("value")
-    Neut = canonical.get("Neutrophils", {}).get("value")
-    Lymph = canonical.get("Lymphocytes", {}).get("value")
-    Plate = canonical.get("Platelets", {}).get("value")
-    CRP = canonical.get("CRP", {}).get("value")
-    Creat = canonical.get("Creatinine", {}).get("value")
-    CK = canonical.get("CK", {}).get("value")
-    K = canonical.get("Potassium", {}).get("value")
-    Na = canonical.get("Sodium", {}).get("value")
-    LDL = canonical.get("LDL", {}).get("value")
-    TG = canonical.get("Triglycerides", {}).get("value")
-    NonHDL = canonical.get("Non-HDL", {}).get("value")
-
-    # ----------------------------------
-    # Anaemia
-    # ----------------------------------
-
-    if Hb is not None:
-        patterns.append({"pattern": "anaemia", "reason": f"Hb {Hb}"})
-        if MCV is not None:
-            if MCV < 80:
-                routes.append("Microcytic anaemia pathway")
-                differentials += [
-                    "Iron deficiency",
-                    "Thalassaemia trait",
-                    "Chronic blood loss",
-                ]
-                next_steps.append(
-                    "Check ferritin, iron studies, and reticulocyte count"
-                )
-            elif MCV > 100:
-                routes.append("Macrocytic anaemia pathway")
-                differentials += [
-                    "Vitamin B12 deficiency",
-                    "Folate deficiency",
-                    "Alcohol-related",
-                ]
-                next_steps.append(
-                    "Check vitamin B12, folate, and review medications"
-                )
-            else:
-                routes.append("Normocytic anaemia pathway")
-                differentials += [
-                    "Anaemia of chronic disease",
-                    "Renal disease",
-                    "Acute blood loss",
-                ]
-                next_steps.append(
-                    "Check reticulocyte count and inflammatory markers"
-                )
-
-    # ----------------------------------
-    # Infection / inflammation
-    # ----------------------------------
-
-    if WBC is not None and WBC > 11:
-        patterns.append({"pattern": "leukocytosis", "reason": f"WBC {WBC}"})
-        differentials.append("Infection")
-
-    if CRP is not None and CRP > 10:
-        patterns.append({"pattern": "elevated CRP", "reason": f"CRP {CRP}"})
+    # -------------------------
+    # DOMINANT THREAT OVERRIDES
+    # -------------------------
+    ck = canonical.get("CK", {}).get("value")
+    if ck is not None and ck >= 5000:
+        patterns.insert(0, {
+            "pattern": "rhabdomyolysis physiology",
+            "reason": f"CK {ck}"
+        })
+        routes.insert(0, "Rhabdomyolysis route")
         next_steps.append(
-            "Correlate with clinical signs of infection or inflammation"
+            "Marked CK elevation suggests muscle injury or rhabdomyolysis; monitor renal function and electrolytes closely."
         )
+        severity_scores.append(5)
 
-    # ----------------------------------
-    # Platelets
-    # ----------------------------------
-
-    if Plate is not None and Plate < 150:
-        patterns.append(
-            {"pattern": "thrombocytopenia", "reason": f"Platelets {Plate}"}
-        )
-        differentials.append("Bone marrow suppression")
-        next_steps.append("Repeat platelet count and review smear")
-
-    # ----------------------------------
-    # Renal
-    # ----------------------------------
-
-    if Creat is not None and Creat > 120:
-        patterns.append(
-            {"pattern": "renal impairment", "reason": f"Creatinine {Creat}"}
-        )
-        differentials.append("Acute kidney injury")
+    plate = canonical.get("Platelets", {}).get("value")
+    if plate is not None and plate < 100:
+        patterns.insert(0, {
+            "pattern": "thrombocytopenia",
+            "reason": f"Platelets {plate}"
+        })
+        routes.insert(0, "Thrombocytopenia route")
         next_steps.append(
-            "Review renal function trend and hydration status"
+            "Low platelet count warrants repeat testing and evaluation for bleeding or marrow suppression."
         )
+        severity_scores.append(4)
 
-    # ----------------------------------
-    # Electrolytes
-    # ----------------------------------
-
-    if K is not None and (K < 3.5 or K > 5.5):
-        patterns.append(
-            {"pattern": "potassium abnormality", "reason": f"K {K}"}
-        )
+    crp = canonical.get("CRP", {}).get("value")
+    if crp is not None and crp >= 10:
+        patterns.append({
+            "pattern": "inflammatory response",
+            "reason": f"CRP {crp}"
+        })
         next_steps.append(
-            "Assess ECG risk and contributing medications"
+            "Elevated CRP suggests active inflammation or infection; correlate with clinical findings."
         )
 
-    if Na is not None and (Na < 130 or Na > 150):
-        patterns.append(
-            {"pattern": "sodium abnormality", "reason": f"Na {Na}"}
-        )
-        next_steps.append(
-            "Assess volume status and neurologic symptoms"
-        )
+    # -------------------------
+    # OVERALL SEVERITY
+    # -------------------------
+    overall_numeric = max(severity_scores) if severity_scores else 1
 
-    # ----------------------------------
-    # Rhabdomyolysis
-    # ----------------------------------
+    # Doctor-trust override (long-term risk must not appear normal)
+    if doctor_trust_flags.get("has_long_term_risk") and overall_numeric == 1:
+        overall_numeric = 2
 
-    if CK is not None and CK > 2000:
-        patterns.append({"pattern": "elevated CK", "reason": f"CK {CK}"})
-        next_steps.append(
-            "Monitor renal function and electrolytes"
-        )
+    severity_text = SEVERITY_MAP[overall_numeric]
 
-    # ----------------------------------
-    # Long-term cardiovascular risk
-    # ----------------------------------
+    # -------------------------
+    # SUMMARY
+    # -------------------------
+    summary_lines: List[str] = []
 
-    if (
-        (LDL is not None and LDL >= 3.0)
-        or (TG is not None and TG >= 1.7)
-        or (NonHDL is not None and NonHDL >= 3.4)
-    ):
-        doctor_trust_flags["has_long_term_risk"] = True
-        patterns.append(
-            {
-                "pattern": "long-term cardiovascular risk",
-                "reason": "Lipid abnormalities detected",
-            }
-        )
-        next_steps.append(
-            "Address cardiovascular risk factors in routine follow-up"
+    if patterns:
+        summary_lines.append(
+            "Patterns: " + "; ".join(p["pattern"] for p in patterns)
         )
 
-    # ----------------------------------
-    # Final severity
-    # ----------------------------------
-
-    overall_sev = max(severity_scores) if severity_scores else 1
-
-    if doctor_trust_flags.get("has_long_term_risk") and overall_sev == 1:
-        overall_sev = 2  # force non-normal
-
-    severity_text = SEVERITY_MAP[overall_sev]
-
-    # ----------------------------------
-    # Summary
-    # ----------------------------------
-
-    if not patterns and doctor_trust_flags.get("has_long_term_risk"):
-        summary = (
-            "No acute abnormalities detected. "
-            "Long-term cardiovascular risk assessment recommended."
+    if routes:
+        summary_lines.append(
+            "Primary routes: " + "; ".join(routes)
         )
-    elif not patterns:
-        summary = "No acute abnormalities detected."
-    else:
-        summary = " | ".join(
-            [p["pattern"] for p in patterns]
+
+    if differentials:
+        summary_lines.append(
+            "Differentials: " + ", ".join(differentials[:5])
+        )
+
+    if next_steps:
+        summary_lines.append(
+            "Suggested follow-up: " + " | ".join(next_steps[:5])
+        )
+
+    if not summary_lines:
+        summary_lines.append(
+            "No acute abnormalities detected. Long-term risk assessment recommended."
         )
 
     return {
         "patterns": patterns,
         "routes": routes,
         "next_steps": next_steps,
-        "differentials": list(dict.fromkeys(differentials)),
+        "differentials": differentials,
         "per_analyte": per_analyte,
-        "overall_severity": overall_sev,
+        "overall_severity": overall_numeric,
         "severity_text": severity_text,
-        "summary": summary,
+        "summary": "\n".join(summary_lines),
     }
-
-# =====================================================
-# END PART 5
-# =====================================================
-# =====================================================
-# MAIN REPORT PROCESSOR
-# =====================================================
+# =========================
+# PROCESS REPORT
+# =========================
 
 def process_report(job: Dict[str, Any]) -> Dict[str, Any]:
     report_id = job.get("id") or job.get("report_id")
     patient_id = job.get("patient_id")
-    file_path = job.get("file_path")
-    pdf_url = job.get("pdf_url")
-    l_text = job.get("l_text") or ""
     patient_age = job.get("age")
     patient_sex = job.get("sex")
+
+    if not report_id:
+        raise RuntimeError("Missing report id")
 
     print(f"Processing report {report_id}")
 
     try:
-        if not file_path and not pdf_url:
-            raise RuntimeError("Missing file_path or pdf_url")
-
-        # ----------------------------------
-        # Download PDF
-        # ----------------------------------
-
+        # -------------------------
+        # DOWNLOAD + EXTRACT
+        # -------------------------
         pdf_bytes = download_pdf_from_supabase(job)
+        extracted = extract_report_text(pdf_bytes)
 
-        # ----------------------------------
-        # Detect scanned vs digital
-        # ----------------------------------
+        raw_text = extracted["text"]
+        scanned = extracted["scanned"]
 
-        scanned = is_scanned_pdf(pdf_bytes)
+        if not raw_text:
+            raise RuntimeError("No text extracted from PDF")
 
-        parsed: Dict[str, Dict[str, Any]] = {}
-        merged_text_for_ai = ""
-
-        # ----------------------------------
-        # Extract text / OCR
-        # ----------------------------------
-
-        if scanned:
-            print("Detected SCANNED PDF — running OCR")
-            ocr_pages = do_ocr_on_pdf(pdf_bytes)
-
-            combined_items: List[Dict[str, Any]] = []
-            for p in ocr_pages:
-                if isinstance(p, dict) and p.get("cbc"):
-                    combined_items.extend(p.get("cbc"))
-
-            if combined_items:
-                parsed = parse_values_from_ocr_json({"cbc": combined_items})
-                merged_text_for_ai = json.dumps({"cbc": combined_items})
-            else:
-                text = extract_text_from_pdf(pdf_bytes)
-                parsed = parse_values_from_text(text)
-                merged_text_for_ai = text
-
-        else:
-            print("Detected DIGITAL PDF — extracting text")
-            text = extract_text_from_pdf(pdf_bytes)
-            merged_text_for_ai = (
-                (l_text + "\n\n" + text).strip()
-                if l_text else text
-            )
-            parsed = parse_values_from_text(merged_text_for_ai)
-
-        # ----------------------------------
-        # Canonical map (HARD GATE)
-        # ----------------------------------
-
+        # -------------------------
+        # PARSE → CANONICAL
+        # -------------------------
+        parsed = parse_report_text(raw_text)
         canonical = canonical_map(parsed)
 
-        # ----------------------------------
-        # Doctor-trust flags (INITIALISE FIRST)
-        # ----------------------------------
-
+        # -------------------------
+        # DOCTOR TRUST FLAGS
+        # -------------------------
         doctor_trust_flags = {
             "has_acute_risk": False,
             "has_long_term_risk": False,
         }
 
-        # ----------------------------------
-        # Long-term risk guardrails
-        # ----------------------------------
-
+        # Long-term cardiovascular risk guardrails
         ldl = canonical.get("LDL", {}).get("value")
         tg = canonical.get("Triglycerides", {}).get("value")
         non_hdl = canonical.get("Non-HDL", {}).get("value")
@@ -1140,28 +722,26 @@ def process_report(job: Dict[str, Any]) -> Dict[str, Any]:
         if non_hdl is not None and non_hdl >= 3.4:
             doctor_trust_flags["has_long_term_risk"] = True
 
-        # ----------------------------------
-        # eGFR calculation
-        # ----------------------------------
-
+        # -------------------------
+        # eGFR (SAFE INSERT)
+        # -------------------------
         creat = canonical.get("Creatinine", {}).get("value")
         if creat is not None and patient_age:
             egfr = calculate_egfr(creat, patient_age, patient_sex)
             if egfr is not None:
                 canonical["eGFR"] = {
                     "value": egfr,
-                    "units": "mL/min/1.73m²",
-                    "flag": None,
+                    "unit": "mL/min/1.73m²",
+                    "flag": "L" if egfr < 60 else None,
                     "raw": "calculated (CKD-EPI 2021)",
                 }
 
-        # ----------------------------------
-        # Fetch previous ai_results (FIXED)
-        # ----------------------------------
-
+        # -------------------------
+        # FETCH PREVIOUS RESULTS
+        # -------------------------
         previous = None
-        try:
-            if supabase and patient_id:
+        if patient_id:
+            try:
                 prev_q = (
                     supabase
                     .table(SUPABASE_TABLE)
@@ -1171,70 +751,34 @@ def process_report(job: Dict[str, Any]) -> Dict[str, Any]:
                     .limit(1)
                     .execute()
                 )
-                prev_rows = (
-                    prev_q.data if hasattr(prev_q, "data") else prev_q
-                )
-                if prev_rows:
-                    previous = prev_rows[0].get("ai_results")
-        except Exception:
-            previous = None
+                rows = prev_q.data if hasattr(prev_q, "data") else prev_q
+                if rows:
+                    previous = rows[0].get("ai_results")
+            except Exception:
+                previous = None
 
-        # ----------------------------------
-        # Trend analysis
-        # ----------------------------------
-
-        trends = trend_analysis(canonical, previous)
-
-        # ----------------------------------
-        # Route engine
-        # ----------------------------------
-
+        # -------------------------
+        # ROUTE ENGINE
+        # -------------------------
         route_info = route_engine_all(
-            canonical,
-            {"age": patient_age, "sex": patient_sex},
-            previous,
-            doctor_trust_flags,
+            canonical=canonical,
+            patient_meta={"age": patient_age, "sex": patient_sex},
+            previous=previous,
+            doctor_trust_flags=doctor_trust_flags,
         )
 
-        # ----------------------------------
-        # Final AI interpretation (optional)
-        # ----------------------------------
-
-        ai_interpretation = {}
-        if openai_client and merged_text_for_ai:
-            try:
-                ai_interpretation = call_ai_on_report(merged_text_for_ai)
-            except Exception:
-                ai_interpretation = {}
-
-        # ----------------------------------
-        # Final payload
-        # ----------------------------------
-
+        # -------------------------
+        # FINAL PAYLOAD
+        # -------------------------
         ai_results = {
             "processed_at": now_iso(),
             "scanned": scanned,
             "canonical": canonical,
             "routes": route_info,
-            "trends": trends,
             "doctor_trust_flags": doctor_trust_flags,
-            "ai_interpretation": ai_interpretation,
         }
 
-        # ----------------------------------
-        # Save to Supabase
-        # ----------------------------------
-
-        try:
-            supabase.table(SUPABASE_TABLE).update(
-                {
-                    "ai_status": "completed",
-                    "ai_results": ai_results,
-                    "ai_error": None,
-                }
-            ).eq("id", report_id).execute()
-        except Exception as e:
-            print("Supabase save failed:", e)
+        save_ai_results_to_supabase(report_id, ai_results)
 
         print(f"✅ Report {report_id} processed successfully")
         return {"success": True, "data": ai_results}
@@ -1252,115 +796,37 @@ def process_report(job: Dict[str, Any]) -> Dict[str, Any]:
             pass
 
         return {"error": err}
+# =========================
+# SAVE RESULTS TO SUPABASE
+# =========================
 
-# =====================================================
-# END PART 6
-# =====================================================
-# =====================================================
-# TREND ANALYSIS
-# =====================================================
-
-def trend_analysis(
-    current: Dict[str, Dict[str, Any]],
-    previous: Optional[Dict[str, Any]]
-) -> Dict[str, Any]:
-    """
-    Simple numeric trend analysis.
-    No interpretation — numbers only.
-    """
-    if not previous:
-        return {"trend": "no_previous"}
-
-    diffs: Dict[str, Any] = {}
-
-    for key, item in current.items():
-        cur = item.get("value")
-        prev = None
-
-        try:
-            prev = previous.get("canonical", {}).get(key, {}).get("value")
-        except Exception:
-            prev = None
-
-        if cur is None or prev is None:
-            continue
-
-        try:
-            delta = cur - prev
-            pct = (delta / prev) * 100 if prev != 0 else None
-            diffs[key] = {
-                "previous": prev,
-                "current": cur,
-                "delta": round(delta, 3),
-                "pct_change": round(pct, 1) if pct is not None else None,
-            }
-        except Exception:
-            continue
-
-    return {"trend": diffs if diffs else "no_change"}
-
-
-# =====================================================
-# OPTIONAL AI INTERPRETER (ADVISORY ONLY)
-# =====================================================
-
-def call_ai_on_report(text: str) -> Dict[str, Any]:
-    """
-    Advisory-only AI interpretation.
-    NEVER authoritative.
-    """
-    if not openai_client:
-        return {}
-
-    MAX_CHARS = 12000
-    if len(text) > MAX_CHARS:
-        text = text[:MAX_CHARS]
-
-    system_prompt = (
-        "You are a conservative clinical assistant. "
-        "Describe lab abnormalities only. "
-        "No diagnoses. No admission advice. "
-        "Return STRICT JSON."
-    )
-
+def save_ai_results_to_supabase(report_id: str, ai_results: Dict[str, Any]) -> None:
     try:
-        resp = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.1,
-        )
-
-        raw = resp.choices[0].message.content
-        if isinstance(raw, dict):
-            return raw
-        if isinstance(raw, str):
-            try:
-                return json.loads(raw)
-            except Exception:
-                return {}
-        return {}
-
+        payload = {
+            "ai_status": "completed",
+            "ai_results": ai_results,
+            "ai_error": None,
+        }
+        supabase.table(SUPABASE_TABLE).update(payload).eq("id", report_id).execute()
+        print(f"Saved ai_results for report {report_id}")
     except Exception as e:
-        print("AI interpreter failed:", e)
-        return {}
+        print("⚠️ Failed to save ai_results:", e)
+        try:
+            supabase.table(SUPABASE_TABLE).update(
+                {"ai_status": "failed", "ai_error": str(e)}
+            ).eq("id", report_id).execute()
+        except Exception:
+            pass
 
 
-# =====================================================
-# POLLING LOOP
-# =====================================================
+# =========================
+# POLL LOOP
+# =========================
+
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "6"))
+
 
 def poll_loop() -> None:
-    """
-    Continuously poll Supabase for pending reports.
-    """
-    if not supabase:
-        print("Supabase not configured — poll loop disabled.")
-        return
-
     print("🚀 AMI Health Worker started — polling for pending reports")
 
     while True:
@@ -1376,18 +842,23 @@ def poll_loop() -> None:
 
             rows = res.data if hasattr(res, "data") else res
 
-            if rows:
-                for job in rows:
-                    try:
-                        supabase.table(SUPABASE_TABLE).update(
-                            {"ai_status": "processing"}
-                        ).eq("id", job.get("id")).execute()
-                    except Exception:
-                        pass
-
-                    process_report(job)
-            else:
+            if not rows:
                 time.sleep(POLL_INTERVAL)
+                continue
+
+            for job in rows:
+                report_id = job.get("id")
+                if not report_id:
+                    continue
+
+                try:
+                    supabase.table(SUPABASE_TABLE).update(
+                        {"ai_status": "processing"}
+                    ).eq("id", report_id).execute()
+                except Exception:
+                    pass
+
+                process_report(job)
 
         except Exception as e:
             print("Polling error:", e)
@@ -1395,47 +866,38 @@ def poll_loop() -> None:
             time.sleep(5)
 
 
-# =====================================================
-# CLI HARNESS
-# =====================================================
+# =========================
+# CLI / LOCAL TEST HARNESS
+# =========================
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(
-        description="AMI Health Worker — Production"
-    )
-    parser.add_argument(
-        "--test-pdf",
-        help="Path to local PDF for testing",
-    )
-    parser.add_argument(
-        "--once",
-        action="store_true",
-        help="Poll once and exit",
-    )
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test-pdf", help="Path to local PDF for testing")
+    parser.add_argument("--once", action="store_true", help="Process pending once and exit")
     args = parser.parse_args()
 
     if args.test_pdf:
+        print("🧪 Running local PDF test")
+
         with open(args.test_pdf, "rb") as f:
-            pdf_bytes = f.read()
+            test_bytes = f.read()
 
-        def _mock_download(_: Dict[str, Any]) -> bytes:
-            return pdf_bytes
+        # Override downloader for local test
+        def _local_download(_):
+            return test_bytes
 
-        globals()["download_pdf_from_supabase"] = _mock_download
+        globals()["download_pdf_from_supabase"] = _local_download
 
         dummy_job = {
             "id": "local-test",
-            "file_path": "local",
-            "patient_id": "local",
+            "patient_id": "local-test",
+            "file_path": "local.pdf",
             "age": 45,
             "sex": "male",
-            "l_text": "",
         }
 
-        print("Running local PDF test...")
         result = process_report(dummy_job)
         print(json.dumps(result, indent=2))
 
@@ -1450,21 +912,10 @@ if __name__ == "__main__":
                 .execute()
             )
             rows = res.data if hasattr(res, "data") else res
-
             if rows:
-                for job in rows:
-                    try:
-                        supabase.table(SUPABASE_TABLE).update(
-                            {"ai_status": "processing"}
-                        ).eq("id", job.get("id")).execute()
-                    except Exception:
-                        pass
-                    process_report(job)
+                for r in rows:
+                    process_report(r)
             else:
                 print("No pending reports.")
         else:
             poll_loop()
-
-# =====================================================
-# END PART 7 — WORKER COMPLETE
-# =====================================================
