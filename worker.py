@@ -730,6 +730,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     augmented["_differential_trees"] = diffs
     augmented["_trend_comparison"] = trends
     augmented["_generated_at"] = iso_now()
+    augmented["_overall_status"] = overall_status
 
     return augmented
 
