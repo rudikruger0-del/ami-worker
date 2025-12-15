@@ -790,6 +790,25 @@ def process_report(job: dict) -> dict:
         # 1) call AI interpretation
         print("Calling AI interpretation...")
         ai_json = call_ai_on_report(merged_text_for_ai)
+        # ---- CBC extraction sanity check (doctor-grade) ----
+cbc_rows = ai_json.get("cbc") or []
+cbc_present = any(
+    any(
+        key in (r.get("analyte") or "").lower()
+        for key in (
+            "hb", "hemoglobin", "haemoglobin",
+            "wbc", "white", "leuko",
+            "platelet", "plt"
+        )
+    )
+    for r in cbc_rows
+    if isinstance(r, dict)
+)
+
+
+if not cbc_present:
+    raise ValueError("CBC expected but not extracted — blocking interpretation")
+
 
         # 2) build augmented clinical report (routes, severity, diffs, trends)
         print("Building clinical augmentation...")
