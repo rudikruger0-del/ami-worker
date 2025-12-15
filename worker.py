@@ -758,19 +758,41 @@ def process_report(job: dict) -> dict:
 # ---------------------------
 def main():
     print("Entering main loop...")
+
+    # ---- startup sanity check ----
+    chk = supabase.table("reports").select("id").eq("ai_status", "pending").limit(5).execute()
+    print("🔍 Pending jobs at startup:", chk.data)
+
     while True:
         try:
-            res = supabase.table("reports").select("*").eq("ai_status", "pending").limit(1).execute()
-            # supabase client returns APIResponse-like object — read `.model` for rows
-            jobs = getattr(res, "model", None) or []
+            # ALWAYS read .data (supabase-py v2)
+            res = supabase.table("reports") \
+                .select("*") \
+                .eq("ai_status", "pending") \
+                .limit(1) \
+                .execute()
+
+            jobs = res.data if hasattr(res, "data") else []
+
             if not jobs:
                 print("No jobs...")
                 time.sleep(1)
                 continue
 
             job = jobs[0]
-            print(f"🔎 Found job {job.get('id')}")
-            supabase.table("reports").update({"ai_status": "processing"}).eq("id", job.get("id")).execute()
+            job_id = job.get("id")
+            print(f"🔎 Found job {job_id}")
+
+            # ---- atomic claim (prevents race + stuck jobs) ----
+            claim = supabase.table("reports") \
+                .update({"ai_status": "processing"}) \
+                .eq("id", job_id) \
+                .eq("ai_status", "pending") \
+                .execute()
+
+            if not claim.data:
+                print("⚠️ Job already claimed by another worker, skipping")
+                continue
 
             process_report(job)
 
