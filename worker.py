@@ -790,7 +790,7 @@ def process_report(job: dict) -> dict:
             merged_text_for_ai = text or l_text
             if not merged_text_for_ai.strip():
                 raise ValueError("No usable text extracted from digital PDF")
-                        # --------------------
+        # --------------------
         # AI interpretation
         # --------------------
         print("Calling AI interpretation...")
