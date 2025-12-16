@@ -1237,7 +1237,8 @@ if not routes:
     augmented["_generated_at"] = iso_now()
     augmented["_overall_status"] = overall_status
 
-       return augmented
+    return augmented
+
 
 
 
