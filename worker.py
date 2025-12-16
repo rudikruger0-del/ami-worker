@@ -1104,7 +1104,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
                 ]
             })
 
-    # Kidney / CK
+        # Kidney / CK
     if Cr is not None and Cr > 120:
         routes.append({
             "pattern": "Renal impairment physiology",
@@ -1115,29 +1115,31 @@ def build_full_clinical_report(ai_json: dict) -> dict:
                 "Consider eGFR"
             ]
         })
+
+    if CK is not None and CK > 1000:
+        routes.append({
+            "pattern": "High CK",
+            "route": "Muscle injury / rhabdomyolysis physiology",
+            "next_steps": [
+                "Check creatinine",
+                "Assess muscle pain / trauma",
+                "Urgent review if creatinine rising"
+            ]
+        })
+
+    if not routes:
+        routes.append({
+            "pattern": "Laboratory abnormalities detected",
+            "route": "Abnormal findings require clinical correlation",
+            "next_steps": [
+                "Review results in full clinical context",
+                "Consider repeat testing if results are unexpected"
+            ]
+        })
+
+
         
-if CK is not None and CK > 1000:
-    routes.append({
-        "pattern": "High CK",
-        "route": "Muscle injury / rhabdomyolysis physiology",
-        "next_steps": [
-            "Check creatinine",
-            "Assess muscle pain / trauma",
-            "Urgent review if creatinine rising"
-        ]
-    })
 
-    
-
-if not routes:
-    routes.append({
-        "pattern": "Laboratory abnormalities detected",
-        "route": "Abnormal findings require clinical correlation",
-        "next_steps": [
-            "Review results in full clinical context",
-            "Consider repeat testing if results are unexpected"
-        ]
-    })
 
 
     # ---------------------------
