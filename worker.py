@@ -1206,7 +1206,6 @@ if WBC is not None and WBC > 30:
                 "Urgent review if creatinine rising"
             ]
         })
-
     # =====================================================
     # PASS 1 — COMBINED HIGH-RISK PHYSIOLOGY
     # =====================================================
@@ -1394,11 +1393,6 @@ if WBC is not None and WBC > 30:
     else:
         augmented_summary = "No dominant clinical priority identified."
 
-
-        
-
-
-
     # ---------------------------
     # Severity / differentials / trends
     # ---------------------------
@@ -1497,6 +1491,9 @@ if WBC is not None and WBC > 30:
     augmented["_overall_status"] = overall_status
 
     return augmented
+
+
+
 
 
 
