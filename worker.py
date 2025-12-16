@@ -776,6 +776,25 @@ def detect_simple_clinical_patterns(cdict: dict) -> list:
     return notes
 
 
+# ---------------------------
+# Route helper: priority-aware insertion
+# ---------------------------
+def add_route(routes, priority, pattern, route, next_steps):
+    """
+    priority: 'primary' | 'secondary' | 'contextual'
+    Primary routes are inserted at the top.
+    """
+    entry = {
+        "priority": priority,
+        "pattern": pattern,
+        "route": route,
+        "next_steps": next_steps
+    }
+
+    if priority == "primary":
+        routes.insert(0, entry)
+    else:
+        routes.append(entry)
 
 # ---------------------------
 # Route engine aggregator: Patterns -> Route -> Next Steps
@@ -853,6 +872,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     routes = []
     v = lambda k: clean_number(cdict.get(k, {}).get("value"))
 
+    # -------- Extract values FIRST (REQUIRED) --------
     Hb = v("Hb")
     MCV = v("MCV")
     WBC = v("WBC")
@@ -862,6 +882,126 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     Cr = v("Creatinine")
     CRP = v("CRP")
     CK = v("CK")
+    Na = v("Sodium")
+    K = v("Potassium")
+
+    # =====================================================
+    # COMPOSITE CBC PATTERNS (doctor-style reasoning)
+    # =====================================================
+
+    # ---- Composite: Acute inflammatory / infective response (PRIMARY) ----
+    if (
+        WBC is not None and WBC > 12
+        and Neut is not None and Neut > 75
+        and CRP is not None and CRP > 20
+    ):
+        add_route(
+            routes,
+            priority="primary",
+            pattern="Acute inflammatory / infective response",
+            route=(
+                "Neutrophil-predominant leukocytosis with elevated CRP, "
+                "suggesting active infection or significant inflammatory stress"
+            ),
+            next_steps=[
+                "Urgent clinical assessment to identify possible source of infection",
+                "Correlate with symptoms, vitals, and imaging where appropriate",
+                "Repeat CBC and CRP to assess trend if clinically indicated"
+            ]
+        )
+
+    # ---- Microcytic anaemia (age-aware) ----
+    if Hb is not None and Hb < 12 and MCV is not None and MCV < 80:
+        age = cdict.get("_patient_age")
+        route_text = "Microcytic hypochromic anaemia — iron deficiency most likely"
+
+        if age is not None and age < 25:
+            route_text += " (menstrual iron loss common in this age group)"
+
+        add_route(
+            routes,
+            priority="secondary",
+            pattern="Microcytic anaemia",
+            route=route_text,
+            next_steps=[
+                "Order ferritin and iron studies",
+                "Review dietary intake and menstrual history where appropriate",
+                "Repeat haemoglobin after correction of any acute illness"
+            ]
+        )
+
+    # ---- Anaemia with concurrent inflammatory illness (SECONDARY) ----
+    if Hb is not None and Hb < 12 and WBC is not None and WBC > 12:
+        add_route(
+            routes,
+            priority="contextual",
+            pattern="Anaemia with concurrent inflammatory illness",
+            route=(
+                "Anaemia may be exacerbated or masked by acute inflammatory state"
+            ),
+            next_steps=[
+                "Reassess haemoglobin once acute illness has resolved",
+                "Interpret iron studies cautiously while CRP remains elevated"
+            ]
+        )
+
+    # =====================================================
+    # ELECTROLYTE DANGER COMPOSITES (ER PRIORITY)
+    # =====================================================
+
+    if K is not None:
+        if K < 3.0 or K > 6.0:
+            add_route(
+                routes,
+                priority="primary",
+                pattern="Critical potassium abnormality",
+                route=f"Potassium {K} mmol/L associated with high risk of cardiac arrhythmia",
+                next_steps=[
+                    "Urgent clinical assessment and ECG correlation",
+                    "Review renal function and medications",
+                    "Repeat potassium urgently to confirm"
+                ]
+            )
+        elif K < 3.3 or K > 5.5:
+            add_route(
+                routes,
+                priority="secondary",
+                pattern="Significant potassium abnormality",
+                route=f"Potassium {K} mmol/L outside safe physiological range",
+                next_steps=[
+                    "Assess for symptoms and contributing factors",
+                    "Review medications and renal function",
+                    "Repeat electrolytes to monitor trend"
+                ]
+            )
+
+    if Na is not None:
+        if Na < 125 or Na > 155:
+            add_route(
+                routes,
+                priority="primary",
+                pattern="Critical sodium abnormality",
+                route=f"Sodium {Na} mmol/L associated with neurological complications",
+                next_steps=[
+                    "Urgent clinical assessment including mental status",
+                    "Review volume status and recent fluid intake",
+                    "Repeat sodium and osmolality if clinically indicated"
+                ]
+            )
+        elif Na < 130 or Na > 150:
+            add_route(
+                routes,
+                priority="secondary",
+                pattern="Significant sodium abnormality",
+                route=f"Sodium {Na} mmol/L outside normal physiological range",
+                next_steps=[
+                    "Assess hydration status and contributing causes",
+                    "Review medications (e.g. diuretics)",
+                    "Monitor sodium trend with repeat testing"
+                ]
+            )
+
+
 
     # Anaemia
     if Hb is not None and Hb < 13:
@@ -977,22 +1117,26 @@ def build_full_clinical_report(ai_json: dict) -> dict:
         })
 
     if CK is not None and CK > 1000:
-        routes.append({
-            "pattern": "High CK",
-            "route": "Muscle injury / rhabdomyolysis physiology",
-            "next_steps": [
-                "Check creatinine",
-                "Assess muscle pain / trauma",
-                "Urgent review if creatinine rising"
-            ]
-        })
+    routes.append({
+        "pattern": "High CK",
+        "route": "Muscle injury / rhabdomyolysis physiology",
+        "next_steps": [
+            "Check creatinine",
+            "Assess muscle pain / trauma",
+            "Urgent review if creatinine rising"
+        ]
+    })
 
-    if not routes:
-        routes.append({
-            "pattern": "No major patterns detected",
-            "route": "Results within expected ranges",
-            "next_steps": ["Correlate clinically and review prior results"]
-        })
+if not routes:
+    routes.append({
+        "pattern": "Laboratory abnormalities detected",
+        "route": "Abnormal findings require clinical correlation",
+        "next_steps": [
+            "Review results in full clinical context",
+            "Consider repeat testing if results are unexpected"
+        ]
+    })
+
 
     # ---------------------------
     # Severity / differentials / trends
