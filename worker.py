@@ -986,552 +986,552 @@ def build_full_clinical_report(ai_json: dict) -> dict:
         )
     
     
-        # =====================================================
-        # COMPOSITE CBC PATTERNS (doctor-style reasoning)
-        # =====================================================
-    
-        # ---- Composite: Acute inflammatory / infective response (PRIMARY) ----
-        if (
-            WBC is not None and WBC > 12
-            and Neut is not None and Neut > 75
-            and CRP is not None and CRP > 20
-        ):
+    # =====================================================
+    # COMPOSITE CBC PATTERNS (doctor-style reasoning)
+    # =====================================================
+
+    # ---- Composite: Acute inflammatory / infective response (PRIMARY) ----
+    if (
+        WBC is not None and WBC > 12
+        and Neut is not None and Neut > 75
+        and CRP is not None and CRP > 20
+    ):
+        add_route(
+            routes,
+            priority="primary",
+            pattern="Acute inflammatory / infective response",
+            route=(
+                "Neutrophil-predominant leukocytosis with elevated CRP, "
+                "suggesting active infection or significant inflammatory stress"
+            ),
+            next_steps=[
+                "Urgent clinical assessment to identify possible source of infection",
+                "Correlate with symptoms, vitals, and imaging where appropriate",
+                "Repeat CBC and CRP to assess trend if clinically indicated"
+            ]
+        )
+
+    # ---- Microcytic anaemia (age-aware) ----
+    if Hb is not None and Hb < 12 and MCV is not None and MCV < 80:
+        age = cdict.get("_patient_age")
+        route_text = "Microcytic hypochromic anaemia — iron deficiency most likely"
+
+        if age is not None and age < 25:
+            route_text += " (menstrual iron loss common in this age group)"
+
+        add_route(
+            routes,
+            priority="secondary",
+            pattern="Microcytic anaemia",
+            route=route_text,
+            next_steps=[
+                "Order ferritin and iron studies",
+                "Review dietary intake and menstrual history where appropriate",
+                "Repeat haemoglobin after correction of any acute illness"
+            ]
+        )
+
+    # ---- Anaemia with concurrent inflammatory illness (SECONDARY) ----
+    if Hb is not None and Hb < 12 and WBC is not None and WBC > 12:
+        add_route(
+            routes,
+            priority="contextual",
+            pattern="Anaemia with concurrent inflammatory illness",
+            route=(
+                "Anaemia may be exacerbated or masked by acute inflammatory state"
+            ),
+            next_steps=[
+                "Reassess haemoglobin once acute illness has resolved",
+                "Interpret iron studies cautiously while CRP remains elevated"
+            ]
+        )
+
+    # =====================================================
+    # ELECTROLYTE DANGER COMPOSITES (ER PRIORITY)
+    # =====================================================
+
+    if K is not None:
+        if K < 3.0 or K > 6.0:
             add_route(
                 routes,
                 priority="primary",
-                pattern="Acute inflammatory / infective response",
-                route=(
-                    "Neutrophil-predominant leukocytosis with elevated CRP, "
-                    "suggesting active infection or significant inflammatory stress"
-                ),
+                pattern="Critical potassium abnormality",
+                route=f"Potassium {K} mmol/L associated with high risk of cardiac arrhythmia",
                 next_steps=[
-                    "Urgent clinical assessment to identify possible source of infection",
-                    "Correlate with symptoms, vitals, and imaging where appropriate",
-                    "Repeat CBC and CRP to assess trend if clinically indicated"
+                    "Urgent clinical assessment and ECG correlation",
+                    "Review renal function and medications",
+                    "Repeat potassium urgently to confirm"
                 ]
             )
-    
-        # ---- Microcytic anaemia (age-aware) ----
-        if Hb is not None and Hb < 12 and MCV is not None and MCV < 80:
-            age = cdict.get("_patient_age")
-            route_text = "Microcytic hypochromic anaemia — iron deficiency most likely"
-    
-            if age is not None and age < 25:
-                route_text += " (menstrual iron loss common in this age group)"
-    
+        elif K < 3.3 or K > 5.5:
             add_route(
                 routes,
                 priority="secondary",
-                pattern="Microcytic anaemia",
-                route=route_text,
+                pattern="Significant potassium abnormality",
+                route=f"Potassium {K} mmol/L outside safe physiological range",
                 next_steps=[
-                    "Order ferritin and iron studies",
-                    "Review dietary intake and menstrual history where appropriate",
-                    "Repeat haemoglobin after correction of any acute illness"
+                    "Assess for symptoms and contributing factors",
+                    "Review medications and renal function",
+                    "Repeat electrolytes to monitor trend"
                 ]
             )
-    
-        # ---- Anaemia with concurrent inflammatory illness (SECONDARY) ----
-        if Hb is not None and Hb < 12 and WBC is not None and WBC > 12:
+
+    if Na is not None:
+        if Na < 125 or Na > 155:
             add_route(
                 routes,
-                priority="contextual",
-                pattern="Anaemia with concurrent inflammatory illness",
-                route=(
-                    "Anaemia may be exacerbated or masked by acute inflammatory state"
-                ),
+                priority="primary",
+                pattern="Critical sodium abnormality",
+                route=f"Sodium {Na} mmol/L associated with neurological complications",
                 next_steps=[
-                    "Reassess haemoglobin once acute illness has resolved",
-                    "Interpret iron studies cautiously while CRP remains elevated"
+                    "Urgent clinical assessment including mental status",
+                    "Review volume status and recent fluid intake",
+                    "Repeat sodium and osmolality if clinically indicated"
                 ]
             )
-    
-        # =====================================================
-        # ELECTROLYTE DANGER COMPOSITES (ER PRIORITY)
-        # =====================================================
-    
-        if K is not None:
-            if K < 3.0 or K > 6.0:
-                add_route(
-                    routes,
-                    priority="primary",
-                    pattern="Critical potassium abnormality",
-                    route=f"Potassium {K} mmol/L associated with high risk of cardiac arrhythmia",
-                    next_steps=[
-                        "Urgent clinical assessment and ECG correlation",
-                        "Review renal function and medications",
-                        "Repeat potassium urgently to confirm"
+        elif Na < 130 or Na > 150:
+            add_route(
+                routes,
+                priority="secondary",
+                pattern="Significant sodium abnormality",
+                route=f"Sodium {Na} mmol/L outside normal physiological range",
+                next_steps=[
+                    "Assess hydration status and contributing causes",
+                    "Review medications (e.g. diuretics)",
+                    "Monitor sodium trend with repeat testing"
+                ]
+            )
+
+
+
+    # Anaemia
+    if Hb is not None and Hb < 13:
+        if MCV is not None:
+            if MCV < 80:
+                routes.append({
+                    "pattern": "Microcytic anaemia",
+                    "route": "Likely iron deficiency / chronic disease pattern",
+                    "next_steps": [
+                        "Order ferritin & iron studies",
+                        "Reticulocyte count",
+                        "Consider inflammation markers (CRP)"
                     ]
-                )
-            elif K < 3.3 or K > 5.5:
-                add_route(
-                    routes,
-                    priority="secondary",
-                    pattern="Significant potassium abnormality",
-                    route=f"Potassium {K} mmol/L outside safe physiological range",
-                    next_steps=[
-                        "Assess for symptoms and contributing factors",
-                        "Review medications and renal function",
-                        "Repeat electrolytes to monitor trend"
+                })
+            elif 80 <= MCV <= 100:
+                routes.append({
+                    "pattern": "Normocytic anaemia",
+                    "route": "Possible chronic disease, renal, or early iron deficiency",
+                    "next_steps": [
+                        "Check creatinine & eGFR",
+                        "Reticulocyte count",
+                        "Clinical correlation"
                     ]
-                )
-    
-        if Na is not None:
-            if Na < 125 or Na > 155:
-                add_route(
-                    routes,
-                    priority="primary",
-                    pattern="Critical sodium abnormality",
-                    route=f"Sodium {Na} mmol/L associated with neurological complications",
-                    next_steps=[
-                        "Urgent clinical assessment including mental status",
-                        "Review volume status and recent fluid intake",
-                        "Repeat sodium and osmolality if clinically indicated"
-                    ]
-                )
-            elif Na < 130 or Na > 150:
-                add_route(
-                    routes,
-                    priority="secondary",
-                    pattern="Significant sodium abnormality",
-                    route=f"Sodium {Na} mmol/L outside normal physiological range",
-                    next_steps=[
-                        "Assess hydration status and contributing causes",
-                        "Review medications (e.g. diuretics)",
-                        "Monitor sodium trend with repeat testing"
-                    ]
-                )
-    
-    
-    
-        # Anaemia
-        if Hb is not None and Hb < 13:
-            if MCV is not None:
-                if MCV < 80:
-                    routes.append({
-                        "pattern": "Microcytic anaemia",
-                        "route": "Likely iron deficiency / chronic disease pattern",
-                        "next_steps": [
-                            "Order ferritin & iron studies",
-                            "Reticulocyte count",
-                            "Consider inflammation markers (CRP)"
-                        ]
-                    })
-                elif 80 <= MCV <= 100:
-                    routes.append({
-                        "pattern": "Normocytic anaemia",
-                        "route": "Possible chronic disease, renal, or early iron deficiency",
-                        "next_steps": [
-                            "Check creatinine & eGFR",
-                            "Reticulocyte count",
-                            "Clinical correlation"
-                        ]
-                    })
-                else:
-                    routes.append({
-                        "pattern": "Macrocytic anaemia",
-                        "route": "Possible B12/folate deficiency or hepatic/drug effect",
-                        "next_steps": [
-                            "Order B12 & folate",
-                            "Review liver enzymes",
-                            "Medication review"
-                        ]
-                    })
+                })
             else:
                 routes.append({
-                    "pattern": "Anaemia (MCV unknown)",
-                    "route": "Low haemoglobin — further classification needed",
+                    "pattern": "Macrocytic anaemia",
+                    "route": "Possible B12/folate deficiency or hepatic/drug effect",
                     "next_steps": [
-                        "Obtain MCV/MCH",
-                        "Order ferritin & reticulocytes"
+                        "Order B12 & folate",
+                        "Review liver enzymes",
+                        "Medication review"
                     ]
                 })
-    
-        # WBC
-        if WBC is not None:
-            if WBC > 12:
-                detail = "Inflammatory/infective physiology"
-                nexts = []
-    
-                if Neut and Neut > 70:
-                    detail = "Neutrophil-predominant — bacterial pattern more likely"
-                    nexts.append(
-                        "Correlate with fever, localising signs; treat per clinical context"
-                    )
-    
-                if Lymph and Lymph > 45:
-                    nexts.append("Consider viral causes; review symptom timeline")
-    
-                if not nexts:
-                    nexts.append("Correlate clinically; consider CRP and cultures if indicated")
-    
-                routes.append({
-                    "pattern": "Leucocytosis",
-                    "route": detail,
-                    "next_steps": nexts
-                })
-    
-            elif WBC < 4:
-                routes.append({
-                    "pattern": "Leukopenia",
-                    "route": "Viral suppression, marrow effect, or drugs",
-                    "next_steps": [
-                        "Medication review",
-                        "Repeat CBC",
-                        "Consider specialist review if persistent"
-                    ]
-                })
-    
-        # Platelets
-        if Plt is not None:
-            if Plt < 150:
-                routes.append({
-                    "pattern": "Thrombocytopenia",
-                    "route": "Bleeding risk assessment",
-                    "next_steps": [
-                        "Assess bleeding symptoms",
-                        "Review drugs and prior CBCs",
-                        "Haematology review if <50"
-                    ]
-                })
-            elif Plt > 450:
-                routes.append({
-                    "pattern": "Thrombocytosis",
-                    "route": "Reactive vs primary thrombocytosis",
-                    "next_steps": [
-                        "Check CRP",
-                        "Repeat CBC",
-                        "Consider iron studies"
-                    ]
-                })
-    
-            # Kidney / CK
-        if Cr is not None and Cr > 120:
-            routes.append({
-                "pattern": "Renal impairment physiology",
-                "route": "Assess for AKI or CKD",
-                "next_steps": [
-                    "Repeat U&E",
-                    "Review medications & hydration",
-                    "Consider eGFR"
-                ]
-            })
-    
-        if CK is not None and CK > 1000:
-            routes.append({
-                "pattern": "High CK",
-                "route": "Muscle injury / rhabdomyolysis physiology",
-                "next_steps": [
-                    "Check creatinine",
-                    "Assess muscle pain / trauma",
-                    "Urgent review if creatinine rising"
-                ]
-            })
-        # =====================================================
-        # PASS 1 — COMBINED HIGH-RISK PHYSIOLOGY
-        # =====================================================
-    
-        # ---- Infection + thrombocytopenia (bleeding + sepsis risk) ----
-        if (
-            WBC is not None and WBC > 12
-            and CRP is not None and CRP > 20
-            and Plt is not None and Plt < 100
-        ):
-            add_route(
-                routes,
-                priority="primary",
-                pattern="Infection with thrombocytopenia",
-                route="Concurrent inflammatory response and thrombocytopenia increase bleeding and sepsis risk",
-                next_steps=[
-                    "Urgent clinical assessment",
-                    "Assess for bleeding and sepsis physiology",
-                    "Repeat CBC and CRP to assess trend"
-                ]
-            )
-    
-        # ---- Infection with significant anaemia ----
-        if (
-            WBC is not None and WBC > 12
-            and CRP is not None and CRP > 20
-            and Hb is not None and Hb < 10
-        ):
-            add_route(
-                routes,
-                priority="primary",
-                pattern="Infection with significant anaemia",
-                route="Anaemia may impair oxygen delivery during acute inflammatory illness",
-                next_steps=[
-                    "Urgent clinical assessment",
-                    "Assess haemodynamic stability",
-                    "Repeat haemoglobin after acute phase"
-                ]
-            )
-    
-        # ---- Bone marrow failure physiology ----
-        if (
-            Hb is not None and Hb < 10
-            and WBC is not None and WBC < 3
-            and Plt is not None and Plt < 100
-        ):
-            add_route(
-                routes,
-                priority="primary",
-                pattern="Bone marrow failure physiology",
-                route="Global suppression of blood cell lines suggests marrow failure or infiltration",
-                next_steps=[
-                    "Urgent peripheral blood smear",
-                    "Review medications, toxins, and systemic symptoms",
-                    "Specialist review is indicated"
-                ]
-            )
-    
-        # ---- Multiple simultaneous danger signals ----
-        danger_count = sum([
-            1 if Hb is not None and Hb < 7 else 0,
-            1 if Plt is not None and Plt < 50 else 0,
-            1 if WBC is not None and (WBC < 1 or WBC > 30) else 0,
-            1 if K is not None and (K < 3.0 or K > 6.0) else 0,
-            1 if Na is not None and (Na < 125 or Na > 155) else 0
-        ])
-    
-        if danger_count >= 2:
-            add_route(
-                routes,
-                priority="primary",
-                pattern="Multiple concurrent critical abnormalities",
-                route="More than one life-threatening laboratory abnormality detected",
-                next_steps=[
-                    "Immediate senior clinical review",
-                    "Prioritise stabilisation and monitoring",
-                    "Repeat critical parameters urgently"
-                ]
-            )
-    
-        # =====================================================
-        # FAIL-SAFE — MUST BE LAST
-        # =====================================================
-        if not routes:
-            routes.append({
-                "pattern": "Laboratory abnormalities detected",
-                "route": "Abnormal findings require clinical correlation",
-                "next_steps": [
-                    "Review results in full clinical context",
-                    "Consider repeat testing if results are unexpected"
-                ]
-            })
-    
-        # =====================================================
-        # PASS 2 — ROUTE DOMINANCE & CLINICAL PRIORITISATION
-        # =====================================================
-    
-        def route_priority_score(r):
-            """
-            Lower score = higher clinical priority
-            """
-            if r.get("priority") == "primary":
-                return 0
-            if r.get("priority") == "secondary":
-                return 1
-            return 2
-    
-        # ---- Sort routes by clinical priority ----
-        routes = sorted(routes, key=route_priority_score)
-    
-        # ---- If any PRIMARY routes exist, suppress weak contextual noise ----
-        has_primary = any(r.get("priority") == "primary" for r in routes)
-    
-        if has_primary:
-            filtered = []
-            for r in routes:
-                # Always keep primary routes
-                if r.get("priority") == "primary":
-                    filtered.append(r)
-                    continue
-    
-                # Keep secondary routes ONLY if clinically reinforcing
-                if r.get("priority") == "secondary":
-                    filtered.append(r)
-    
-            routes = filtered
-    
-        # ---- Hard cap to avoid cognitive overload ----
-        MAX_ROUTES = 5
-        routes = routes[:MAX_ROUTES]
-    
-        # =====================================================
-        # PASS 3 — CLINICAL CONFIDENCE & TEMPORAL FRAMING
-        # =====================================================
-    
-        def classify_timeframe(route):
-            """
-            Assigns a clinical time-sensitivity label.
-            """
-            pattern = (route.get("pattern") or "").lower()
-    
-            if any(x in pattern for x in [
-                "critical",
-                "bone marrow",
-                "multiple concurrent",
-                "severe",
-                "life-threatening"
-            ]):
-                return "Immediate"
-    
-            if any(x in pattern for x in [
-                "infection",
-                "electrolyte",
-                "renal impairment",
-                "anaemia with"
-            ]):
-                return "Urgent"
-    
-            return "Routine / Monitor"
-    
-        def confidence_language(route):
-            """
-            Adds senior-clinician-style certainty without diagnosis.
-            """
-            timeframe = route.get("_timeframe")
-    
-            if timeframe == "Immediate":
-                return "This pattern is clinically concerning and requires immediate senior assessment."
-    
-            if timeframe == "Urgent":
-                return "This finding warrants timely clinical review and correlation."
-    
-            return "This pattern may be monitored in appropriate clinical context."
-    
-        # ---- Apply timeframe + confidence to routes ----
-        for r in routes:
-            tf = classify_timeframe(r)
-            r["_timeframe"] = tf
-            r["_confidence"] = confidence_language(r)
-    
-        # ---- Escalation summary (one-liner doctors scan) ----
-        if routes:
-            top = routes[0]
-            augmented_summary = f"{top.get('pattern')} — {top.get('_timeframe')} priority."
         else:
-            augmented_summary = "No dominant clinical priority identified."
-    
-        # ---------------------------
-        # Severity / differentials / trends
-        # ---------------------------
-        # ---------------------------
-        # Severity resolution (ROUTE-DOMINANT)
-        # ---------------------------
-        numeric_sev = evaluate_severity_and_urgency(cdict)
-        route_sev = severity_from_routes(routes)
-        
-        # Escalation order (never downgrade)
-        severity_rank = {
-            "low": 0,
-            "moderate": 1,
-            "high": 2,
-            "critical": 3
-        }
-        
-        final_severity = route_sev
-        if severity_rank.get(numeric_sev["severity"], 0) > severity_rank.get(route_sev, 0):
-            final_severity = numeric_sev["severity"]
-        
-        sev = dict(numeric_sev)
-        sev["severity"] = final_severity
+            routes.append({
+                "pattern": "Anaemia (MCV unknown)",
+                "route": "Low haemoglobin — further classification needed",
+                "next_steps": [
+                    "Obtain MCV/MCH",
+                    "Order ferritin & reticulocytes"
+                ]
+            })
 
-        diffs = generate_differential_trees(cdict)
+    # WBC
+    if WBC is not None:
+        if WBC > 12:
+            detail = "Inflammatory/infective physiology"
+            nexts = []
+
+            if Neut and Neut > 70:
+                detail = "Neutrophil-predominant — bacterial pattern more likely"
+                nexts.append(
+                    "Correlate with fever, localising signs; treat per clinical context"
+                )
+
+            if Lymph and Lymph > 45:
+                nexts.append("Consider viral causes; review symptom timeline")
+
+            if not nexts:
+                nexts.append("Correlate clinically; consider CRP and cultures if indicated")
+
+            routes.append({
+                "pattern": "Leucocytosis",
+                "route": detail,
+                "next_steps": nexts
+            })
+
+        elif WBC < 4:
+            routes.append({
+                "pattern": "Leukopenia",
+                "route": "Viral suppression, marrow effect, or drugs",
+                "next_steps": [
+                    "Medication review",
+                    "Repeat CBC",
+                    "Consider specialist review if persistent"
+                ]
+            })
+
+    # Platelets
+    if Plt is not None:
+        if Plt < 150:
+            routes.append({
+                "pattern": "Thrombocytopenia",
+                "route": "Bleeding risk assessment",
+                "next_steps": [
+                    "Assess bleeding symptoms",
+                    "Review drugs and prior CBCs",
+                    "Haematology review if <50"
+                ]
+            })
+        elif Plt > 450:
+            routes.append({
+                "pattern": "Thrombocytosis",
+                "route": "Reactive vs primary thrombocytosis",
+                "next_steps": [
+                    "Check CRP",
+                    "Repeat CBC",
+                    "Consider iron studies"
+                ]
+            })
+
+        # Kidney / CK
+    if Cr is not None and Cr > 120:
+        routes.append({
+            "pattern": "Renal impairment physiology",
+            "route": "Assess for AKI or CKD",
+            "next_steps": [
+                "Repeat U&E",
+                "Review medications & hydration",
+                "Consider eGFR"
+            ]
+        })
+
+    if CK is not None and CK > 1000:
+        routes.append({
+            "pattern": "High CK",
+            "route": "Muscle injury / rhabdomyolysis physiology",
+            "next_steps": [
+                "Check creatinine",
+                "Assess muscle pain / trauma",
+                "Urgent review if creatinine rising"
+            ]
+        })
+    # =====================================================
+    # PASS 1 — COMBINED HIGH-RISK PHYSIOLOGY
+    # =====================================================
+
+    # ---- Infection + thrombocytopenia (bleeding + sepsis risk) ----
+    if (
+        WBC is not None and WBC > 12
+        and CRP is not None and CRP > 20
+        and Plt is not None and Plt < 100
+    ):
+        add_route(
+            routes,
+            priority="primary",
+            pattern="Infection with thrombocytopenia",
+            route="Concurrent inflammatory response and thrombocytopenia increase bleeding and sepsis risk",
+            next_steps=[
+                "Urgent clinical assessment",
+                "Assess for bleeding and sepsis physiology",
+                "Repeat CBC and CRP to assess trend"
+            ]
+        )
+
+    # ---- Infection with significant anaemia ----
+    if (
+        WBC is not None and WBC > 12
+        and CRP is not None and CRP > 20
+        and Hb is not None and Hb < 10
+    ):
+        add_route(
+            routes,
+            priority="primary",
+            pattern="Infection with significant anaemia",
+            route="Anaemia may impair oxygen delivery during acute inflammatory illness",
+            next_steps=[
+                "Urgent clinical assessment",
+                "Assess haemodynamic stability",
+                "Repeat haemoglobin after acute phase"
+            ]
+        )
+
+    # ---- Bone marrow failure physiology ----
+    if (
+        Hb is not None and Hb < 10
+        and WBC is not None and WBC < 3
+        and Plt is not None and Plt < 100
+    ):
+        add_route(
+            routes,
+            priority="primary",
+            pattern="Bone marrow failure physiology",
+            route="Global suppression of blood cell lines suggests marrow failure or infiltration",
+            next_steps=[
+                "Urgent peripheral blood smear",
+                "Review medications, toxins, and systemic symptoms",
+                "Specialist review is indicated"
+            ]
+        )
+
+    # ---- Multiple simultaneous danger signals ----
+    danger_count = sum([
+        1 if Hb is not None and Hb < 7 else 0,
+        1 if Plt is not None and Plt < 50 else 0,
+        1 if WBC is not None and (WBC < 1 or WBC > 30) else 0,
+        1 if K is not None and (K < 3.0 or K > 6.0) else 0,
+        1 if Na is not None and (Na < 125 or Na > 155) else 0
+    ])
+
+    if danger_count >= 2:
+        add_route(
+            routes,
+            priority="primary",
+            pattern="Multiple concurrent critical abnormalities",
+            route="More than one life-threatening laboratory abnormality detected",
+            next_steps=[
+                "Immediate senior clinical review",
+                "Prioritise stabilisation and monitoring",
+                "Repeat critical parameters urgently"
+            ]
+        )
+
+    # =====================================================
+    # FAIL-SAFE — MUST BE LAST
+    # =====================================================
+    if not routes:
+        routes.append({
+            "pattern": "Laboratory abnormalities detected",
+            "route": "Abnormal findings require clinical correlation",
+            "next_steps": [
+                "Review results in full clinical context",
+                "Consider repeat testing if results are unexpected"
+            ]
+        })
+
+    # =====================================================
+    # PASS 2 — ROUTE DOMINANCE & CLINICAL PRIORITISATION
+    # =====================================================
+
+    def route_priority_score(r):
+        """
+        Lower score = higher clinical priority
+        """
+        if r.get("priority") == "primary":
+            return 0
+        if r.get("priority") == "secondary":
+            return 1
+        return 2
+
+    # ---- Sort routes by clinical priority ----
+    routes = sorted(routes, key=route_priority_score)
+
+    # ---- If any PRIMARY routes exist, suppress weak contextual noise ----
+    has_primary = any(r.get("priority") == "primary" for r in routes)
+
+    if has_primary:
+        filtered = []
+        for r in routes:
+            # Always keep primary routes
+            if r.get("priority") == "primary":
+                filtered.append(r)
+                continue
+
+            # Keep secondary routes ONLY if clinically reinforcing
+            if r.get("priority") == "secondary":
+                filtered.append(r)
+
+        routes = filtered
+
+    # ---- Hard cap to avoid cognitive overload ----
+    MAX_ROUTES = 5
+    routes = routes[:MAX_ROUTES]
+
+    # =====================================================
+    # PASS 3 — CLINICAL CONFIDENCE & TEMPORAL FRAMING
+    # =====================================================
+
+    def classify_timeframe(route):
+        """
+        Assigns a clinical time-sensitivity label.
+        """
+        pattern = (route.get("pattern") or "").lower()
+
+        if any(x in pattern for x in [
+            "critical",
+            "bone marrow",
+            "multiple concurrent",
+            "severe",
+            "life-threatening"
+        ]):
+            return "Immediate"
+
+        if any(x in pattern for x in [
+            "infection",
+            "electrolyte",
+            "renal impairment",
+            "anaemia with"
+        ]):
+            return "Urgent"
+
+        return "Routine / Monitor"
+
+    def confidence_language(route):
+        """
+        Adds senior-clinician-style certainty without diagnosis.
+        """
+        timeframe = route.get("_timeframe")
+
+        if timeframe == "Immediate":
+            return "This pattern is clinically concerning and requires immediate senior assessment."
+
+        if timeframe == "Urgent":
+            return "This finding warrants timely clinical review and correlation."
+
+        return "This pattern may be monitored in appropriate clinical context."
+
+    # ---- Apply timeframe + confidence to routes ----
+    for r in routes:
+        tf = classify_timeframe(r)
+        r["_timeframe"] = tf
+        r["_confidence"] = confidence_language(r)
+
+    # ---- Escalation summary (one-liner doctors scan) ----
+    if routes:
+        top = routes[0]
+        augmented_summary = f"{top.get('pattern')} — {top.get('_timeframe')} priority."
+    else:
+        augmented_summary = "No dominant clinical priority identified."
+
+    # ---------------------------
+    # Severity / differentials / trends
+    # ---------------------------
+    # ---------------------------
+    # Severity resolution (ROUTE-DOMINANT)
+    # ---------------------------
+    numeric_sev = evaluate_severity_and_urgency(cdict)
+    route_sev = severity_from_routes(routes)
     
-        patient_name = None
-        try:
-            patient_name = (ai_json.get("patient") or {}).get("name")
-        except Exception:
-            pass
+    # Escalation order (never downgrade)
+    severity_rank = {
+        "low": 0,
+        "moderate": 1,
+        "high": 2,
+        "critical": 3
+    }
     
-        trends = trend_comparison(patient_name, cdict)
+    final_severity = route_sev
+    if severity_rank.get(numeric_sev["severity"], 0) > severity_rank.get(route_sev, 0):
+        final_severity = numeric_sev["severity"]
     
-        # ---------------------------
-        # Chemistry context & next steps
-        # ---------------------------
-        chemistry_context = None
-        chemistry_next_steps = None
-    
-        if ai_json.get("_chemistry_status") in ("present", "assumed_from_text"):
-            chemistry_context = []
-            chemistry_next_steps = []
-    
-            bilirubin = v("Bilirubin")
-            alt = v("ALT")
-            ast = v("AST")
-            alp = v("ALP")
-            ggt = v("GGT")
-            crp = v("CRP")
-            triglycerides = v("Triglycerides")
-    
-            ldl = (
-                v("LDL")
-                or v("LDL Chol")
-                or v("LDL Chol (direct)")
-            )
-    
-            def ref_high(k):
-                return clean_number(cdict.get(k, {}).get("reference_high"))
-    
-            if bilirubin is not None and bilirubin > 21:
-                if all(
-                    x is not None and
-                    (ref_high(k) is None or x <= ref_high(k))
-                    for k, x in [("ALT", alt), ("AST", ast), ("ALP", alp), ("GGT", ggt)]
-                ):
-                    chemistry_context.append(
-                        "Unconjugated hyperbilirubinaemia with normal liver enzymes is commonly benign "
-                        "(e.g. Gilbert syndrome), particularly if intermittent."
-                    )
-    
-            if crp is not None and crp < 5:
+    sev = dict(numeric_sev)
+    sev["severity"] = final_severity
+
+    diffs = generate_differential_trees(cdict)
+
+    patient_name = None
+    try:
+        patient_name = (ai_json.get("patient") or {}).get("name")
+    except Exception:
+        pass
+
+    trends = trend_comparison(patient_name, cdict)
+
+    # ---------------------------
+    # Chemistry context & next steps
+    # ---------------------------
+    chemistry_context = None
+    chemistry_next_steps = None
+
+    if ai_json.get("_chemistry_status") in ("present", "assumed_from_text"):
+        chemistry_context = []
+        chemistry_next_steps = []
+
+        bilirubin = v("Bilirubin")
+        alt = v("ALT")
+        ast = v("AST")
+        alp = v("ALP")
+        ggt = v("GGT")
+        crp = v("CRP")
+        triglycerides = v("Triglycerides")
+
+        ldl = (
+            v("LDL")
+            or v("LDL Chol")
+            or v("LDL Chol (direct)")
+        )
+
+        def ref_high(k):
+            return clean_number(cdict.get(k, {}).get("reference_high"))
+
+        if bilirubin is not None and bilirubin > 21:
+            if all(
+                x is not None and
+                (ref_high(k) is None or x <= ref_high(k))
+                for k, x in [("ALT", alt), ("AST", ast), ("ALP", alp), ("GGT", ggt)]
+            ):
                 chemistry_context.append(
-                    "Normal CRP reduces the likelihood of acute inflammatory or infectious pathology."
+                    "Unconjugated hyperbilirubinaemia with normal liver enzymes is commonly benign "
+                    "(e.g. Gilbert syndrome), particularly if intermittent."
                 )
-    
-            age = cdict.get("_patient_age")
-    
-            if triglycerides is not None or ldl is not None:
-                if age is not None and age < 40:
-                    chemistry_context.append(
-                        "At this age, absolute short-term cardiovascular risk is generally low; "
-                        "lifestyle optimisation is appropriate as first-line management."
-                    )
-                else:
-                    chemistry_context.append(
-                        "Lipid abnormalities suggest increased long-term cardiovascular risk rather than acute illness."
-                    )
-    
-                chemistry_next_steps.append(
-                    "Repeat fasting lipid profile in 3–6 months if clinically appropriate."
+
+        if crp is not None and crp < 5:
+            chemistry_context.append(
+                "Normal CRP reduces the likelihood of acute inflammatory or infectious pathology."
+            )
+
+        age = cdict.get("_patient_age")
+
+        if triglycerides is not None or ldl is not None:
+            if age is not None and age < 40:
+                chemistry_context.append(
+                    "At this age, absolute short-term cardiovascular risk is generally low; "
+                    "lifestyle optimisation is appropriate as first-line management."
                 )
-                chemistry_next_steps.append(
-                    "Consider fasting status and recent alcohol intake when interpreting triglyceride levels."
+            else:
+                chemistry_context.append(
+                    "Lipid abnormalities suggest increased long-term cardiovascular risk rather than acute illness."
                 )
-    
-            if bilirubin is not None and bilirubin > 21:
-                chemistry_next_steps.append(
-                    "If bilirubin remains elevated, consider repeat fractionation ± reticulocyte count if clinically indicated."
-                )
-    
-        # ---------------------------
-        # Final assembly
-        # ---------------------------
-        augmented = dict(ai_json)
-        augmented["_canonical_cbc"] = cdict
-        augmented["_routes"] = routes
-        augmented["_severity"] = sev
-        augmented["_differential_trees"] = diffs
-        augmented["_trend_comparison"] = trends
-        augmented["_clinical_context"] = chemistry_context
-        augmented["_suggested_next_steps"] = chemistry_next_steps
-        augmented["_clinical_patterns"] = patterns
-        augmented["_generated_at"] = iso_now()
-        augmented["_overall_status"] = overall_status
-    
-        return augmented
+
+            chemistry_next_steps.append(
+                "Repeat fasting lipid profile in 3–6 months if clinically appropriate."
+            )
+            chemistry_next_steps.append(
+                "Consider fasting status and recent alcohol intake when interpreting triglyceride levels."
+            )
+
+        if bilirubin is not None and bilirubin > 21:
+            chemistry_next_steps.append(
+                "If bilirubin remains elevated, consider repeat fractionation ± reticulocyte count if clinically indicated."
+            )
+
+    # ---------------------------
+    # Final assembly
+    # ---------------------------
+    augmented = dict(ai_json)
+    augmented["_canonical_cbc"] = cdict
+    augmented["_routes"] = routes
+    augmented["_severity"] = sev
+    augmented["_differential_trees"] = diffs
+    augmented["_trend_comparison"] = trends
+    augmented["_clinical_context"] = chemistry_context
+    augmented["_suggested_next_steps"] = chemistry_next_steps
+    augmented["_clinical_patterns"] = patterns
+    augmented["_generated_at"] = iso_now()
+    augmented["_overall_status"] = overall_status
+
+    return augmented
 
 
 
