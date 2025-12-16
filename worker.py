@@ -796,6 +796,27 @@ def add_route(routes, priority, pattern, route, next_steps):
     else:
         routes.append(entry)
 
+def severity_from_routes(routes: list) -> str:
+    """
+    Determines minimum severity based on dominant clinical routes.
+    Routes OVERRIDE numeric scoring (doctor logic).
+    """
+    if not routes:
+        return "low"
+
+    # Any PRIMARY route = at least HIGH severity
+    for r in routes:
+        if r.get("priority") == "primary":
+            return "high"
+
+    # Any SECONDARY route = at least MODERATE severity
+    for r in routes:
+        if r.get("priority") == "secondary":
+            return "moderate"
+
+    return "low"
+
+
 # ---------------------------
 # Route engine aggregator: Patterns -> Route -> Next Steps
 # also includes severity/urgency/differential/trends
@@ -1396,7 +1417,27 @@ def build_full_clinical_report(ai_json: dict) -> dict:
         # ---------------------------
         # Severity / differentials / trends
         # ---------------------------
-        sev = evaluate_severity_and_urgency(cdict)
+        # ---------------------------
+        # Severity resolution (ROUTE-DOMINANT)
+        # ---------------------------
+        numeric_sev = evaluate_severity_and_urgency(cdict)
+        route_sev = severity_from_routes(routes)
+        
+        # Escalation order (never downgrade)
+        severity_rank = {
+            "low": 0,
+            "moderate": 1,
+            "high": 2,
+            "critical": 3
+        }
+        
+        final_severity = route_sev
+        if severity_rank.get(numeric_sev["severity"], 0) > severity_rank.get(route_sev, 0):
+            final_severity = numeric_sev["severity"]
+        
+        sev = dict(numeric_sev)
+        sev["severity"] = final_severity
+
         diffs = generate_differential_trees(cdict)
     
         patient_name = None
