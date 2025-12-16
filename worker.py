@@ -1602,6 +1602,18 @@ def process_report(job: dict) -> dict:
         # --------------------
         print("Calling AI interpretation...")
         ai_json = call_ai_on_report(merged_text_for_ai)
+        # --------------------
+        # HARD FAILSAFE: force CBC extraction if missing
+        # --------------------
+        if not ai_json.get("cbc"):
+            print("⚠️ No structured CBC detected — forcing extraction")
+        
+            if extracted_rows:
+                ai_json["cbc"] = extracted_rows
+                ai_json["_cbc_status"] = "forced_from_ocr"
+            else:
+                raise ValueError("CBC missing after AI interpretation — cannot proceed safely")
+
 
         # ---- CBC sanity check (doctor-grade) ----
         cbc_rows = ai_json.get("cbc") or []
