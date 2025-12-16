@@ -1115,8 +1115,8 @@ def build_full_clinical_report(ai_json: dict) -> dict:
                 "Consider eGFR"
             ]
         })
-
-    if CK is not None and CK > 1000:
+        
+if CK is not None and CK > 1000:
     routes.append({
         "pattern": "High CK",
         "route": "Muscle injury / rhabdomyolysis physiology",
@@ -1126,6 +1126,8 @@ def build_full_clinical_report(ai_json: dict) -> dict:
             "Urgent review if creatinine rising"
         ]
     })
+
+    
 
 if not routes:
     routes.append({
