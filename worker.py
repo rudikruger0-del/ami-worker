@@ -884,6 +884,86 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     CK = v("CK")
     Na = v("Sodium")
     K = v("Potassium")
+# =====================================================
+# PASS 1 — PRIMARY LIFE-THREATENING CBC ROUTES
+# =====================================================
+
+# ---- Severe anaemia (immediate risk) ----
+if Hb is not None and Hb < 7:
+    add_route(
+        routes,
+        priority="primary",
+        pattern="Severe anaemia",
+        route=f"Haemoglobin {Hb} g/dL at a level associated with reduced oxygen delivery",
+        next_steps=[
+            "Urgent clinical assessment",
+            "Assess haemodynamic stability and bleeding",
+            "Repeat haemoglobin to confirm"
+        ]
+    )
+
+# ---- Critical thrombocytopenia ----
+if Plt is not None and Plt < 50:
+    add_route(
+        routes,
+        priority="primary",
+        pattern="Critical thrombocytopenia",
+        route=f"Platelet count {Plt} ×10⁹/L with increased bleeding risk",
+        next_steps=[
+            "Assess for bleeding or bruising",
+            "Review medications and recent infections",
+            "Repeat platelet count and peripheral smear"
+        ]
+    )
+
+# ---- Pancytopenia (bone marrow danger pattern) ----
+cytopenias = sum([
+    1 if Hb is not None and Hb < 10 else 0,
+    1 if WBC is not None and WBC < 3 else 0,
+    1 if Plt is not None and Plt < 100 else 0
+])
+
+if cytopenias >= 2:
+    add_route(
+        routes,
+        priority="primary",
+        pattern="Pancytopenia physiology",
+        route="Multiple concurrent cytopenias raise concern for bone marrow pathology or severe systemic illness",
+        next_steps=[
+            "Urgent peripheral blood smear",
+            "Review recent drugs, infections, and systemic symptoms",
+            "Specialist review if persistent or worsening"
+        ]
+    )
+
+# ---- Neutropenic infection physiology ----
+if WBC is not None and WBC < 1.5 and CRP is not None and CRP > 20:
+    add_route(
+        routes,
+        priority="primary",
+        pattern="Neutropenic inflammatory response",
+        route="Low white cell count with inflammatory marker elevation raises concern for high-risk infection",
+        next_steps=[
+            "Urgent clinical assessment",
+            "Careful infection source evaluation",
+            "Repeat CBC to assess trend"
+        ]
+    )
+
+# ---- Extreme leukocytosis ----
+if WBC is not None and WBC > 30:
+    add_route(
+        routes,
+        priority="primary",
+        pattern="Extreme leukocytosis",
+        route=f"WBC {WBC} ×10⁹/L may reflect severe infection or haematologic pathology",
+        next_steps=[
+            "Assess for sepsis or systemic illness",
+            "Peripheral smear review",
+            "Specialist input if unexplained"
+        ]
+    )
+
 
     # =====================================================
     # COMPOSITE CBC PATTERNS (doctor-style reasoning)
@@ -1127,15 +1207,201 @@ def build_full_clinical_report(ai_json: dict) -> dict:
             ]
         })
 
-    if not routes:
-        routes.append({
-            "pattern": "Laboratory abnormalities detected",
-            "route": "Abnormal findings require clinical correlation",
-            "next_steps": [
-                "Review results in full clinical context",
-                "Consider repeat testing if results are unexpected"
-            ]
-        })
+# =====================================================
+# PASS 1 — COMBINED HIGH-RISK PHYSIOLOGY
+# =====================================================
+
+# ---- Infection + thrombocytopenia (bleeding + sepsis risk) ----
+if (
+    WBC is not None and WBC > 12
+    and CRP is not None and CRP > 20
+    and Plt is not None and Plt < 100
+):
+    add_route(
+        routes,
+        priority="primary",
+        pattern="Infection with thrombocytopenia",
+        route="Concurrent inflammatory response and thrombocytopenia increase bleeding and sepsis risk",
+        next_steps=[
+            "Urgent clinical assessment",
+            "Assess for bleeding and sepsis physiology",
+            "Repeat CBC and CRP to assess trend"
+        ]
+    )
+
+# ---- Infection with significant anaemia ----
+if (
+    WBC is not None and WBC > 12
+    and CRP is not None and CRP > 20
+    and Hb is not None and Hb < 10
+):
+    add_route(
+        routes,
+        priority="primary",
+        pattern="Infection with significant anaemia",
+        route="Anaemia may impair oxygen delivery during acute inflammatory illness",
+        next_steps=[
+            "Urgent clinical assessment",
+            "Assess haemodynamic stability",
+            "Repeat haemoglobin after acute phase"
+        ]
+    )
+
+
+# ---- Bone marrow failure physiology ----
+if (
+    Hb is not None and Hb < 10
+    and WBC is not None and WBC < 3
+    and Plt is not None and Plt < 100
+):
+    add_route(
+        routes,
+        priority="primary",
+        pattern="Bone marrow failure physiology",
+        route="Global suppression of blood cell lines suggests marrow failure or infiltration",
+        next_steps=[
+            "Urgent peripheral blood smear",
+            "Review medications, toxins, and systemic symptoms",
+            "Specialist review is indicated"
+        ]
+    )
+
+
+# ---- Multiple simultaneous danger signals ----
+danger_count = sum([
+    1 if Hb is not None and Hb < 7 else 0,
+    1 if Plt is not None and Plt < 50 else 0,
+    1 if WBC is not None and (WBC < 1 or WBC > 30) else 0,
+    1 if K is not None and (K < 3.0 or K > 6.0) else 0,
+    1 if Na is not None and (Na < 125 or Na > 155) else 0
+])
+
+if danger_count >= 2:
+    add_route(
+        routes,
+        priority="primary",
+        pattern="Multiple concurrent critical abnormalities",
+        route="More than one life-threatening laboratory abnormality detected",
+        next_steps=[
+            "Immediate senior clinical review",
+            "Prioritise stabilisation and monitoring",
+            "Repeat critical parameters urgently"
+        ]
+    )
+
+
+# =====================================================
+# FAIL-SAFE — MUST BE LAST
+# =====================================================
+if not routes:
+    routes.append({
+        "pattern": "Laboratory abnormalities detected",
+        "route": "Abnormal findings require clinical correlation",
+        "next_steps": [
+            "Review results in full clinical context",
+            "Consider repeat testing if results are unexpected"
+        ]
+    })
+# =====================================================
+# PASS 2 — ROUTE DOMINANCE & CLINICAL PRIORITISATION
+# =====================================================
+
+def route_priority_score(r):
+    """
+    Lower score = higher clinical priority
+    """
+    if r.get("priority") == "primary":
+        return 0
+    if r.get("priority") == "secondary":
+        return 1
+    return 2
+
+
+# ---- Sort routes by clinical priority ----
+routes = sorted(routes, key=route_priority_score)
+
+
+# ---- If any PRIMARY routes exist, suppress weak contextual noise ----
+has_primary = any(r.get("priority") == "primary" for r in routes)
+
+if has_primary:
+    filtered = []
+    for r in routes:
+        # Always keep primary routes
+        if r.get("priority") == "primary":
+            filtered.append(r)
+            continue
+
+        # Keep secondary routes ONLY if clinically reinforcing
+        if r.get("priority") == "secondary":
+            filtered.append(r)
+
+    routes = filtered
+
+
+# ---- Hard cap to avoid cognitive overload ----
+MAX_ROUTES = 5
+routes = routes[:MAX_ROUTES]
+# =====================================================
+# PASS 3 — CLINICAL CONFIDENCE & TEMPORAL FRAMING
+# =====================================================
+
+def classify_timeframe(route):
+    """
+    Assigns a clinical time-sensitivity label.
+    """
+    pattern = (route.get("pattern") or "").lower()
+
+    if any(x in pattern for x in [
+        "critical",
+        "bone marrow",
+        "multiple concurrent",
+        "severe",
+        "life-threatening"
+    ]):
+        return "Immediate"
+
+    if any(x in pattern for x in [
+        "infection",
+        "electrolyte",
+        "renal impairment",
+        "anaemia with"
+    ]):
+        return "Urgent"
+
+    return "Routine / Monitor"
+
+
+def confidence_language(route):
+    """
+    Adds senior-clinician-style certainty without diagnosis.
+    """
+    timeframe = route.get("_timeframe")
+
+    if timeframe == "Immediate":
+        return "This pattern is clinically concerning and requires immediate senior assessment."
+
+    if timeframe == "Urgent":
+        return "This finding warrants timely clinical review and correlation."
+
+    return "This pattern may be monitored in appropriate clinical context."
+
+
+# ---- Apply timeframe + confidence to routes ----
+for r in routes:
+    tf = classify_timeframe(r)
+    r["_timeframe"] = tf
+    r["_confidence"] = confidence_language(r)
+
+
+# ---- Escalation summary (one-liner doctors scan) ----
+if routes:
+    top = routes[0]
+    augmented_summary = f"{top.get('pattern')} — {top.get('_timeframe')} priority."
+else:
+    augmented_summary = "No dominant clinical priority identified."
+
+
 
 
         
