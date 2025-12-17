@@ -1475,6 +1475,26 @@ def build_full_clinical_report(ai_json: dict) -> dict:
         if severity_rank.get(final_severity, 0) < severity_rank["moderate"]:
             final_severity = "moderate"
 
+    # ---------------------------
+    # CHEMISTRY DOMINANT PRIMARY ROUTE
+    # ---------------------------
+    if chemistry_dominant:
+        add_route(
+            routes,
+            priority="primary",
+            pattern="High–anion–gap metabolic acidosis physiology",
+            route=(
+                "Elevated anion gap with reduced bicarbonate indicates a dominant "
+                "metabolic acidosis process with associated electrolyte and renal stress."
+            ),
+            next_steps=[
+                "Urgent clinical assessment",
+                "Evaluate causes of high–anion–gap metabolic acidosis",
+                "Monitor electrolytes and renal function closely"
+            ]
+        )
+
+
     sev = dict(numeric_sev)
     sev["severity"] = final_severity
 
