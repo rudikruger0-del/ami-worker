@@ -1541,6 +1541,24 @@ def build_full_clinical_report(ai_json: dict) -> dict:
             chemistry_next_steps.append(
                 "If bilirubin remains elevated, consider repeat fractionation ± reticulocyte count if clinically indicated."
             )
+    # ---------------------------
+    # CHEMISTRY PRIORITY FRAMING (SUMMARY AUGMENT)
+    # ---------------------------
+    if chemistry_dominant:
+        dominant_line = (
+            "The dominant abnormality is high–anion–gap metabolic acidosis "
+            "with associated electrolyte and renal stress, which warrants "
+            "urgent clinical assessment due to risk of deterioration."
+        )
+    
+        if isinstance(ai_json.get("summary"), dict):
+            existing = ai_json["summary"].get("impression", "")
+            if dominant_line not in existing:
+                ai_json["summary"]["impression"] = (
+                    dominant_line if not existing
+                    else f"{existing} {dominant_line}"
+                )
+
 
     # ---------------------------
     # Final assembly
