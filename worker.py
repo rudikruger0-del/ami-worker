@@ -337,6 +337,13 @@ def build_cbc_value_dict(ai_json: dict) -> dict:
 
         elif "calcium" in name:
             put("Calcium")
+            
+        elif "anion gap" in name:
+            put("Anion Gap")
+        
+        elif "bicarbonate" in name or name in ("co2", "hco3"):
+            put("Bicarbonate")
+
 
         # -----------------
         # Liver / Enzymes
