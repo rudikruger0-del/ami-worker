@@ -1449,6 +1449,13 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     bicarb = clean_number(cdict.get("Bicarbonate", {}).get("value"))
     potassium = clean_number(cdict.get("Potassium", {}).get("value"))
     creatinine = clean_number(cdict.get("Creatinine", {}).get("value"))
+
+    print("🧪 CHEM CHECK:",
+      "AnionGap=", anion_gap,
+      "Bicarb=", bicarb,
+      "K=", potassium,
+      "Cr=", creatinine)
+
     
     chemistry_dominant = False
     
