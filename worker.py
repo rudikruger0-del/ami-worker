@@ -1435,6 +1435,32 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     if severity_rank.get(numeric_sev["severity"], 0) > severity_rank.get(route_sev, 0):
         final_severity = numeric_sev["severity"]
     
+    # ---------------------------
+    # CHEMISTRY SEVERITY DOMINANCE (DO NOT DOWNGRADE)
+    # ---------------------------
+    anion_gap = clean_number(cdict.get("Anion Gap", {}).get("value"))
+    bicarb = clean_number(cdict.get("Bicarbonate", {}).get("value"))
+    potassium = clean_number(cdict.get("Potassium", {}).get("value"))
+    creatinine = clean_number(cdict.get("Creatinine", {}).get("value"))
+    
+    chemistry_dominant = False
+    
+    # High–anion–gap metabolic acidosis physiology
+    if (
+        anion_gap is not None and anion_gap >= 16
+        and bicarb is not None and bicarb <= 20
+    ):
+        chemistry_dominant = True
+    
+    # Acidosis with electrolyte or renal stress escalates risk
+    if chemistry_dominant and (
+        (potassium is not None and potassium >= 5.2) or
+        (creatinine is not None and creatinine >= 105)
+    ):
+        # Enforce minimum MODERATE severity
+        if severity_rank.get(final_severity, 0) < severity_rank["moderate"]:
+            final_severity = "moderate"
+
     sev = dict(numeric_sev)
     sev["severity"] = final_severity
 
