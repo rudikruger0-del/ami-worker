@@ -823,6 +823,43 @@ def severity_from_routes(routes: list) -> str:
 
     return "low"
 
+def build_follow_up_block(cdict: dict, routes: list, severity: str) -> list:
+    """
+    Returns a short, clean follow-up list using EXISTING findings only.
+    No diagnoses. No treatment. No new logic.
+    """
+    follow_up = []
+
+    # Severity-driven framing
+    if severity in ("high", "critical"):
+        follow_up.append(
+            "Urgent clinical reassessment is advised based on the severity of abnormalities detected."
+        )
+    elif severity == "moderate":
+        follow_up.append(
+            "Timely clinical review is recommended to reassess abnormal findings and trends."
+        )
+    else:
+        follow_up.append(
+            "Findings may be monitored in appropriate clinical context."
+        )
+
+    # Route-driven reinforcement (no new ideas)
+    for r in routes:
+        if r.get("priority") == "primary":
+            follow_up.append(
+                "Primary abnormal laboratory patterns should be prioritised during clinical assessment."
+            )
+            break
+
+    # Trend awareness
+    follow_up.append(
+        "Correlation with symptoms, vital signs, and previous laboratory results is important."
+    )
+
+    return follow_up
+
+
 
 # ---------------------------
 # Route engine aggregator: Patterns -> Route -> Next Steps
@@ -1507,6 +1544,15 @@ def build_full_clinical_report(ai_json: dict) -> dict:
         pass
 
     trends = trend_comparison(patient_name, cdict)
+    # ---------------------------
+    # Clean follow-up block (summary-level, non-invasive)
+    # ---------------------------
+    follow_up = build_follow_up_block(
+        cdict=cdict,
+        routes=routes,
+        severity=sev.get("severity")
+    )
+
 
     # ---------------------------
     # Chemistry context & next steps
@@ -1608,6 +1654,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     augmented["_clinical_patterns"] = patterns
     augmented["_generated_at"] = iso_now()
     augmented["_overall_status"] = overall_status
+    augmented["_follow_up"] = follow_up
 
     return augmented
 
