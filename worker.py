@@ -661,7 +661,7 @@ def trend_comparison(patient_name: str, current_cdict: dict) -> dict:
     try:
         # Fetch recent completed reports (limit 20) and filter in Python by patient name match
        res = supabase.table("reports").select("*").eq("ai_status", "completed").order("created_at", desc=True).limit(20).execute()
-        prior = res.model or []
+       prior = res.model or []
         matches = []
         for r in prior:
             try:
