@@ -663,7 +663,7 @@ def trend_comparison(patient_name: str, current_cdict: dict) -> dict:
        res = supabase.table("reports").select("*").eq("ai_status", "completed").order("created_at", desc=True).limit(20).execute()
        prior = res.model or []
        matches = []
-        for r in prior:
+       for r in prior:
             try:
                 ai = r.get("ai_results") or r.get("ai_results_raw") or {}
                 # ai could be a string or dict
