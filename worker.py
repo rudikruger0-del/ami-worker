@@ -660,28 +660,28 @@ def trend_comparison(patient_name: str, current_cdict: dict) -> dict:
 
     try:
         # Fetch recent completed reports (limit 20) and filter in Python by patient name match
-res = supabase.table("reports").select("*").eq("ai_status", "completed").order("created_at", desc=True).limit(20).execute()
-prior = res.model or []
-matches = []
-
-for r in prior:
-    try:
-        ai = r.get("ai_results") or r.get("ai_results_raw") or {}
-        # ai could be a string or dict
-        if isinstance(ai, str):
+        res = supabase.table("reports").select("*").eq("ai_status", "completed").order("created_at", desc=True).limit(20).execute()
+        prior = res.model or []
+        matches = []
+        
+        for r in prior:
             try:
-                ai = json.loads(ai)
-            except:
-                ai = {}
-
-        pname = None
-        if isinstance(ai, dict):
-            pname = (ai.get("patient") or {}).get("name")
-
-        if pname and patient_name and pname.strip().lower() == patient_name.strip().lower():
-            matches.append({"created_at": r.get("created_at"), "ai": ai})
-    except Exception:
-        continue
+                ai = r.get("ai_results") or r.get("ai_results_raw") or {}
+                # ai could be a string or dict
+                if isinstance(ai, str):
+                    try:
+                        ai = json.loads(ai)
+                    except:
+                        ai = {}
+        
+                pname = None
+                if isinstance(ai, dict):
+                    pname = (ai.get("patient") or {}).get("name")
+        
+                if pname and patient_name and pname.strip().lower() == patient_name.strip().lower():
+                    matches.append({"created_at": r.get("created_at"), "ai": ai})
+            except Exception:
+                continue
 
 
         if not matches:
