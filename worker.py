@@ -108,6 +108,67 @@ def clean_number(val):
         return float(nums[0])
     except:
         return None
+        
+def extract_patient_demographics(text: str) -> dict:
+    """
+    Extract patient name, age, sex from OCR or PDF text.
+    Conservative: returns None if uncertain.
+    """
+    if not text:
+        return {"name": None, "age": None, "sex": "Unknown"}
+
+    t = text.lower()
+
+    # ---------- NAME ----------
+    name = None
+    for p in [
+        r"patient\s*name\s*[:\-]\s*([a-z ,.'-]{3,50})",
+        r"name\s*[:\-]\s*([a-z ,.'-]{3,50})",
+    ]:
+        m = re.search(p, t, re.IGNORECASE)
+        if m:
+            cand = m.group(1).strip().title()
+            if 1 <= len(cand.split()) <= 4:
+                name = cand
+                break
+
+    # ---------- SEX ----------
+    sex = "Unknown"
+    m = re.search(r"\b(sex|gender)\s*[:\-]\s*(male|female|m|f)\b", t, re.IGNORECASE)
+    if m:
+        sex = "Male" if m.group(2).lower() in ("male", "m") else "Female"
+
+    # ---------- AGE ----------
+    age = None
+    m = re.search(r"\bage\s*[:\-]\s*(\d{1,3})\b", t)
+    if m:
+        try:
+            a = int(m.group(1))
+            if 0 < a < 120:
+                age = a
+        except:
+            pass
+
+    # ---------- DOB → AGE ----------
+    if age is None:
+        m = re.search(
+            r"\b(dob|date of birth)\s*[:\-]\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})",
+            t
+        )
+        if m:
+            try:
+                dob = datetime.strptime(m.group(2), "%d/%m/%Y")
+                today = datetime.today()
+                age = today.year - dob.year - (
+                    (today.month, today.day) < (dob.month, dob.day)
+                )
+                if not (0 < age < 120):
+                    age = None
+            except:
+                pass
+
+    return {"name": name, "age": age, "sex": sex}
+
 
 def iso_now():
     return datetime.utcnow().isoformat() + "Z"
