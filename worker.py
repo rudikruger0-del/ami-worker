@@ -111,20 +111,32 @@ def clean_number(val):
         
 def extract_patient_demographics(text: str) -> dict:
     """
-    Extract patient name, age, sex from OCR or PDF text.
-    Conservative: returns None if uncertain.
+    Extract patient name, age, sex from SA lab reports:
+    Lancet, Ampath, PathCare, Path24.
+    Conservative: only fills fields when confident.
     """
     if not text:
         return {"name": None, "age": None, "sex": "Unknown"}
 
     t = text.lower()
 
-    # ---------- NAME ----------
     name = None
-    for p in [
-        r"patient\s*name\s*[:\-]\s*([a-z ,.'-]{3,50})",
-        r"name\s*[:\-]\s*([a-z ,.'-]{3,50})",
-    ]:
+    age = None
+    sex = "Unknown"
+
+    # ==================================================
+    # NAME (Lancet / Ampath / PathCare)
+    # Examples:
+    # "PATIENT NAME : ZYBRAND TALJAARD"
+    # "Patient Name- John Smith"
+    # ==================================================
+    name_patterns = [
+        r"patient\s*name\s*[:\-]\s*([a-z ,.'-]{3,60})",
+        r"patient\s*[:\-]\s*([a-z ,.'-]{3,60})",
+        r"\bname\s*[:\-]\s*([a-z ,.'-]{3,60})",
+    ]
+
+    for p in name_patterns:
         m = re.search(p, t, re.IGNORECASE)
         if m:
             cand = m.group(1).strip().title()
@@ -132,58 +144,79 @@ def extract_patient_demographics(text: str) -> dict:
                 name = cand
                 break
 
-    # ---------- SEX ----------
-    sex = "Unknown"
-    m = re.search(r"\b(sex|gender)\s*[:\-]\s*(male|female|m|f)\b", t, re.IGNORECASE)
-    if m:
-        sex = "Male" if m.group(2).lower() in ("male", "m") else "Female"
-
-    # ---------- AGE ----------
-    age = None
-    m = re.search(r"\bage\s*[:\-]\s*(\d{1,3})\b", t)
+    # ==================================================
+    # AGE / SEX combined (VERY COMMON IN SA LABS)
+    # Examples:
+    # "AGE/SEX/DOB : 33Y / M / 1991/04/05"
+    # "33 Y / MALE"
+    # ==================================================
+    m = re.search(
+        r"(\d{1,3})\s*(y|yrs|years)?\s*/\s*(male|female|m|f)",
+        t,
+        re.IGNORECASE
+    )
     if m:
         try:
             a = int(m.group(1))
             if 0 < a < 120:
                 age = a
+            sex = "Male" if m.group(3).lower() in ("m", "male") else "Female"
         except:
             pass
 
-    # ---------- DOB → AGE ----------
+    # ==================================================
+    # AGE only
+    # Example: "AGE : 33"
+    # ==================================================
+    if age is None:
+        m = re.search(r"\bage\s*[:\-]\s*(\d{1,3})\b", t)
+        if m:
+            try:
+                a = int(m.group(1))
+                if 0 < a < 120:
+                    age = a
+            except:
+                pass
+
+    # ==================================================
+    # SEX only
+    # ==================================================
+    if sex == "Unknown":
+        m = re.search(r"\b(sex|gender)\s*[:\-]\s*(male|female|m|f)\b", t)
+        if m:
+            sex = "Male" if m.group(2).lower() in ("m", "male") else "Female"
+
+    # ==================================================
+    # DOB → AGE (fallback)
+    # Examples:
+    # "DOB : 1991/04/05"
+    # "Date of Birth - 05/04/1991"
+    # ==================================================
     if age is None:
         m = re.search(
-            r"\b(dob|date of birth)\s*[:\-]\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})",
+            r"(dob|date of birth)\s*[:\-]\s*(\d{1,4}[\/\-]\d{1,2}[\/\-]\d{1,4})",
             t
         )
         if m:
-            try:
-                dob = datetime.strptime(m.group(2), "%d/%m/%Y")
-                today = datetime.today()
-                age = today.year - dob.year - (
-                    (today.month, today.day) < (dob.month, dob.day)
-                )
-                if not (0 < age < 120):
-                    age = None
-            except:
-                pass
+            for fmt in ("%Y/%m/%d", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+                try:
+                    dob = datetime.strptime(m.group(2), fmt)
+                    today = datetime.today()
+                    a = today.year - dob.year - (
+                        (today.month, today.day) < (dob.month, dob.day)
+                    )
+                    if 0 < a < 120:
+                        age = a
+                        break
+                except:
+                    continue
 
-    # ---------- AGE / SEX COMBINED (Lancet format) ----------
-        m = re.search(
-            r"(\d{1,3})\s*(y|yrs|years)?\s*/\s*(male|female)",
-            t,
-            re.IGNORECASE
-        )
-        if m:
-            try:
-                age = int(m.group(1))
-                sex = "Male" if m.group(3).lower() == "male" else "Female"
-                if not (0 < age < 120):
-                    age = None
-            except:
-                pass
-    
+    return {
+        "name": name,
+        "age": age,
+        "sex": sex
+    }
 
-    return {"name": name, "age": age, "sex": sex}
 
 
 def iso_now():
