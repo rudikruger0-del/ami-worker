@@ -1801,6 +1801,7 @@ def process_report(job: dict) -> dict:
         print(f"Report {report_id}: scanned={scanned}, text_len={len(text)}")
 
         extracted_rows = []
+        ocr_text_chunks = []
         merged_text_for_ai = ""
 
         # --------------------
@@ -1808,34 +1809,42 @@ def process_report(job: dict) -> dict:
         # --------------------
         if scanned:
             print("SCANNED PDF → OCR")
+            ocr_text_chunks = []
             pages = convert_from_bytes(pdf_bytes)
+        
             for i, page_img in enumerate(pages, start=1):
                 buf = io.BytesIO()
                 page_img.save(buf, format="PNG")
                 ocr_out = extract_cbc_from_image(buf.getvalue())
                 extracted_rows.extend(ocr_out.get("cbc", []))
-
+                ocr_text_chunks.append(ocr_out.get("raw_text", ""))
+        
             if not extracted_rows:
                 raise ValueError("No CBC extracted from scanned PDF")
-
+        
             merged_text_for_ai = json.dumps(
                 {"cbc": extracted_rows},
                 ensure_ascii=False
             )
-
+        
+            ocr_identity_text = "\n".join(ocr_text_chunks)
+        
         else:
             merged_text_for_ai = text or l_text
             if not merged_text_for_ai.strip():
                 raise ValueError("No usable text extracted from digital PDF")
+        
         # --------------------
         # AI interpretation
         # --------------------
         print("Calling AI interpretation...")
         ai_json = call_ai_on_report(merged_text_for_ai)
+        
         # --------------------
-        # Patient demographics extraction (from raw PDF text)
+        # Patient demographics extraction (THIS IS THE KEY)
         # --------------------
-        raw_text_for_patient = text  # use PDF text, not AI JSON
+        raw_text_for_patient = text if not scanned else ocr_identity_text
+        
         patient = extract_patient_demographics(raw_text_for_patient)
         
         print("🧾 Extracted patient demographics:", patient)
