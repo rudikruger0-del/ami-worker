@@ -1876,12 +1876,19 @@ def process_report(job: dict) -> dict:
         
 
         # --------------------
-        # Store results
+        # Store results + persist patient demographics
         # --------------------
+        patient = augmented.get("patient") or {}
+        
         supabase.table("reports").update({
             "ai_status": "completed",
             "ai_results": augmented,
-            "ai_error": None
+            "ai_error": None,
+        
+            # 🔒 Persist patient fields explicitly
+            "name": patient.get("name"),
+            "age": patient.get("age"),
+            "sex": patient.get("sex"),
         }).eq("id", report_id).execute()
 
         print(f"✅ Report {report_id} completed")
