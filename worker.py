@@ -126,9 +126,6 @@ def extract_patient_demographics(text: str) -> dict:
 
     # ==================================================
     # NAME (Lancet / Ampath / PathCare)
-    # Examples:
-    # "PATIENT NAME : ZYBRAND TALJAARD"
-    # "Patient Name- John Smith"
     # ==================================================
     name_patterns = [
         r"patient\s*name\s*[:\-]\s*([a-z ,.'-]{3,60})",
@@ -145,10 +142,7 @@ def extract_patient_demographics(text: str) -> dict:
                 break
 
     # ==================================================
-    # AGE / SEX combined (VERY COMMON IN SA LABS)
-    # Examples:
-    # "AGE/SEX/DOB : 33Y / M / 1991/04/05"
-    # "33 Y / MALE"
+    # AGE / SEX combined (very common in SA labs)
     # ==================================================
     m = re.search(
         r"(\d{1,3})\s*(y|yrs|years)?\s*/\s*(male|female|m|f)",
@@ -166,7 +160,6 @@ def extract_patient_demographics(text: str) -> dict:
 
     # ==================================================
     # AGE only
-    # Example: "AGE : 33"
     # ==================================================
     if age is None:
         m = re.search(r"\bage\s*[:\-]\s*(\d{1,3})\b", t)
@@ -188,9 +181,6 @@ def extract_patient_demographics(text: str) -> dict:
 
     # ==================================================
     # DOB → AGE (fallback)
-    # Examples:
-    # "DOB : 1991/04/05"
-    # "Date of Birth - 05/04/1991"
     # ==================================================
     if age is None:
         m = re.search(
@@ -216,6 +206,7 @@ def extract_patient_demographics(text: str) -> dict:
         "age": age,
         "sex": sex
     }
+
 
 
 
