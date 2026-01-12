@@ -1846,22 +1846,10 @@ def process_report(job: dict) -> dict:
         raw_text_for_patient = text if not scanned else ocr_identity_text
         
         patient = extract_patient_demographics(raw_text_for_patient)
+        print("🧪 RAW IDENTITY TEXT (first 500 chars):\n", raw_text_for_patient[:500])
         
         print("🧾 Extracted patient demographics:", patient)
         
-        if isinstance(ai_json.get("patient"), dict):
-            for k, v in patient.items():
-                if ai_json["patient"].get(k) in (None, "Unknown"):
-                    ai_json["patient"][k] = v
-        else:
-            ai_json["patient"] = patient
-
-        # --------------------
-        # Patient demographics extraction (from raw PDF / OCR text)
-        # --------------------
-        raw_text_for_patient = text if not scanned else merged_text_for_ai
-        patient = extract_patient_demographics(raw_text_for_patient)
-
         if isinstance(ai_json.get("patient"), dict):
             for k, v in patient.items():
                 if ai_json["patient"].get(k) in (None, "Unknown"):
