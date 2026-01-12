@@ -1833,6 +1833,21 @@ def process_report(job: dict) -> dict:
         print("Calling AI interpretation...")
         ai_json = call_ai_on_report(merged_text_for_ai)
         # --------------------
+        # Patient demographics extraction (from raw PDF text)
+        # --------------------
+        raw_text_for_patient = text  # use PDF text, not AI JSON
+        patient = extract_patient_demographics(raw_text_for_patient)
+        
+        print("🧾 Extracted patient demographics:", patient)
+        
+        if isinstance(ai_json.get("patient"), dict):
+            for k, v in patient.items():
+                if ai_json["patient"].get(k) in (None, "Unknown"):
+                    ai_json["patient"][k] = v
+        else:
+            ai_json["patient"] = patient
+
+        # --------------------
         # Patient demographics extraction (from raw PDF / OCR text)
         # --------------------
         raw_text_for_patient = text if not scanned else merged_text_for_ai
