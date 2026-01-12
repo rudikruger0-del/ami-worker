@@ -167,6 +167,22 @@ def extract_patient_demographics(text: str) -> dict:
             except:
                 pass
 
+    # ---------- AGE / SEX COMBINED (Lancet format) ----------
+        m = re.search(
+            r"(\d{1,3})\s*(y|yrs|years)?\s*/\s*(male|female)",
+            t,
+            re.IGNORECASE
+        )
+        if m:
+            try:
+                age = int(m.group(1))
+                sex = "Male" if m.group(3).lower() == "male" else "Female"
+                if not (0 < age < 120):
+                    age = None
+            except:
+                pass
+    
+
     return {"name": name, "age": age, "sex": sex}
 
 
