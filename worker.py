@@ -600,6 +600,79 @@ def assess_notes_coherence(notes_text: str | None, routes: list) -> dict | None:
         "notes_coherence": notes
     }
 
+def build_cross_domain_coherence(
+    routes: list,
+    dominant_driver: dict,
+    acid_base: dict | None,
+    ecg: dict | None,
+    notes: dict | None
+) -> dict:
+    """
+    Cross-domain coherence synthesis.
+
+    Purpose:
+    - Reduce the big picture into a short, clinically useful orientation
+    - Highlight agreement, tension, or uncertainty between domains
+    - NEVER diagnose
+    - NEVER override severity or routes
+    """
+
+    summary = []
+    confidence = "limited"
+
+    # ----------------------------
+    # Dominant driver framing
+    # ----------------------------
+    if dominant_driver and dominant_driver.get("driver"):
+        if dominant_driver.get("confidence") == "clear":
+            summary.append(
+                f"Primary physiological driver appears to be '{dominant_driver['driver']}'."
+            )
+            confidence = "moderate"
+        elif dominant_driver.get("confidence") == "competing":
+            summary.append(
+                "Multiple competing physiological drivers are present; avoid anchoring on a single cause."
+            )
+            confidence = "limited"
+
+    # ----------------------------
+    # Acid–base reinforcement
+    # ----------------------------
+    if acid_base:
+        summary.append(
+            "Acid–base findings provide additional physiological context that supports laboratory interpretation."
+        )
+        confidence = "moderate"
+
+    # ----------------------------
+    # ECG reinforcement
+    # ----------------------------
+    if ecg:
+        summary.append(
+            "ECG context highlights potential electrical risk related to electrolyte abnormalities."
+        )
+        confidence = "moderate"
+
+    # ----------------------------
+    # Notes reinforcement
+    # ----------------------------
+    if notes:
+        summary.append(
+            "Clinical notes provide contextual information that should be correlated with physiological findings."
+        )
+        confidence = "moderate"
+
+    if not summary:
+        summary.append(
+            "Interpretation is limited to available laboratory data; no additional cross-domain context is present."
+        )
+
+    return {
+        "cross_domain_summary": summary,
+        "confidence": confidence
+    }
+
+
 
 
 
@@ -2032,6 +2105,17 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # ---------------------------
     notes_text = ai_json.get("clinical_notes") or ai_json.get("notes")
     notes_coherence = assess_notes_coherence(notes_text, routes)
+    # ---------------------------
+    # STEP 8: Cross-domain coherence (synthesis only)
+    # ---------------------------
+    cross_domain_coherence = build_cross_domain_coherence(
+        routes=routes,
+        dominant_driver=dominant_driver,
+        acid_base=acid_base_coherence,
+        ecg=ecg_coherence,
+        notes=notes_coherence
+    )
+
 
 
 
@@ -2297,6 +2381,8 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     augmented["_dominant_driver"] = dominant_driver
     augmented["_ecg_coherence"] = ecg_coherence
     augmented["_notes_coherence"] = notes_coherence
+    augmented["_cross_domain_coherence"] = cross_domain_coherence
+
 
 
 
