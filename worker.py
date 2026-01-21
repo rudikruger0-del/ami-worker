@@ -1915,6 +1915,8 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     augmented["_overall_status"] = overall_status
     augmented["_follow_up"] = follow_up
     augmented["_data_integrity"] = data_integrity
+    augmented["_pattern_strength"] = pattern_strength
+
 
 
     return augmented
