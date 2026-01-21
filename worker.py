@@ -452,6 +452,84 @@ def assess_acid_base_coherence(cdict: dict) -> dict | None:
     return {
         "acid_base_coherence": notes
     }
+    
+def assess_ecg_coherence(cdict: dict, ecg_data: dict | None) -> dict | None:
+    """
+    Read-only ECG coherence assessment.
+
+    Purpose:
+    - Relate electrolyte abnormalities to potential electrical risk
+    - Orientation only
+    - NEVER interpret rhythm
+    - NEVER diagnose
+    - NEVER override severity or routes
+
+    Returns None if ECG data or relevant context is absent.
+    """
+
+    if not ecg_data or not isinstance(ecg_data, dict):
+        return None
+
+    v = lambda k: clean_number(cdict.get(k, {}).get("value"))
+
+    potassium = v("Potassium")
+    calcium = v("Calcium")
+    magnesium = v("Magnesium")
+
+    qtc = clean_number(ecg_data.get("QTc"))
+    heart_rate = clean_number(ecg_data.get("heart_rate"))
+
+    notes = []
+
+    # ----------------------------
+    # Potassium ↔ electrical risk
+    # ----------------------------
+    if potassium is not None:
+        if potassium >= 5.5:
+            notes.append(
+                "Elevated potassium is associated with increased risk of conduction abnormalities; ECG correlation is important."
+            )
+        elif potassium <= 3.0:
+            notes.append(
+                "Low potassium may increase susceptibility to ventricular arrhythmias, particularly in the presence of QT prolongation."
+            )
+
+    # ----------------------------
+    # QT context (if available)
+    # ----------------------------
+    if qtc is not None and qtc >= 480:
+        notes.append(
+            "Prolonged QT interval increases arrhythmic risk, especially in the presence of electrolyte disturbances."
+        )
+
+    # ----------------------------
+    # Calcium / magnesium context
+    # ----------------------------
+    if calcium is not None and calcium < 2.0:
+        notes.append(
+            "Low calcium may contribute to QT prolongation and electrical instability."
+        )
+
+    if magnesium is not None and magnesium < 0.7:
+        notes.append(
+            "Low magnesium may predispose to ventricular arrhythmias."
+        )
+
+    # ----------------------------
+    # Heart rate amplification
+    # ----------------------------
+    if heart_rate is not None and heart_rate > 120:
+        notes.append(
+            "Tachycardia may amplify the electrical effects of electrolyte abnormalities."
+        )
+
+    if not notes:
+        return None
+
+    return {
+        "ecg_coherence": notes
+    }
+
 
 
 
@@ -1874,6 +1952,12 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # STEP 4: Dominant driver (orientation only)
     # ---------------------------
     dominant_driver = derive_dominant_driver(routes)
+    # ---------------------------
+    # STEP 6: ECG coherence (read-only)
+    # ---------------------------
+    ecg_data = ai_json.get("ecg") if isinstance(ai_json, dict) else None
+    ecg_coherence = assess_ecg_coherence(cdict, ecg_data)
+
 
 
 
@@ -2135,6 +2219,8 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     augmented["_pattern_strength"] = pattern_strength
     augmented["_interpretation_boundaries"] = interpretation_boundaries
     augmented["_dominant_driver"] = dominant_driver
+    augmented["_ecg_coherence"] = ecg_coherence
+
 
 
 
