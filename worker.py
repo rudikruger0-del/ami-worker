@@ -108,6 +108,149 @@ def clean_number(val):
         return float(nums[0])
     except:
         return None
+
+def assess_data_integrity(cdict: dict) -> dict:
+    """
+    Read-only data integrity check.
+    Determines whether the available laboratory data are internally consistent
+    and physiologically interpretable.
+
+    This function:
+    - Does NOT interpret results
+    - Does NOT change severity, routes, or patterns
+    - Does NOT assume missing data
+    - Only reports confidence and limitations
+
+    Returns:
+    {
+        "status": "consistent | limited | discordant",
+        "notes": [ "...", "..." ]
+    }
+    """
+
+    notes = []
+    status = "consistent"
+
+    v = lambda k: clean_number(cdict.get(k, {}).get("value"))
+
+    # Core values (only if present)
+    Hb = v("Hb")
+    Na = v("Sodium")
+    K = v("Potassium")
+    Cr = v("Creatinine")
+    HCO3 = v("Bicarbonate")
+    AG = v("Anion Gap")
+    WBC = v("WBC")
+    Neut = v("Neutrophils")
+
+    # ----------------------------
+    # Unit / scale sanity checks
+    # ----------------------------
+    if Hb is not None and Hb > 30:
+        notes.append(
+            "Haemoglobin value appears unusually high for g/dL; unit or scale inconsistency possible."
+        )
+        status = "limited"
+
+    if K is not None and K > 10:
+        notes.append(
+            "Potassium value exceeds physiologically plausible range; unit or transcription error possible."
+        )
+        status = "discordant"
+
+    # ----------------------------
+    # Internal consistency checks
+    # ----------------------------
+    if AG is not None and HCO3 is not None:
+        if AG >= 16 and HCO3 >= 26:
+            notes.append(
+                "Elevated anion gap with normal bicarbonate is physiologically discordant."
+            )
+            status = "limited"
+
+    if WBC is not None and Neut is not None:
+        if Neut > WBC:
+            notes.append(
+                "Neutrophil count exceeds total white cell count; absolute vs percentage mismatch possible."
+            )
+            status = "limited"
+
+    # ----------------------------
+    # Missing anchor awareness
+    # ----------------------------
+    if K is not None and HCO3 is None:
+        notes.append(
+            "Potassium interpretation is limited without accompanying acid–base data."
+        )
+        status = "limited"
+
+    if Cr is not None and cdict.get("_patient_age") is None:
+        notes.append(
+            "Renal function interpretation is limited without age or baseline creatinine."
+        )
+        status = "limited"
+
+    if not notes:
+        notes.append(
+            "Available laboratory data are internally consistent and physiologically interpretable."
+        )
+
+    return {
+        "status": status,
+        "notes": notes
+    }
+
+def assess_pattern_strength(routes: list, cdict: dict) -> list:
+    """
+    Read-only pattern strength calibration.
+
+    This function:
+    - Reads EXISTING routes
+    - Does NOT modify routes
+    - Does NOT affect severity or urgency
+    - Adds descriptive confidence only
+
+    Returns a list aligned 1:1 with routes.
+    """
+
+    results = []
+
+    for r in routes:
+        pattern = (r.get("pattern") or "").lower()
+        strength = "Suggested pattern, limited by available data."
+
+        # Strong, multi-parameter or danger patterns
+        if any(x in pattern for x in [
+            "acute inflammatory",
+            "severe anaemia",
+            "critical",
+            "bone marrow",
+            "high–anion–gap",
+            "multiple concurrent"
+        ]):
+            strength = "Well-supported laboratory pattern."
+
+        # Common but context-dependent patterns
+        elif any(x in pattern for x in [
+            "anaemia",
+            "leucocytosis",
+            "renal impairment",
+            "electrolyte"
+        ]):
+            strength = "Moderately supported laboratory pattern."
+
+        # Data-poor situations
+        if not cdict or len(cdict.keys()) < 3:
+            strength = "Suggested pattern, limited by available data."
+
+        results.append({
+            "pattern": r.get("pattern"),
+            "strength": strength
+        })
+
+    return results
+
+
         
 def extract_patient_demographics(text: str) -> dict:
     """
@@ -985,6 +1128,12 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # ---------------------------
     cdict = build_cbc_value_dict(ai_json)
 
+    # ---------------------------
+    # STEP 1: Data integrity check (read-only)
+    # ---------------------------
+    data_integrity = assess_data_integrity(cdict)
+
+
     # -----------------------------------
     # Merge chemistry rows into canonical dict (SAFE)
     # -----------------------------------
@@ -1506,6 +1655,11 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # ---- Hard cap to avoid cognitive overload ----
     MAX_ROUTES = 5
     routes = routes[:MAX_ROUTES]
+    # ---------------------------
+    # STEP 2: Pattern strength calibration (read-only)
+    # ---------------------------
+    pattern_strength = assess_pattern_strength(routes, cdict)
+
 
     # =====================================================
     # PASS 3 — CLINICAL CONFIDENCE & TEMPORAL FRAMING
@@ -1760,6 +1914,8 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     augmented["_generated_at"] = iso_now()
     augmented["_overall_status"] = overall_status
     augmented["_follow_up"] = follow_up
+    augmented["_data_integrity"] = data_integrity
+
 
     return augmented
 
