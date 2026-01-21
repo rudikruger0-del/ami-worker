@@ -248,7 +248,96 @@ def assess_pattern_strength(routes: list, cdict: dict) -> list:
             "strength": strength
         })
 
-    return results
+def assess_interpretation_boundaries(cdict: dict, routes: list) -> list:
+    """
+    Read-only interpretation boundary detection.
+
+    Identifies missing contextual anchors that limit how confidently
+    current laboratory patterns can be interpreted.
+
+    Does NOT:
+    - change routes
+    - affect severity
+    - recommend actions
+    - assume normality
+
+    Returns a list of limitation statements.
+    """
+
+    limits = []
+    v = lambda k: clean_number(cdict.get(k, {}).get("value"))
+
+    # ----------------------------
+    # Baseline / trend limitations
+    # ----------------------------
+    if cdict.get("_patient_age") is None:
+        limits.append(
+            "Interpretation is limited by absence of patient age."
+        )
+
+    # No historical trend info available
+    limits.append(
+        "Interpretation is based on a single time-point; trend data are not available."
+    )
+
+    # ----------------------------
+    # Renal interpretation limits
+    # ----------------------------
+    Cr = v("Creatinine")
+    if Cr is not None:
+        limits.append(
+            "Renal interpretation is limited without a known baseline creatinine."
+        )
+
+    # ----------------------------
+    # Electrolyte context limits
+    # ----------------------------
+    K = v("Potassium")
+    HCO3 = v("Bicarbonate")
+
+    if K is not None and HCO3 is None:
+        limits.append(
+            "Electrolyte interpretation is limited without accompanying acid–base data."
+        )
+
+    # ----------------------------
+    # Differential count limits
+    # ----------------------------
+    Neut = v("Neutrophils")
+    WBC = v("WBC")
+
+    if Neut is not None and WBC is not None:
+        limits.append(
+            "Differential interpretation may be limited without explicit absolute counts."
+        )
+
+    # ----------------------------
+    # Pattern-driven missing context
+    # ----------------------------
+    for r in routes:
+        p = (r.get("pattern") or "").lower()
+
+        if "potassium" in p:
+            limits.append(
+                "Potassium abnormalities are best interpreted with ECG correlation when available."
+            )
+
+        if "acid" in p or "anion" in p:
+            limits.append(
+                "Acid–base patterns are best interpreted with arterial or venous blood gas data when available."
+            )
+
+    # ----------------------------
+    # De-duplicate while preserving order
+    # ----------------------------
+    seen = set()
+    deduped = []
+    for l in limits:
+        if l not in seen:
+            deduped.append(l)
+            seen.add(l)
+
+    return deduped
 
 
         
