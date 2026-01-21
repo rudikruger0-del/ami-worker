@@ -2451,7 +2451,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
 # ---------------------------
 def process_report(job: dict) -> dict:
     report_id = job.get("id")
-     extracted_abg = {}
+    extracted_abg = {}
     file_path = job.get("file_path")
     l_text = job.get("l_text") or ""
 
