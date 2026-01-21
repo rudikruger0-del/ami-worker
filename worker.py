@@ -530,6 +530,76 @@ def assess_ecg_coherence(cdict: dict, ecg_data: dict | None) -> dict | None:
         "ecg_coherence": notes
     }
 
+def assess_notes_coherence(notes_text: str | None, routes: list) -> dict | None:
+    """
+    Read-only clinical notes coherence assessment.
+
+    Purpose:
+    - Detect alignment or mismatch between notes and lab/ECG-derived physiology
+    - Highlight missing contextual anchors
+    - NEVER diagnose
+    - NEVER recommend treatment
+    - NEVER override other modalities
+    """
+
+    if not notes_text or not isinstance(notes_text, str):
+        return None
+
+    t = notes_text.lower()
+    notes = []
+
+    # ----------------------------
+    # Infective / inflammatory context
+    # ----------------------------
+    if any(x in t for x in ["fever", "rigors", "sepsis", "infection"]):
+        if any("infection" in (r.get("pattern") or "").lower() for r in routes):
+            notes.append(
+                "Clinical notes describe infective symptoms that align with inflammatory laboratory patterns."
+            )
+        else:
+            notes.append(
+                "Clinical notes describe infective symptoms, but laboratory markers do not show a strong inflammatory response."
+            )
+
+    # ----------------------------
+    # Cardiorespiratory symptoms
+    # ----------------------------
+    if any(x in t for x in ["chest pain", "palpitations", "syncope", "shortness of breath"]):
+        notes.append(
+            "Cardiorespiratory symptoms are described; correlation with ECG and electrolyte findings is important."
+        )
+
+    # ----------------------------
+    # Gastrointestinal losses
+    # ----------------------------
+    if any(x in t for x in ["vomiting", "diarrhoea"]):
+        notes.append(
+            "Gastrointestinal losses described in notes may contribute to electrolyte or acid–base disturbances."
+        )
+
+    # ----------------------------
+    # Volume / renal context
+    # ----------------------------
+    if any(x in t for x in ["dehydration", "poor intake", "reduced urine", "oliguria"]):
+        notes.append(
+            "Clinical notes suggest possible volume depletion, which may influence renal function and electrolyte findings."
+        )
+
+    # ----------------------------
+    # Medication / toxin awareness
+    # ----------------------------
+    if any(x in t for x in ["diuretics", "ace inhibitor", "arb", "nsaid", "lithium"]):
+        notes.append(
+            "Medication history in notes may influence renal function or electrolyte balance."
+        )
+
+    if not notes:
+        return None
+
+    return {
+        "notes_coherence": notes
+    }
+
 
 
 
@@ -1957,6 +2027,12 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # ---------------------------
     ecg_data = ai_json.get("ecg") if isinstance(ai_json, dict) else None
     ecg_coherence = assess_ecg_coherence(cdict, ecg_data)
+    # ---------------------------
+    # STEP 7: Notes coherence (read-only)
+    # ---------------------------
+    notes_text = ai_json.get("clinical_notes") or ai_json.get("notes")
+    notes_coherence = assess_notes_coherence(notes_text, routes)
+
 
 
 
@@ -2220,6 +2296,8 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     augmented["_interpretation_boundaries"] = interpretation_boundaries
     augmented["_dominant_driver"] = dominant_driver
     augmented["_ecg_coherence"] = ecg_coherence
+    augmented["_notes_coherence"] = notes_coherence
+
 
 
 
