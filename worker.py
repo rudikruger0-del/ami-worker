@@ -2105,6 +2105,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # ---------------------------
     notes_text = ai_json.get("clinical_notes") or ai_json.get("notes")
     notes_coherence = assess_notes_coherence(notes_text, routes)
+    acid_base_coherence = assess_acid_base_coherence(cdict)
     # ---------------------------
     # STEP 8: Cross-domain coherence (synthesis only)
     # ---------------------------
