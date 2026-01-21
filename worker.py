@@ -2451,6 +2451,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
 # ---------------------------
 def process_report(job: dict) -> dict:
     report_id = job.get("id")
+     extracted_abg = {}
     file_path = job.get("file_path")
     l_text = job.get("l_text") or ""
 
@@ -2496,7 +2497,7 @@ def process_report(job: dict) -> dict:
                 # ---- ABG OCR (optional, non-blocking) ----
                 abg_out = extract_abg_from_image(buf.getvalue())
                 if isinstance(abg_out, dict) and any(v is not None for v in abg_out.values()):
-                    ai_json.setdefault("abg", {}).update(abg_out)
+                    extracted_abg.update(abg_out)
         
                 extracted_rows.extend(ocr_out.get("cbc", []))
                 ocr_text_chunks.append(ocr_out.get("raw_text", ""))
@@ -2522,6 +2523,10 @@ def process_report(job: dict) -> dict:
 
         print("Calling AI interpretation...")
         ai_json = call_ai_on_report(merged_text_for_ai)
+        # ---- Merge ABG OCR results (if present) ----
+        if extracted_abg:
+            ai_json["abg"] = extracted_abg
+
         
         # --------------------
         # Patient demographics extraction (THIS IS THE KEY)
