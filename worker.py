@@ -109,6 +109,19 @@ def clean_number(val):
     except:
         return None
 
+def tag_value_source(row: dict, source: str) -> dict:
+    """
+    Annotate a lab row with its source domain.
+    Source examples: 'cbc', 'chemistry', 'abg', 'coox'
+    """
+    if not isinstance(row, dict):
+        return row
+
+    r = dict(row)
+    r["_source"] = source
+    return r
+
+
 def assess_data_integrity(cdict: dict) -> dict:
     """
     Read-only data integrity check.
@@ -996,6 +1009,7 @@ def build_cbc_value_dict(ai_json: dict) -> dict:
     rows = ai_json.get("cbc") or []
 
     for r in rows:
+        r = tag_value_source(r, "cbc")
         if not isinstance(r, dict):
             continue
 
@@ -1610,9 +1624,11 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # -----------------------------------
     # Merge chemistry rows into canonical dict (SAFE)
     # -----------------------------------
-    for r in (ai_json.get("chemistry") or []):
-        if not isinstance(r, dict):
-            continue
+   for r in (ai_json.get("chemistry") or []):
+       r = tag_value_source(r, "chemistry")
+
+      if not isinstance(r, dict):
+          continue
 
         raw = (r.get("analyte") or r.get("test") or "").lower().strip()
         if not raw:
