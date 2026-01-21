@@ -337,6 +337,53 @@ def assess_interpretation_boundaries(cdict: dict, routes: list) -> list:
             deduped.append(l)
             seen.add(l)
 
+def derive_dominant_driver(routes: list) -> dict:
+    """
+    Read-only dominant driver identification.
+
+    Purpose:
+    - Provide rapid clinical orientation only
+    - Does NOT override, suppress, or reorder routes
+    - Does NOT change severity or urgency
+
+    Returns:
+    {
+        "driver": str | None,
+        "confidence": "clear | competing | none"
+    }
+    """
+
+    if not routes:
+        return {
+            "driver": None,
+            "confidence": "none"
+        }
+
+    # Look only at EXISTING primary routes
+    primary_routes = [
+        r for r in routes
+        if r.get("priority") == "primary"
+    ]
+
+    if len(primary_routes) == 1:
+        return {
+            "driver": primary_routes[0].get("pattern"),
+            "confidence": "clear"
+        }
+
+    if len(primary_routes) > 1:
+        return {
+            "driver": primary_routes[0].get("pattern"),
+            "confidence": "competing"
+        }
+
+    # No primary routes → no dominant driver
+    return {
+        "driver": None,
+        "confidence": "none"
+    }
+
+
     return deduped
 
 
@@ -1748,6 +1795,11 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # STEP 2: Pattern strength calibration (read-only)
     # ---------------------------
     pattern_strength = assess_pattern_strength(routes, cdict)
+    # ---------------------------
+    # STEP 3: Interpretation boundaries (read-only)
+    # ---------------------------
+    interpretation_boundaries = assess_interpretation_boundaries(cdict, routes)
+
 
 
     # =====================================================
@@ -2005,6 +2057,8 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     augmented["_follow_up"] = follow_up
     augmented["_data_integrity"] = data_integrity
     augmented["_pattern_strength"] = pattern_strength
+    augmented["_interpretation_boundaries"] = interpretation_boundaries
+
 
 
 
