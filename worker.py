@@ -2490,13 +2490,16 @@ def process_report(job: dict) -> dict:
             for i, page_img in enumerate(pages, start=1):
                 buf = io.BytesIO()
                 page_img.save(buf, format="PNG")
+        
                 ocr_out = extract_cbc_from_image(buf.getvalue())
+        
                 # ---- ABG OCR (optional, non-blocking) ----
                 abg_out = extract_abg_from_image(buf.getvalue())
                 if isinstance(abg_out, dict) and any(v is not None for v in abg_out.values()):
                     ai_json.setdefault("abg", {}).update(abg_out)
-                 extracted_rows.extend(ocr_out.get("cbc", []))
-                 ocr_text_chunks.append(ocr_out.get("raw_text", ""))
+        
+                extracted_rows.extend(ocr_out.get("cbc", []))
+                ocr_text_chunks.append(ocr_out.get("raw_text", ""))
         
             if not extracted_rows:
                 raise ValueError("No CBC extracted from scanned PDF")
@@ -2516,6 +2519,7 @@ def process_report(job: dict) -> dict:
         # --------------------
         # AI interpretation
         # --------------------
+
         print("Calling AI interpretation...")
         ai_json = call_ai_on_report(merged_text_for_ai)
         
