@@ -383,6 +383,77 @@ def derive_dominant_driver(routes: list) -> dict:
         "confidence": "none"
     }
 
+def assess_acid_base_coherence(cdict: dict) -> dict | None:
+    """
+    Read-only acid–base coherence assessment.
+
+    Purpose:
+    - Identify whether electrolyte / renal findings are physiologically coherent
+    - Highlight offsets (e.g. potassium vs pH, bicarbonate vs anion gap)
+    - NEVER diagnose
+    - NEVER override severity or routes
+
+    Returns None if insufficient data.
+    """
+
+    v = lambda k: clean_number(cdict.get(k, {}).get("value"))
+
+    pH = v("pH")
+    pCO2 = v("pCO2")
+    HCO3 = v("Bicarbonate")
+    AG = v("Anion Gap")
+    K = v("Potassium")
+    Cr = v("Creatinine")
+
+    # Require at least bicarbonate or pH to proceed
+    if pH is None and HCO3 is None:
+        return None
+
+    notes = []
+
+    # ----------------------------
+    # Metabolic acidosis coherence
+    # ----------------------------
+    if HCO3 is not None and HCO3 < 22:
+        if AG is not None and AG >= 16:
+            notes.append(
+                "Low bicarbonate with elevated anion gap is physiologically coherent with a high–anion–gap metabolic acidosis."
+            )
+        else:
+            notes.append(
+                "Low bicarbonate without an elevated anion gap suggests a non–anion–gap metabolic acidosis physiology."
+            )
+
+    # ----------------------------
+    # Potassium offset awareness
+    # ----------------------------
+    if K is not None and HCO3 is not None:
+        if HCO3 < 22 and K <= 5.0:
+            notes.append(
+                "Potassium is not elevated despite metabolic acidosis, which may reflect early disease, renal compensation, or intracellular shifts."
+            )
+
+        if HCO3 >= 22 and K > 5.0:
+            notes.append(
+                "Elevated potassium without metabolic acidosis suggests a non–acidotic driver (e.g. renal or medication-related)."
+            )
+
+    # ----------------------------
+    # Renal–acid base interaction
+    # ----------------------------
+    if Cr is not None and Cr > 110 and HCO3 is not None and HCO3 < 22:
+        notes.append(
+            "Renal impairment with reduced bicarbonate suggests impaired acid clearance contributing to acid–base disturbance."
+        )
+
+    if not notes:
+        return None
+
+    return {
+        "acid_base_coherence": notes
+    }
+
+
 
     return deduped
 
@@ -1799,6 +1870,11 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # STEP 3: Interpretation boundaries (read-only)
     # ---------------------------
     interpretation_boundaries = assess_interpretation_boundaries(cdict, routes)
+    # ---------------------------
+    # STEP 4: Dominant driver (orientation only)
+    # ---------------------------
+    dominant_driver = derive_dominant_driver(routes)
+
 
 
 
@@ -2058,6 +2134,8 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     augmented["_data_integrity"] = data_integrity
     augmented["_pattern_strength"] = pattern_strength
     augmented["_interpretation_boundaries"] = interpretation_boundaries
+    augmented["_dominant_driver"] = dominant_driver
+
 
 
 
