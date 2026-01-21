@@ -881,6 +881,51 @@ def extract_cbc_from_image(image_bytes: bytes) -> dict:
         traceback.print_exc()
         return {"cbc": []}
 
+def extract_abg_from_image(image_bytes: bytes) -> dict:
+    """
+    Extract arterial blood gas values from scanned ABG reports.
+    Returns a flat dict of ABG parameters.
+    Never guesses. Silent on failure.
+    """
+    try:
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        system_prompt = (
+            "You are extracting arterial blood gas values from a scanned ABG report. "
+            "Return STRICT JSON ONLY in this format:\n"
+            "{\n"
+            '  "pH": "", "pCO2": "", "pO2": "", "HCO3": "", '
+            '"BaseExcess": "", "Lactate": "", "Sodium": "", '
+            '"Potassium": "", "Chloride": "", "Glucose": ""\n'
+            "}\n"
+            "If a value is not visible, use null. Do not infer."
+        )
+
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{b64}"}
+                        }
+                    ],
+                },
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+        )
+
+        parsed = safe_get_parsed_from_choice(resp.choices[0])
+        return parsed if isinstance(parsed, dict) else {}
+
+    except Exception:
+        return {}
+
+
 # ---------------------------
 # AI interpretation (text) -> structured ai_json
 # ---------------------------
