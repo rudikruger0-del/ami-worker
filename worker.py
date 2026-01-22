@@ -1720,6 +1720,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
 
     # Pattern-first notes
     patterns = detect_simple_clinical_patterns(cdict)
+    interpretation_boundaries = assess_interpretation_boundaries(cdict, routes)
 
     # ---------------------------
     # Routes
@@ -2495,11 +2496,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     augmented["_ecg_coherence"] = ecg_coherence
     augmented["_notes_coherence"] = notes_coherence
     augmented["_cross_domain_coherence"] = cross_domain_coherence
-
-
-
-
-
+    augmented["_interpretation_boundaries"] = interpretation_boundaries
 
 
 
