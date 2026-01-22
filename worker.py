@@ -2261,6 +2261,10 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     MAX_ROUTES = 5
     routes = routes[:MAX_ROUTES]
     # ---------------------------
+    # STEP 9.3 — Interpretation boundaries (read-only)
+    # ---------------------------
+    interpretation_boundaries = assess_interpretation_boundaries(cdict, routes)
+    # ---------------------------
     # STEP 2: Pattern strength calibration (read-only)
     # ---------------------------
     pattern_strength = assess_pattern_strength(routes, cdict)
