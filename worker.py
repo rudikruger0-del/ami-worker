@@ -497,6 +497,72 @@ def assess_abg_physiology(abg: dict | None) -> list:
         )
         return notes
 
+def assess_offsetting_contexts(cdict: dict, abg: dict | None, ecg: dict | None) -> list:
+    """
+    Detects physiological offsetting or buffering patterns.
+
+    Purpose:
+    - Highlight when an abnormal value is contextually moderated
+    - Reduce false alarm bias without suppressing findings
+
+    Does NOT:
+    - Change severity
+    - Remove routes
+    - Override alerts
+    """
+
+    notes = []
+    v = lambda k: clean_number(cdict.get(k, {}).get("value"))
+
+    # ----------------------------
+    # Potassium vs ECG buffering
+    # ----------------------------
+    K = v("Potassium")
+    if K is not None and K > 5.5:
+        if not ecg:
+            notes.append(
+                "Potassium is elevated; ECG correlation is not available to assess electrophysiological impact."
+            )
+        elif ecg.get("abnormalities") in (None, [], "normal"):
+            notes.append(
+                "Potassium is elevated, but no ECG abnormalities are noted, which may indicate limited immediate electrophysiological effect."
+            )
+
+    # ----------------------------
+    # Metabolic acidosis with compensation
+    # ----------------------------
+    HCO3 = v("Bicarbonate")
+    anion_gap = v("Anion Gap")
+    if HCO3 is not None and HCO3 < 22 and anion_gap is not None and anion_gap >= 16:
+        if abg and abg.get("_compensation") == "appropriate":
+            notes.append(
+                "Metabolic acidosis is present with appropriate respiratory compensation, which may partially buffer physiological impact."
+            )
+
+    # ----------------------------
+    # Renal impairment buffering
+    # ----------------------------
+    Cr = v("Creatinine")
+    if Cr is not None and Cr > 120:
+        if K is not None and 3.5 <= K <= 5.1 and HCO3 is not None and HCO3 >= 22:
+            notes.append(
+                "Creatinine is elevated, but potassium and bicarbonate remain stable, suggesting preserved metabolic buffering."
+            )
+
+    # ----------------------------
+    # Inflammatory marker offset
+    # ----------------------------
+    CRP = v("CRP")
+    WBC = v("WBC")
+    if CRP is not None and CRP > 30:
+        if WBC is not None and WBC < 12:
+            notes.append(
+                "CRP is elevated without accompanying leukocytosis, which may reflect a non-bacterial or evolving inflammatory process."
+            )
+
+    return notes
+
+
     # ---------------------------
     # Primary disorder
     # ---------------------------
@@ -2559,6 +2625,12 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     abg_notes = assess_abg_coherence(cdict, ai_json.get("abg"))
     ecg_notes = assess_ecg_coherence(cdict, ai_json.get("ecg"))
     abg_physiology_notes = assess_abg_physiology(ai_json.get("abg"))
+    offset_notes = assess_offsetting_contexts(
+    cdict,
+    ai_json.get("abg"),
+    ai_json.get("ecg"),
+)
+
     # ---------------------------
     # STEP 10.4 — Contextual interpretation notes (read-only)
     # ---------------------------
@@ -2569,7 +2641,9 @@ def build_full_clinical_report(ai_json: dict) -> dict:
         abg_notes,
         ecg_notes,
         abg_physiology_notes,
+        offset_notes,
     ):
+
         if isinstance(group, list):
             for note in group:
                 if isinstance(note, str):
