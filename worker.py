@@ -352,6 +352,30 @@ def assess_interpretation_boundaries(cdict: dict, routes: list) -> list:
             
     return deduped
 
+def assess_severity_stability(cdict: dict, routes: list, severity: dict) -> dict:
+    v = lambda k: clean_number(cdict.get(k, {}).get("value"))
+
+    active_domains = 0
+
+    # CBC domain
+    if any(v(k) is not None for k in ("Hb", "WBC", "Platelets")):
+        active_domains += 1
+
+    # Chemistry domain
+    if any(v(k) is not None for k in ("Creatinine", "CRP", "Sodium", "Potassium")):
+        active_domains += 1
+
+    # ABG domain
+    if any(v(k) is not None for k in ("pH", "Bicarbonate", "Anion Gap")):
+        active_domains += 1
+
+    if severity.get("severity") == "high" and active_domains == 1:
+        severity["severity"] = "moderate"
+        severity["note"] = "Severity capped due to single-domain abnormality."
+
+    return severity
+
+
 
 def derive_dominant_driver(routes: list) -> dict:
     """
