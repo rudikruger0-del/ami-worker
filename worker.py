@@ -375,6 +375,59 @@ def assess_severity_stability(cdict: dict, routes: list, severity: dict) -> dict
 
     return severity
 
+def assess_abg_coherence(cdict: dict, abg: dict | None) -> list:
+    """
+    Read-only ABG coherence assessment.
+
+    Purpose:
+    - Reinforce or limit interpretation of chemistry-derived acid–base patterns
+    - Never generate routes
+    - Never alter severity
+    """
+
+    notes = []
+
+    if not abg or not isinstance(abg, dict):
+        return notes
+
+    def v(key):
+        return clean_number(abg.get(key))
+
+    pH = v("pH")
+    pCO2 = v("pCO2")
+    HCO3_abg = v("HCO3")
+
+    HCO3_chem = clean_number(cdict.get("Bicarbonate", {}).get("value"))
+    AG = clean_number(cdict.get("Anion Gap", {}).get("value"))
+
+    # --- Acidaemia coherence ---
+    if pH is not None and HCO3_chem is not None:
+        if pH < 7.35 and HCO3_chem < 22:
+            notes.append(
+                "ABG acidaemia is physiologically consistent with reduced serum bicarbonate."
+            )
+
+    # --- High anion gap reinforcement ---
+    if pH is not None and AG is not None:
+        if pH < 7.35 and AG > 16:
+            notes.append(
+                "ABG acidaemia aligns with a high–anion-gap metabolic acidosis pattern."
+            )
+
+    # --- Limiting statements ---
+    if pH is not None and pH >= 7.35 and HCO3_chem is not None and HCO3_chem < 22:
+        notes.append(
+            "Normal pH limits confidence in the severity of metabolic acidosis without compensation assessment."
+        )
+
+    if pH is None:
+        notes.append(
+            "Acid–base interpretation is limited in the absence of arterial or venous blood gas pH."
+        )
+
+    return notes
+
+
 def build_explainability_floor(
     cdict: dict,
     routes: list,
@@ -2377,6 +2430,11 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     sev["severity"] = final_severity
 
     sev = assess_severity_stability(cdict, routes, sev)
+    # ---------------------------
+    # ABG coherence (read-only)
+    # ---------------------------
+    abg_notes = assess_abg_coherence(cdict, ai_json.get("abg"))
+
     # ---------------------------
     # Interpretation boundaries (read-only)
     # ---------------------------
