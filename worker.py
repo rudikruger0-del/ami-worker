@@ -1638,7 +1638,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
    for r in (ai_json.get("chemistry") or []):
        r = tag_value_source(r, "chemistry")
 
-      if not isinstance(r, dict):
+       if not isinstance(r, dict):
           continue
 
         raw = (r.get("analyte") or r.get("test") or "").lower().strip()
