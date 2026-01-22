@@ -2487,6 +2487,9 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # Interpretation boundaries (read-only)
     # ---------------------------
     interpretation_boundaries = assess_interpretation_boundaries(cdict, routes)
+    abg_notes = assess_abg_coherence(cdict, ai_json.get("abg"))
+    ecg_notes = assess_ecg_coherence(cdict, ai_json.get("ecg"))
+
     
     # ---------------------------
     # Explainability floor (non-decisional)
