@@ -1605,6 +1605,41 @@ def is_authoritative_electrolyte(cdict: dict, analyte: str) -> bool:
     source = entry.get("_source")
     return source in ("chemistry", "serum")
 
+def assess_interpretation_boundaries(cdict: dict, routes: list) -> list:
+    boundaries = []
+    v = lambda k: clean_number(cdict.get(k, {}).get("value"))
+
+    K = v("Potassium")
+    pH = v("pH")
+    HCO3 = v("Bicarbonate")
+    AG = v("Anion Gap")
+    CRP = v("CRP")
+    WBC = v("WBC")
+    Hb = v("Hb")
+
+    if K is not None and pH is not None and pH < 7.30:
+        boundaries.append(
+            "Potassium interpretation is constrained by acidemia; transcellular shifts may elevate measured potassium."
+        )
+
+    if HCO3 is not None and AG is not None and AG >= 16 and HCO3 <= 20:
+        boundaries.append(
+            "Low bicarbonate with elevated anion gap reflects metabolic acidosis physiology; electrolyte interpretation should be contextualised."
+        )
+
+    if WBC is not None and CRP is not None and WBC >= 12 and CRP < 5:
+        boundaries.append(
+            "Leukocytosis with low CRP may reflect stress physiology rather than active infection."
+        )
+
+    if Hb is not None and pH is not None and pH < 7.30:
+        boundaries.append(
+            "Haemoglobin interpretation during acute acid–base disturbance may not reflect baseline status."
+        )
+
+    return boundaries
+
+
 
 
 # ---------------------------
