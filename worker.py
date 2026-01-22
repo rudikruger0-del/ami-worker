@@ -2377,7 +2377,20 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     sev["severity"] = final_severity
 
     sev = assess_severity_stability(cdict, routes, sev)
-
+    # ---------------------------
+    # Interpretation boundaries (read-only)
+    # ---------------------------
+    interpretation_boundaries = assess_interpretation_boundaries(cdict, routes)
+    
+    # ---------------------------
+    # Explainability floor (non-decisional)
+    # ---------------------------
+    explainability = build_explainability_floor(
+        cdict,
+        routes,
+        sev,
+        interpretation_boundaries
+    )
     
     # ---------------------------
     # CHEMISTRY SEVERITY DOMINANCE (DO NOT DOWNGRADE)
