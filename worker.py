@@ -349,6 +349,9 @@ def assess_interpretation_boundaries(cdict: dict, routes: list) -> list:
         if l not in seen:
             deduped.append(l)
             seen.add(l)
+            
+    return deduped
+
 
 def derive_dominant_driver(routes: list) -> dict:
     """
