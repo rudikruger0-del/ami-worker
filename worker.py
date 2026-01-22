@@ -466,9 +466,78 @@ def assess_ecg_coherence(cdict: dict, ecg: dict | None) -> list:
             notes.append(
                 "ECG abnormalities present in the setting of severe sodium disturbance, increasing overall clinical risk."
             )
+            
+def assess_abg_physiology(abg: dict | None) -> list:
+    """
+    Read-only ABG physiology assessment.
+
+    Evaluates:
+    - Primary acid–base disturbance
+    - Expected respiratory compensation (Winter’s formula)
+    - Possible mixed disorders
+
+    Does NOT:
+    - Diagnose causes
+    - Recommend treatment
+    - Alter severity or routes
+    """
+
+    notes = []
+
+    if not abg or not isinstance(abg, dict):
+        return notes
+
+    pH = clean_number(abg.get("pH"))
+    HCO3 = clean_number(abg.get("HCO3"))
+    pCO2 = clean_number(abg.get("pCO2"))
+
+    if pH is None or HCO3 is None:
+        notes.append(
+            "ABG interpretation is limited by missing pH or bicarbonate values."
+        )
+        return notes
+
+    # ---------------------------
+    # Primary disorder
+    # ---------------------------
+    if pH < 7.35 and HCO3 < 22:
+        notes.append(
+            "Primary metabolic acidosis physiology is present."
+        )
+
+        if pCO2 is not None:
+            expected_pCO2_low = (1.5 * HCO3) + 6
+            expected_pCO2_high = (1.5 * HCO3) + 10
+
+            if pCO2 < expected_pCO2_low:
+                notes.append(
+                    "pCO₂ is lower than expected for compensation, suggesting a concurrent respiratory alkalosis."
+                )
+            elif pCO2 > expected_pCO2_high:
+                notes.append(
+                    "pCO₂ is higher than expected for compensation, suggesting a concurrent respiratory acidosis."
+                )
+            else:
+                notes.append(
+                    "Respiratory compensation appears appropriate for metabolic acidosis."
+                )
+
+    elif pH > 7.45 and HCO3 > 26:
+        notes.append(
+            "Primary metabolic alkalosis physiology is present."
+        )
+
+        if pCO2 is not None:
+            notes.append(
+                "Respiratory compensation may be present; correlation with clinical context is required."
+            )
+
+    else:
+        notes.append(
+            "No dominant metabolic acid–base disturbance detected on ABG."
+        )
 
     return notes
-
 
 
 def build_explainability_floor(
@@ -2489,12 +2558,18 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     interpretation_boundaries = assess_interpretation_boundaries(cdict, routes)
     abg_notes = assess_abg_coherence(cdict, ai_json.get("abg"))
     ecg_notes = assess_ecg_coherence(cdict, ai_json.get("ecg"))
+    abg_physiology_notes = assess_abg_physiology(ai_json.get("abg"))
     # ---------------------------
     # STEP 10.4 — Contextual interpretation notes (read-only)
     # ---------------------------
     context_notes = []
     
-    for group in (interpretation_boundaries, abg_notes, ecg_notes):
+    for group in (
+        interpretation_boundaries,
+        abg_notes,
+        ecg_notes,
+        abg_physiology_notes,
+    ):
         if isinstance(group, list):
             for note in group:
                 if isinstance(note, str):
