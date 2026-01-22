@@ -1777,14 +1777,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
 
     # Pattern-first notes
     patterns = detect_simple_clinical_patterns(cdict)
-    explainability = build_explainability_floor(
-    cdict,
-    routes,
-    sev,
-    interpretation_boundaries
-)
-
-
+    
     # ---------------------------
     # Routes
     # ---------------------------
