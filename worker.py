@@ -2339,6 +2339,12 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     final_severity = route_sev
     if severity_rank.get(numeric_sev["severity"], 0) > severity_rank.get(route_sev, 0):
         final_severity = numeric_sev["severity"]
+
+    sev = dict(numeric_sev)
+    sev["severity"] = final_severity
+
+    sev = assess_severity_stability(cdict, routes, sev)
+
     
     # ---------------------------
     # CHEMISTRY SEVERITY DOMINANCE (DO NOT DOWNGRADE)
