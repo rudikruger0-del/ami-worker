@@ -1635,11 +1635,11 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # -----------------------------------
     # Merge chemistry rows into canonical dict (SAFE)
     # -----------------------------------
-   for r in (ai_json.get("chemistry") or []):
-       r = tag_value_source(r, "chemistry")
+    for r in (ai_json.get("chemistry") or []):
+        r = tag_value_source(r, "chemistry")
 
-       if not isinstance(r, dict):
-          continue
+        if not isinstance(r, dict):
+            continue
 
         raw = (r.get("analyte") or r.get("test") or "").lower().strip()
         if not raw:
@@ -1673,6 +1673,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
             put("CRP")
         elif "creatinine" in raw:
             put("Creatinine")
+
 
     # ---------------------------
     # Patient context
