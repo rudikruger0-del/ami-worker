@@ -2489,6 +2489,24 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     interpretation_boundaries = assess_interpretation_boundaries(cdict, routes)
     abg_notes = assess_abg_coherence(cdict, ai_json.get("abg"))
     ecg_notes = assess_ecg_coherence(cdict, ai_json.get("ecg"))
+    # ---------------------------
+    # STEP 10.4 — Contextual interpretation notes (read-only)
+    # ---------------------------
+    context_notes = []
+    
+    for group in (interpretation_boundaries, abg_notes, ecg_notes):
+        if isinstance(group, list):
+            for note in group:
+                if isinstance(note, str):
+                    context_notes.append(note)
+    
+    # De-duplicate while preserving order
+    seen = set()
+    context_notes = [
+        n for n in context_notes
+        if not (n in seen or seen.add(n))
+    ]
+
 
     
     # ---------------------------
@@ -2686,8 +2704,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     augmented["_cross_domain_coherence"] = cross_domain_coherence
     augmented["_interpretation_boundaries"] = interpretation_boundaries
     augmented["_explainability"] = explainability
-
-
+    augmented["_interpretation_context"] = context_notes
 
 
     return augmented
