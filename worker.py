@@ -427,6 +427,49 @@ def assess_abg_coherence(cdict: dict, abg: dict | None) -> list:
 
     return notes
 
+def assess_ecg_coherence(cdict: dict, ecg: dict | None) -> list:
+    """
+    Read-only ECG coherence assessment.
+
+    Purpose:
+    - Correlate ECG flags with electrolyte-related risk
+    - Never generate routes
+    - Never alter severity
+    """
+
+    notes = []
+
+    if not ecg or not isinstance(ecg, dict):
+        return notes
+
+    flags = ecg.get("flags") or []
+    if not isinstance(flags, list):
+        return notes
+
+    K = clean_number(cdict.get("Potassium", {}).get("value"))
+    Na = clean_number(cdict.get("Sodium", {}).get("value"))
+
+    # --- Potassium risk coherence ---
+    if K is not None and (K < 3.3 or K > 5.5):
+        if flags:
+            notes.append(
+                "ECG flags present alongside potassium abnormality, supporting increased arrhythmic risk."
+            )
+        else:
+            notes.append(
+                "Potassium abnormality without ECG abnormalities limits arrhythmia risk assessment."
+            )
+
+    # --- Sodium-related neurological risk ---
+    if Na is not None and (Na < 125 or Na > 155):
+        if flags:
+            notes.append(
+                "ECG abnormalities present in the setting of severe sodium disturbance, increasing overall clinical risk."
+            )
+
+    return notes
+
+
 
 def build_explainability_floor(
     cdict: dict,
@@ -2434,6 +2477,11 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # ABG coherence (read-only)
     # ---------------------------
     abg_notes = assess_abg_coherence(cdict, ai_json.get("abg"))
+    # ---------------------------
+    # ECG coherence (read-only)
+    # ---------------------------
+    ecg_notes = assess_ecg_coherence(cdict, ai_json.get("ecg"))
+
 
     # ---------------------------
     # Interpretation boundaries (read-only)
