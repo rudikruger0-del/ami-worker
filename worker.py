@@ -1591,6 +1591,8 @@ def build_follow_up_block(cdict: dict, routes: list, severity: str) -> list:
     follow_up.append(
         "Correlation with symptoms, vital signs, and previous laboratory results is important."
     )
+    return follow_up
+    
 def is_authoritative_electrolyte(cdict: dict, analyte: str) -> bool:
     """
     Only serum / chemistry electrolytes may independently drive severity.
