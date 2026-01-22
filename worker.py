@@ -1591,6 +1591,18 @@ def build_follow_up_block(cdict: dict, routes: list, severity: str) -> list:
     follow_up.append(
         "Correlation with symptoms, vital signs, and previous laboratory results is important."
     )
+def is_authoritative_electrolyte(cdict: dict, analyte: str) -> bool:
+    """
+    Only serum / chemistry electrolytes may independently drive severity.
+    ABG or co-oximetry values may inform context but not dominate.
+    """
+    entry = cdict.get(analyte)
+    if not isinstance(entry, dict):
+        return False
+
+    source = entry.get("_source")
+    return source in ("chemistry", "serum")
+
 
     return follow_up
 
@@ -1838,7 +1850,11 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # =====================================================
 
     if K is not None:
-        if K < 3.0 or K > 6.0:
+        if (
+            (K < 3.0 or K > 6.0)
+            and is_authoritative_electrolyte(cdict, "Potassium")
+        ):
+
             add_route(
                 routes,
                 priority="primary",
