@@ -2854,6 +2854,8 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     augmented["_interpretation_boundaries"] = interpretation_boundaries
     augmented["_explainability"] = explainability
     augmented["_interpretation_context"] = context_notes
+    augmented["context_notes"] = context_notes
+
 
 
     return augmented
