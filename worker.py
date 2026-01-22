@@ -1604,9 +1604,6 @@ def is_authoritative_electrolyte(cdict: dict, analyte: str) -> bool:
     return source in ("chemistry", "serum")
 
 
-    return follow_up
-
-
 
 # ---------------------------
 # Route engine aggregator: Patterns -> Route -> Next Steps
