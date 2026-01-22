@@ -375,6 +375,36 @@ def assess_severity_stability(cdict: dict, routes: list, severity: dict) -> dict
 
     return severity
 
+def build_explainability_floor(
+    cdict: dict,
+    routes: list,
+    severity: dict,
+    interpretation_boundaries: list
+) -> list:
+    explanations = []
+
+    # Severity rationale
+    explanations.append(
+        f"Overall severity assessed as '{severity.get('severity')}' based on combined laboratory signals and route dominance."
+    )
+
+    # Route rationale
+    if routes:
+        explanations.append(
+            "Clinical routes were generated from detected laboratory patterns without diagnostic assumptions."
+        )
+    else:
+        explanations.append(
+            "No dominant clinical routes identified based on available data."
+        )
+
+    # Boundary rationale
+    for b in interpretation_boundaries:
+        explanations.append(b)
+
+    return explanations
+
+
 
 
 def derive_dominant_driver(routes: list) -> dict:
