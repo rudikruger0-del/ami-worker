@@ -3076,10 +3076,8 @@ def process_report(job: dict) -> dict:
                 ai_json["cbc"] = extracted_rows
                 ai_json["_cbc_status"] = "forced_from_ocr"
             else:
-                if not has_supported_domain(ai_json):
-                    raise ValueError(
-                        "No supported data domains detected (CBC, chemistry, ABG, or ECG)"
-                    )
+                pass
+
 
 
 
