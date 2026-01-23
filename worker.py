@@ -1530,6 +1530,45 @@ def evaluate_severity_and_urgency(cdict: dict) -> dict:
         "key_issues": key_issues
     }
 
+def elevate_severity(
+    current: str | None,
+    minimum: str,
+) -> str:
+    """
+    Elevate severity to at least `minimum`, never downgrade.
+
+    Severity scale (ascending):
+        normal → mild → moderate → severe → critical
+
+    If current is None or invalid, minimum is returned.
+    """
+
+    SEVERITY_ORDER = [
+        "normal",
+        "mild",
+        "moderate",
+        "severe",
+        "critical",
+    ]
+
+    if not current:
+        return minimum
+
+    current = current.lower()
+    minimum = minimum.lower()
+
+    if current not in SEVERITY_ORDER:
+        return minimum
+
+    if minimum not in SEVERITY_ORDER:
+        return current
+
+    if SEVERITY_ORDER.index(current) < SEVERITY_ORDER.index(minimum):
+        return minimum
+
+    return current
+
+
 # ---------------------------
 # Differential diagnosis trees (safe)
 # ---------------------------
