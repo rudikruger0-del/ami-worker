@@ -2773,28 +2773,6 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # Severity / differentials / trends
     # ---------------------------
     # ---------------------------
-    # Severity resolution (ROUTE-DOMINANT)
-    # ---------------------------
-    numeric_sev = evaluate_severity_and_urgency(cdict)
-    route_sev = severity_from_routes(routes)
-    
-    # Escalation order (never downgrade)
-    severity_rank = {
-        "low": 0,
-        "moderate": 1,
-        "high": 2,
-        "critical": 3
-    }
-    
-    final_severity = route_sev
-    if severity_rank.get(numeric_sev["severity"], 0) > severity_rank.get(route_sev, 0):
-        final_severity = numeric_sev["severity"]
-
-    sev = dict(numeric_sev)
-    sev["severity"] = final_severity
-
-    sev = assess_severity_stability(cdict, routes, sev)
-    # ---------------------------
     # ABG coherence (read-only)
     # ---------------------------
     abg_notes = assess_abg_coherence(cdict, ai_json.get("abg"))
@@ -2951,6 +2929,29 @@ def build_full_clinical_report(ai_json: dict) -> dict:
         pass
 
     trends = trend_comparison(patient_name, cdict)
+
+    # ---------------------------
+    # Severity resolution (ROUTE-DOMINANT)
+    # ---------------------------
+    numeric_sev = evaluate_severity_and_urgency(cdict)
+    route_sev = severity_from_routes(routes)
+    
+    # Escalation order (never downgrade)
+    severity_rank = {
+        "low": 0,
+        "moderate": 1,
+        "high": 2,
+        "critical": 3
+    }
+    
+    final_severity = route_sev
+    if severity_rank.get(numeric_sev["severity"], 0) > severity_rank.get(route_sev, 0):
+        final_severity = numeric_sev["severity"]
+
+    sev = dict(numeric_sev)
+    sev["severity"] = final_severity
+
+    sev = assess_severity_stability(cdict, routes, sev)
     # ---------------------------
     # Clean follow-up block (summary-level, non-invasive)
     # ---------------------------
