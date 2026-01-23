@@ -2146,6 +2146,29 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     Na = v("Sodium")
     K = v("Potassium")
     # =====================================================
+    # ABG DOMINANCE FLAG (PHYSIOLOGY ONLY)
+    # =====================================================
+    abg = ai_json.get("abg") or {}
+    
+    pH_abg = clean_number(abg.get("pH"))
+    pCO2_abg = clean_number(abg.get("pCO2"))
+    lactate_abg = clean_number(abg.get("Lactate"))
+    
+    abg_dominant = False
+    
+    # Primary ventilatory failure physiology
+    if (
+        pH_abg is not None and pCO2_abg is not None
+        and pH_abg < 7.30
+        and pCO2_abg > 45
+    ):
+        abg_dominant = True
+    
+    # Additional metabolic stress signal
+    if lactate_abg is not None and lactate_abg >= 3.0:
+        abg_dominant = True
+
+    # =====================================================
     # ABG PRIMARY PHYSIOLOGY ROUTE (VENTILATORY RISK)
     # =====================================================
     abg = ai_json.get("abg") or {}
@@ -2867,25 +2890,6 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # ---------------------------
     # ABG SEVERITY DOMINANCE (DO NOT DOWNGRADE)
     # ---------------------------
-    abg = ai_json.get("abg") or {}
-    
-    pH_abg = clean_number(abg.get("pH"))
-    pCO2_abg = clean_number(abg.get("pCO2"))
-    lactate_abg = clean_number(abg.get("Lactate"))
-    
-    abg_dominant = False
-    
-    # Primary respiratory acidosis physiology
-    if (
-        pH_abg is not None and pCO2_abg is not None
-        and pH_abg < 7.30
-        and pCO2_abg > 45
-    ):
-        abg_dominant = True
-    
-    # Metabolic stress signal
-    if lactate_abg is not None and lactate_abg >= 3.0:
-        abg_dominant = True
     
     # Enforce minimum MODERATE severity
     if abg_dominant:
