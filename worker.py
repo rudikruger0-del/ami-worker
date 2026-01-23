@@ -2146,6 +2146,51 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     Na = v("Sodium")
     K = v("Potassium")
     # =====================================================
+    # ABG PRIMARY PHYSIOLOGY ROUTE (VENTILATORY RISK)
+    # =====================================================
+    abg = ai_json.get("abg") or {}
+    
+    pH_abg = clean_number(abg.get("pH"))
+    pCO2_abg = clean_number(abg.get("pCO2"))
+    lactate_abg = clean_number(abg.get("Lactate"))
+    
+    # ---- Primary respiratory acidosis physiology ----
+    if (
+        pH_abg is not None and pCO2_abg is not None
+        and pH_abg < 7.30
+        and pCO2_abg > 45
+    ):
+        add_route(
+            routes,
+            priority="primary",
+            pattern="Respiratory acidosis physiology",
+            route=(
+                "Low pH with elevated pCO₂ indicates ventilatory failure physiology "
+                "with risk of clinical deterioration"
+            ),
+            next_steps=[
+                "Prompt clinical assessment of ventilation and respiratory status",
+                "Correlate with respiratory rate, oxygenation, and mental status",
+                "Repeat blood gas if clinically indicated"
+            ]
+        )
+    
+    # ---- Lactate escalation (metabolic stress signal) ----
+    if lactate_abg is not None and lactate_abg >= 3.0:
+        add_route(
+            routes,
+            priority="secondary",
+            pattern="Elevated lactate (metabolic stress)",
+            route=(
+                "Raised lactate indicates systemic metabolic stress and increases overall clinical risk"
+            ),
+            next_steps=[
+                "Assess for hypoxia, hypoperfusion, or increased work of breathing",
+                "Repeat lactate to assess trend if clinically indicated"
+            ]
+        )
+
+    # =====================================================
     # PASS 1 — PRIMARY LIFE-THREATENING CBC ROUTES
     # =====================================================
     
