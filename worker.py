@@ -2952,6 +2952,19 @@ def build_full_clinical_report(ai_json: dict) -> dict:
 
     return augmented
 
+def has_supported_domain(ai_json: dict) -> bool:
+    """
+    At least ONE supported data domain must be present.
+    CBC is NOT mandatory.
+    """
+    return any([
+        bool(ai_json.get("cbc")),
+        bool(ai_json.get("chemistry")),
+        bool(ai_json.get("abg")),
+        bool(ai_json.get("ecg")),
+    ])
+
+
 
 
 # ---------------------------
@@ -3063,7 +3076,11 @@ def process_report(job: dict) -> dict:
                 ai_json["cbc"] = extracted_rows
                 ai_json["_cbc_status"] = "forced_from_ocr"
             else:
-                raise ValueError("CBC missing after AI interpretation — cannot proceed safely")
+                else:
+                    if not has_supported_domain(ai_json):
+                        raise ValueError(
+                            "No supported data domains detected (CBC, chemistry, ABG, or ECG)"
+                        )
 
 
         # ---- CBC sanity check (doctor-grade) ----
