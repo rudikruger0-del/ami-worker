@@ -2848,6 +2848,26 @@ def build_full_clinical_report(ai_json: dict) -> dict:
             final_severity = "moderate"
 
     # ---------------------------
+    # ABG DOMINANT PRIMARY ROUTE
+    # ---------------------------
+    if abg_dominant:
+        add_route(
+            routes,
+            priority="primary",
+            pattern="Respiratory acidosis physiology with metabolic stress",
+            route=(
+                "Low pH with elevated pCO₂ indicates impaired ventilation, "
+                "with elevated lactate suggesting additional metabolic stress."
+            ),
+            next_steps=[
+                "Prompt clinical assessment with focus on ventilation and respiratory status",
+                "Correlate with respiratory rate, oxygenation, and mental status",
+                "Repeat ABG if clinical condition changes"
+            ]
+        )
+
+
+    # ---------------------------
     # ABG DOMINANT PRIMARY ROUTE (PHYSIOLOGY ONLY)
     # ---------------------------
     if abg_dominant:
