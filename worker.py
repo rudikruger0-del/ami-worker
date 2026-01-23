@@ -1927,6 +1927,85 @@ def assess_interpretation_boundaries(cdict: dict, routes: list) -> list:
 
     return boundaries
 
+def build_primary_physiology_summary(
+    routes: list,
+    severity: str,
+    dominant_driver: dict,
+    chemistry_dominant: bool,
+    acid_base_coherence: dict | None,
+    ecg_coherence: dict | None,
+    offset_notes: list
+) -> str | None:
+    """
+    Primary Physiology Orchestrator (read-only).
+
+    Purpose:
+    - Compress the full report into 1–3 sentences
+    - Highlight dominant physiology
+    - Reflect buffering or reinforcement
+    - Never diagnose
+    - Never mention absent domains
+    """
+
+    if not routes:
+        return None
+
+    sentences = []
+
+    # -------------------------------------------------
+    # Sentence 1 — Dominant physiology
+    # -------------------------------------------------
+    primary_route = routes[0]
+    pattern = primary_route.get("pattern", "").lower()
+
+    if chemistry_dominant:
+        sentence = (
+            "Dominant physiology is high–anion–gap metabolic acidosis "
+            "with associated electrolyte or renal stress"
+        )
+    elif "electrical" in pattern or "potassium" in pattern:
+        sentence = (
+            "Dominant physiology relates to increased electrical instability"
+        )
+    elif dominant_driver and dominant_driver.get("driver"):
+        sentence = (
+            f"Dominant physiology is driven by {dominant_driver['driver'].lower()}"
+        )
+    else:
+        sentence = "Dominant physiological pattern is present"
+
+    # Buffering language (ONLY if already detected)
+    if offset_notes:
+        if any("buffer" in n.lower() or "compens" in n.lower() for n in offset_notes):
+            sentence += ", partially buffered at this stage"
+
+    sentence += "."
+    sentences.append(sentence)
+
+    # -------------------------------------------------
+    # Sentence 2 — Cross-domain reinforcement (optional)
+    # -------------------------------------------------
+    if ecg_coherence:
+        sentences.append(
+            "ECG findings reinforce the clinical significance of this physiology."
+        )
+    elif acid_base_coherence:
+        sentences.append(
+            "Acid–base findings provide important physiological context."
+        )
+
+    # -------------------------------------------------
+    # Sentence 3 — Low-severity compression fallback
+    # -------------------------------------------------
+    if severity in ("low", "moderate") and not chemistry_dominant:
+        if len(routes) == 1:
+            sentences = [
+                "Findings suggest mild laboratory abnormalities without a single dominant acute pathology."
+            ]
+
+    return " ".join(sentences[:3])
+
+
 
 
 
@@ -2855,16 +2934,23 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     augmented["_explainability"] = explainability
     augmented["_interpretation_context"] = context_notes
     augmented["context_notes"] = context_notes
-
+    # ---------------------------
+    # PRIMARY PHYSIOLOGY SUMMARY (TOP-LEVEL ORCHESTRATION)
+    # ---------------------------
+    primary_physiology_summary = build_primary_physiology_summary(
+        routes=routes,
+        severity=sev.get("severity"),
+        dominant_driver=dominant_driver,
+        chemistry_dominant=chemistry_dominant,
+        acid_base_coherence=acid_base_coherence,
+        ecg_coherence=ecg_coherence,
+        offset_notes=offset_notes,
+    )
+    
+    augmented["primary_physiology_summary"] = primary_physiology_summary
 
 
     return augmented
-
-
-
-
-
-
 
 
 
