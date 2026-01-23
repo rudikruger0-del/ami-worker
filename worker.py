@@ -2820,6 +2820,35 @@ def build_full_clinical_report(ai_json: dict) -> dict:
             final_severity = "moderate"
 
     # ---------------------------
+    # ABG SEVERITY DOMINANCE (DO NOT DOWNGRADE)
+    # ---------------------------
+    abg = ai_json.get("abg") or {}
+    
+    pH_abg = clean_number(abg.get("pH"))
+    pCO2_abg = clean_number(abg.get("pCO2"))
+    lactate_abg = clean_number(abg.get("Lactate"))
+    
+    abg_dominant = False
+    
+    # Primary respiratory acidosis physiology
+    if (
+        pH_abg is not None and pCO2_abg is not None
+        and pH_abg < 7.30
+        and pCO2_abg > 45
+    ):
+        abg_dominant = True
+    
+    # Metabolic stress signal
+    if lactate_abg is not None and lactate_abg >= 3.0:
+        abg_dominant = True
+    
+    # Enforce minimum MODERATE severity
+    if abg_dominant:
+        if severity_rank.get(final_severity, 0) < severity_rank["moderate"]:
+            final_severity = "moderate"
+
+
+    # ---------------------------
     # CHEMISTRY DOMINANT PRIMARY ROUTE
     # ---------------------------
     if chemistry_dominant:
