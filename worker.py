@@ -2939,9 +2939,13 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     trends = trend_comparison(patient_name, cdict)
 
     # ---------------------------
-    # Severity resolution (ROUTE-DOMINANT)
+    # Severity resolution (ROUTE-DOMINANT, SAFE)
     # ---------------------------
+    
+    # Always evaluate numeric severity FIRST (labs-only, modality-agnostic)
     numeric_sev = evaluate_severity_and_urgency(cdict)
+    
+    # Then derive severity from dominant physiology routes
     route_sev = severity_from_routes(routes)
     
     # Escalation order (never downgrade)
@@ -2952,14 +2956,24 @@ def build_full_clinical_report(ai_json: dict) -> dict:
         "critical": 3
     }
     
+    # Start with route-based severity
     final_severity = route_sev
-    if severity_rank.get(numeric_sev["severity"], 0) > severity_rank.get(route_sev, 0):
-        final_severity = numeric_sev["severity"]
-
+    
+    # Escalate if numeric severity is higher
+    if severity_rank.get(numeric_sev.get("severity"), 0) > severity_rank.get(route_sev, 0):
+        final_severity = numeric_sev.get("severity")
+    
+    # Build final severity object ONCE
     sev = dict(numeric_sev)
     sev["severity"] = final_severity
-
-    sev = assess_severity_stability(cdict, routes, sev)
+    
+    # Stability & buffering logic (never downgrade, may escalate)
+    sev = assess_severity_stability(
+        cdict=cdict,
+        routes=routes,
+        sev=sev
+    )
+    
     # ---------------------------
     # Clean follow-up block (summary-level, non-invasive)
     # ---------------------------
@@ -2968,6 +2982,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
         routes=routes,
         severity=sev.get("severity")
     )
+
 
 
     # ---------------------------
