@@ -2924,10 +2924,6 @@ def build_full_clinical_report(ai_json: dict) -> dict:
             ]
         )
 
-
-    sev = dict(numeric_sev)
-    sev["severity"] = final_severity
-
     diffs = generate_differential_trees(cdict)
 
     patient_name = None
