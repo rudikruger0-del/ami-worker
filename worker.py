@@ -2074,6 +2074,13 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # Canonical dict
     # ---------------------------
     cdict = build_cbc_value_dict(ai_json)
+    has_cbc = bool(ai_json.get("cbc"))
+    has_chem = bool(ai_json.get("chemistry"))
+    has_abg = bool(ai_json.get("abg"))
+    has_ecg = bool(ai_json.get("ecg"))
+    
+    supported_domains = sum([has_cbc, has_chem, has_abg, has_ecg])
+
 
     # ---------------------------
     # STEP 1: Data integrity check (read-only)
@@ -2929,42 +2936,24 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     if severity_rank.get(numeric_sev["severity"], 0) > severity_rank.get(route_sev, 0):
         final_severity = numeric_sev["severity"]
 
-    # -------------------------------------------------
-    # HARD SAFETY RULE: ABG-ONLY CAN NEVER BE LOW
-    # -------------------------------------------------
-    has_cbc = bool(ai_json.get("cbc"))
-    has_chem = bool(ai_json.get("chemistry"))
-    has_abg = bool(ai_json.get("abg"))
-    has_ecg = bool(ai_json.get("ecg"))
     
-    supported_domains = sum([has_cbc, has_chem, has_abg, has_ecg])
-    
-    # LOW requires reassuring multi-domain data
-    if supported_domains == 1 and has_abg:
-        if final_severity == "low":
-            final_severity = "moderate"
 
 
     # -------------------------------------------------
     # SAFETY GUARD: LOW must be justified by data
     # -------------------------------------------------
-    supported_domains = sum([
-        1 if ai_json.get("cbc") else 0,
-        1 if ai_json.get("chemistry") else 0,
-        1 if ai_json.get("abg") else 0,
-        1 if ai_json.get("ecg") else 0,
-    ])
-    
-    # ABG-only data can NEVER justify LOW reassurance
-    if supported_domains == 1 and ai_json.get("abg"):
-        if final_severity == "low":
-            final_severity = "moderate"
-            abg_severity_locked = True
     
         
     # 5️⃣ Build final severity object
     sev = dict(numeric_sev)
     sev["severity"] = final_severity
+    if supported_domains == 1 and has_abg:
+    final_severity = max(
+        final_severity,
+        "moderate",
+        key=lambda x: severity_rank[x]
+    )
+
     
     # 6️⃣ Stability guard (single-domain cap, etc.)
     # 6️⃣ Stability guard (single-domain cap, etc.)
