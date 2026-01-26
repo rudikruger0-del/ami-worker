@@ -2061,6 +2061,14 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     - differential trees
     - trend comparison
     """
+    # ---------------------------
+    # Default severity (must exist)
+    # ---------------------------
+    sev = {
+        "severity": "low",
+        "key_issues": [],
+        "urgency_flags": []
+    }
 
     # ---------------------------
     # Canonical dict
@@ -3078,16 +3086,26 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # PRIMARY PHYSIOLOGY SUMMARY (TOP-LEVEL ORCHESTRATION)
     # ---------------------------
     primary_physiology_summary = build_primary_physiology_summary(
-        routes=routes,
-        severity=sev.get("severity"),
-        dominant_driver=dominant_driver,
-        chemistry_dominant=chemistry_dominant,
-        acid_base_coherence=acid_base_coherence,
-        ecg_coherence=ecg_coherence,
-        offset_notes=offset_notes,
-    )
+    routes=routes,
+    severity=sev.get("severity"),
+    dominant_driver=dominant_driver,
+    chemistry_dominant=chemistry_dominant,
+    acid_base_coherence=acid_base_coherence,
+    ecg_coherence=ecg_coherence,
+    offset_notes=offset_notes,
+)
+
+    # ---------------------------
+    # Primary physiology summary fallback (MUST EXIST)
+    # ---------------------------
+    if not primary_physiology_summary:
+        primary_physiology_summary = (
+            "Interpretation is limited to available data without a single dominant acute physiology."
+        )
     
     augmented["primary_physiology_summary"] = primary_physiology_summary
+    return augmented
+
 
 
     return augmented
