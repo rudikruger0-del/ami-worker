@@ -2943,24 +2943,22 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # SAFETY GUARD: LOW must be justified by data
     # -------------------------------------------------
     
-        
     # 5️⃣ Build final severity object
     sev = dict(numeric_sev)
     sev["severity"] = final_severity
-    if supported_domains == 1 and has_abg:
-    final_severity = max(
-        final_severity,
-        "moderate",
-        key=lambda x: severity_rank[x]
-    )
-
     
-    # 6️⃣ Stability guard (single-domain cap, etc.)
+    # ABG-only data can NEVER be LOW
+    if supported_domains == 1 and has_abg:
+        sev["severity"] = max(
+            sev["severity"],
+            "moderate",
+            key=lambda x: severity_rank[x]
+        )
+    
     # 6️⃣ Stability guard (single-domain cap, etc.)
     # Do NOT allow ABG-only cases to be downgraded
     if not (supported_domains == 1 and ai_json.get("abg")):
         sev = assess_severity_stability(cdict, routes, sev)
-
     
     # 7️⃣ Follow-up block (depends ONLY on final severity)
     follow_up = build_follow_up_block(
