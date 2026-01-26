@@ -2647,6 +2647,26 @@ def build_full_clinical_report(ai_json: dict) -> dict:
         )
 
     # =====================================================
+    # ABG DOMINANT PRIMARY ROUTE (PHYSIOLOGY ONLY)
+    # =====================================================
+    if abg_dominant:
+        add_route(
+            routes,
+            priority="primary",
+            pattern="Respiratory acidosis physiology",
+            route=(
+                "Arterial blood gas shows acidemia with elevated pCO₂, "
+                "indicating impaired ventilation physiology with increased clinical risk."
+            ),
+            next_steps=[
+                "Prompt clinical assessment of ventilation and respiratory status",
+                "Correlate with respiratory rate, oxygenation, and mental status",
+                "Repeat blood gas if clinical condition changes"
+            ]
+        )
+
+
+    # =====================================================
     # FAIL-SAFE — MUST BE LAST
     # =====================================================
     if not routes:
@@ -2891,17 +2911,6 @@ def build_full_clinical_report(ai_json: dict) -> dict:
         # Enforce minimum MODERATE severity
         if severity_rank.get(final_severity, 0) < severity_rank["moderate"]:
             final_severity = "moderate"
-
-    # ---------------------------
-    # ABG SEVERITY DOMINANCE (DO NOT DOWNGRADE)
-    # ---------------------------
-    
-    # Enforce minimum MODERATE severity
-    if abg_dominant:
-        if severity_rank.get(final_severity, 0) < severity_rank["moderate"]:
-            final_severity = "moderate"
-
-
     
     # ---------------------------
     # CHEMISTRY DOMINANT PRIMARY ROUTE
