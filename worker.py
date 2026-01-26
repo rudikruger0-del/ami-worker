@@ -2221,25 +2221,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
             ]
         )
 
-    # ---------------------------
-    # ABG DOMINANT PRIMARY ROUTE (PHYSIOLOGY ONLY)
-    # ---------------------------
-    if abg_dominant:
-        add_route(
-            routes,
-            priority="primary",
-            pattern="Respiratory acidosis physiology with metabolic stress",
-            route=(
-                "Arterial blood gas shows acidemia with elevated pCO₂, "
-                "indicating impaired ventilation physiology, with additional "
-                "metabolic stress signal from elevated lactate."
-            ),
-            next_steps=[
-                "Prompt clinical assessment with attention to ventilatory status",
-                "Correlate with respiratory symptoms, oxygenation, and vital signs",
-                "Repeat blood gas if clinical status changes"
-            ]
-        )
+    
     # =====================================================
     # PASS 1 — PRIMARY LIFE-THREATENING CBC ROUTES
     # =====================================================
@@ -2646,24 +2628,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
             ]
         )
 
-    # =====================================================
-    # ABG DOMINANT PRIMARY ROUTE (PHYSIOLOGY ONLY)
-    # =====================================================
-    if abg_dominant:
-        add_route(
-            routes,
-            priority="primary",
-            pattern="Respiratory acidosis physiology",
-            route=(
-                "Arterial blood gas shows acidemia with elevated pCO₂, "
-                "indicating impaired ventilation physiology with increased clinical risk."
-            ),
-            next_steps=[
-                "Prompt clinical assessment of ventilation and respiratory status",
-                "Correlate with respiratory rate, oxygenation, and mental status",
-                "Repeat blood gas if clinical condition changes"
-            ]
-        )
+    
 
 
     # =====================================================
@@ -2963,6 +2928,22 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     final_severity = route_sev
     if severity_rank.get(numeric_sev["severity"], 0) > severity_rank.get(route_sev, 0):
         final_severity = numeric_sev["severity"]
+
+    # -------------------------------------------------
+    # HARD SAFETY RULE: ABG-ONLY CAN NEVER BE LOW
+    # -------------------------------------------------
+    has_cbc = bool(ai_json.get("cbc"))
+    has_chem = bool(ai_json.get("chemistry"))
+    has_abg = bool(ai_json.get("abg"))
+    has_ecg = bool(ai_json.get("ecg"))
+    
+    supported_domains = sum([has_cbc, has_chem, has_abg, has_ecg])
+    
+    # LOW requires reassuring multi-domain data
+    if supported_domains == 1 and has_abg:
+        if final_severity == "low":
+            final_severity = "moderate"
+
 
     # -------------------------------------------------
     # SAFETY GUARD: LOW must be justified by data
