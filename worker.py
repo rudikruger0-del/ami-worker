@@ -2938,17 +2938,17 @@ def build_full_clinical_report(ai_json: dict) -> dict:
 
     trends = trend_comparison(patient_name, cdict)
 
-    # ---------------------------
-    # Severity resolution (ROUTE-DOMINANT, SAFE)
-    # ---------------------------
+    # =====================================================
+    # SEVERITY RESOLUTION (ROUTE-DOMINANT, SAFE ORDER)
+    # =====================================================
     
-    # Always evaluate numeric severity FIRST (labs-only, modality-agnostic)
+    # 1️⃣ Numeric severity from labs (CBC / chemistry / ABG-safe)
     numeric_sev = evaluate_severity_and_urgency(cdict)
     
-    # Then derive severity from dominant physiology routes
+    # 2️⃣ Route-based severity (clinical dominance)
     route_sev = severity_from_routes(routes)
     
-    # Escalation order (never downgrade)
+    # 3️⃣ Escalation order (never downgrade)
     severity_rank = {
         "low": 0,
         "moderate": 1,
@@ -2956,34 +2956,24 @@ def build_full_clinical_report(ai_json: dict) -> dict:
         "critical": 3
     }
     
-    # Start with route-based severity
+    # 4️⃣ Choose highest severity
     final_severity = route_sev
+    if severity_rank.get(numeric_sev["severity"], 0) > severity_rank.get(route_sev, 0):
+        final_severity = numeric_sev["severity"]
     
-    # Escalate if numeric severity is higher
-    if severity_rank.get(numeric_sev.get("severity"), 0) > severity_rank.get(route_sev, 0):
-        final_severity = numeric_sev.get("severity")
-    
-    # Build final severity object ONCE
+    # 5️⃣ Build final severity object
     sev = dict(numeric_sev)
     sev["severity"] = final_severity
     
-    # Stability & buffering logic (never downgrade, may escalate)
-    sev = assess_severity_stability(
-        cdict=cdict,
-        routes=routes,
-        sev=sev
-    )
+    # 6️⃣ Stability guard (single-domain cap, etc.)
+    sev = assess_severity_stability(cdict, routes, sev)
     
-    # ---------------------------
-    # Clean follow-up block (summary-level, non-invasive)
-    # ---------------------------
+    # 7️⃣ Follow-up block (depends ONLY on final severity)
     follow_up = build_follow_up_block(
         cdict=cdict,
         routes=routes,
         severity=sev.get("severity")
     )
-
-
 
     # ---------------------------
     # Chemistry context & next steps
