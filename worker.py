@@ -2960,7 +2960,23 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     final_severity = route_sev
     if severity_rank.get(numeric_sev["severity"], 0) > severity_rank.get(route_sev, 0):
         final_severity = numeric_sev["severity"]
+
+    # -------------------------------------------------
+    # SAFETY GUARD: LOW must be justified by data
+    # -------------------------------------------------
+    supported_domains = sum([
+        1 if ai_json.get("cbc") else 0,
+        1 if ai_json.get("chemistry") else 0,
+        1 if ai_json.get("abg") else 0,
+        1 if ai_json.get("ecg") else 0,
+    ])
     
+    # ABG-only data can NEVER justify LOW reassurance
+    if supported_domains == 1 and ai_json.get("abg"):
+        if final_severity == "low":
+            final_severity = "moderate"
+    
+        
     # 5️⃣ Build final severity object
     sev = dict(numeric_sev)
     sev["severity"] = final_severity
