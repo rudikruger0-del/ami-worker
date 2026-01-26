@@ -2221,6 +2221,25 @@ def build_full_clinical_report(ai_json: dict) -> dict:
             ]
         )
 
+    # ---------------------------
+    # ABG DOMINANT PRIMARY ROUTE (PHYSIOLOGY ONLY)
+    # ---------------------------
+    if abg_dominant:
+        add_route(
+            routes,
+            priority="primary",
+            pattern="Respiratory acidosis physiology with metabolic stress",
+            route=(
+                "Arterial blood gas shows acidemia with elevated pCO₂, "
+                "indicating impaired ventilation physiology, with additional "
+                "metabolic stress signal from elevated lactate."
+            ),
+            next_steps=[
+                "Prompt clinical assessment with attention to ventilatory status",
+                "Correlate with respiratory symptoms, oxygenation, and vital signs",
+                "Repeat blood gas if clinical status changes"
+            ]
+        )
     # =====================================================
     # PASS 1 — PRIMARY LIFE-THREATENING CBC ROUTES
     # =====================================================
@@ -2883,28 +2902,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
             final_severity = "moderate"
 
 
-    # ---------------------------
-    # ABG DOMINANT PRIMARY ROUTE (PHYSIOLOGY ONLY)
-    # ---------------------------
-    if abg_dominant:
-        add_route(
-            routes,
-            priority="primary",
-            pattern="Respiratory acidosis physiology with metabolic stress",
-            route=(
-                "Arterial blood gas shows acidemia with elevated pCO₂, "
-                "indicating impaired ventilation physiology, with additional "
-                "metabolic stress signal from elevated lactate."
-            ),
-            next_steps=[
-                "Prompt clinical assessment with attention to ventilatory status",
-                "Correlate with respiratory symptoms, oxygenation, and vital signs",
-                "Repeat blood gas if clinical status changes"
-            ]
-        )
-
-
-
+    
     # ---------------------------
     # CHEMISTRY DOMINANT PRIMARY ROUTE
     # ---------------------------
