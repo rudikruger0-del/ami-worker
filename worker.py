@@ -2959,6 +2959,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     if supported_domains == 1 and ai_json.get("abg"):
         if final_severity == "low":
             final_severity = "moderate"
+            abg_severity_locked = True
     
         
     # 5️⃣ Build final severity object
@@ -2966,7 +2967,11 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     sev["severity"] = final_severity
     
     # 6️⃣ Stability guard (single-domain cap, etc.)
-    sev = assess_severity_stability(cdict, routes, sev)
+    # 6️⃣ Stability guard (single-domain cap, etc.)
+    # Do NOT allow ABG-only cases to be downgraded
+    if not (supported_domains == 1 and ai_json.get("abg")):
+        sev = assess_severity_stability(cdict, routes, sev)
+
     
     # 7️⃣ Follow-up block (depends ONLY on final severity)
     follow_up = build_follow_up_block(
