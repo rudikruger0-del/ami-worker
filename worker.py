@@ -3079,6 +3079,8 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     augmented["_explainability"] = explainability
     augmented["_interpretation_context"] = context_notes
     augmented["context_notes"] = context_notes
+    augmented["severity"] = sev["severity"]
+    augmented["urgency"] = sev.get("urgency")
     # ---------------------------
     # PRIMARY PHYSIOLOGY SUMMARY (TOP-LEVEL ORCHESTRATION)
     # ---------------------------
