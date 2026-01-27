@@ -2959,13 +2959,24 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # Do NOT allow ABG-only cases to be downgraded
     if not (supported_domains == 1 and ai_json.get("abg")):
         sev = assess_severity_stability(cdict, routes, sev)
-    
+
+    # ===============================
+    # FINAL INVARIANT — DO NOT MOVE
+    # ===============================
+    # ABG-only reports are NEVER low reassurance
+    if has_abg and supported_domains == 1:
+        if severity_rank.get(sev["severity"], 0) < severity_rank["moderate"]:
+            sev["severity"] = "moderate"
+
     # 7️⃣ Follow-up block (depends ONLY on final severity)
-    follow_up = build_follow_up_block(
-        cdict=cdict,
-        routes=routes,
-        severity=sev.get("severity")
-    )
+        follow_up = build_follow_up_block(
+            cdict=cdict,
+            routes=routes,
+            severity=sev.get("severity")
+        )
+    
+        
+        
 
     # ---------------------------
     # Chemistry context & next steps
