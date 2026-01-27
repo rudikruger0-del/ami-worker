@@ -3236,6 +3236,30 @@ def process_report(job: dict) -> dict:
         if extracted_abg:
             ai_json["abg"] = extracted_abg
 
+        # -------------------------------------------------
+        # DIGITAL ABG TEXT EXTRACTION (CRITICAL)
+        # Must occur BEFORE clinical aggregation
+        # -------------------------------------------------
+        if not scanned:
+            abg_text = text.lower()
+
+            def find(pattern):
+                m = re.search(pattern, abg_text)
+                return clean_number(m.group(1)) if m else None
+
+            digital_abg = {
+                "pH": find(r"\bph\b\s*[:=]?\s*([0-9\.]+)"),
+                "pCO2": find(r"pco2\s*[:=]?\s*([0-9\.]+)"),
+                "pO2": find(r"po2\s*[:=]?\s*([0-9\.]+)"),
+                "HCO3": find(r"hco3\s*[:=]?\s*([0-9\.]+)"),
+                "Lactate": find(r"lactate\s*[:=]?\s*([0-9\.]+)"),
+            }
+
+            # Attach ONLY if real ABG physiology exists
+            if any(v is not None for v in digital_abg.values()):
+                ai_json["abg"] = digital_abg
+
+
         
         # --------------------
         # Patient demographics extraction (THIS IS THE KEY)
