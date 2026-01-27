@@ -2076,12 +2076,30 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # Canonical dict
     # ---------------------------
     cdict = build_cbc_value_dict(ai_json)
+    # ---------------------------
+    # Domain presence detection
+    # ---------------------------
     has_cbc = bool(ai_json.get("cbc"))
     has_chem = bool(ai_json.get("chemistry"))
-    has_abg = bool(ai_json.get("abg"))
+
+    abg = ai_json.get("abg")
+    has_abg = (
+        isinstance(abg, dict)
+        and any(
+            clean_number(abg.get(k)) is not None
+            for k in ("pH", "pCO2", "pO2", "HCO3", "Lactate")
+        )
+    )
+
     has_ecg = bool(ai_json.get("ecg"))
-    
-    supported_domains = sum([has_cbc, has_chem, has_abg, has_ecg])
+
+    supported_domains = sum([
+        1 if has_cbc else 0,
+        1 if has_chem else 0,
+        1 if has_abg else 0,
+        1 if has_ecg else 0,
+    ])
+
 
 
     # ---------------------------
