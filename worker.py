@@ -2053,6 +2053,8 @@ def build_primary_physiology_summary(
 # also includes severity/urgency/differential/trends
 # ---------------------------
 def build_full_clinical_report(ai_json: dict) -> dict:
+    follow_up = None
+
     """
     Given ai_json (from call_ai_on_report), add:
     - canonical cdict
