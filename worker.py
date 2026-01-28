@@ -2959,6 +2959,30 @@ def build_full_clinical_report(ai_json: dict) -> dict:
         "high": 2,
         "critical": 3
     }
+    # -------------------------------------------------
+    # ABG PHYSIOLOGICAL SEVERITY ESCALATION (UNIVERSAL)
+    # -------------------------------------------------
+    if has_abg:
+        abg = ai_json.get("abg") or {}
+    
+        pH = clean_number(abg.get("pH"))
+        pCO2 = clean_number(abg.get("pCO2"))
+        lactate = clean_number(abg.get("Lactate"))
+    
+        # Severe ventilatory failure physiology
+        if (
+            pH is not None and pH < 7.20
+            and pCO2 is not None and pCO2 > 70
+        ):
+            route_sev = max(route_sev, "high", key=lambda x: severity_rank[x])
+    
+        # Extreme acidaemia or systemic collapse
+        if (
+            pH is not None and pH < 7.10
+            or (lactate is not None and lactate >= 5.0)
+        ):
+            route_sev = max(route_sev, "critical", key=lambda x: severity_rank[x])
+
     
     # 4️⃣ Choose highest severity
     final_severity = route_sev
