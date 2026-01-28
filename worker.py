@@ -2995,6 +2995,24 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     if severity_rank.get(numeric_sev["severity"], 0) > severity_rank.get(route_sev, 0):
         final_severity = numeric_sev["severity"]
 
+    # SAFETY: CRITICAL must always have at least one route
+    if final_severity == "critical" and not routes:
+        add_route(
+            routes,
+            priority="primary",
+            pattern="Severe metabolic or physiological derangement",
+            route=(
+                "Life-threatening physiological abnormalities detected requiring "
+                "immediate clinical prioritisation."
+            ),
+            next_steps=[
+                "Immediate senior clinical review",
+                "Continuous monitoring and reassessment",
+                "Targeted evaluation of underlying cause"
+            ]
+        )
+
+
     # =====================================================
     # HARD PRIORITY LOCK — LIFE-THREATENING METABOLIC PHYSIOLOGY
     # =====================================================
