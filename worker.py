@@ -2989,6 +2989,39 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     if severity_rank.get(numeric_sev["severity"], 0) > severity_rank.get(route_sev, 0):
         final_severity = numeric_sev["severity"]
 
+    # =====================================================
+    # HARD PRIORITY LOCK — LIFE-THREATENING METABOLIC PHYSIOLOGY
+    # =====================================================
+    
+    abg = ai_json.get("abg") or {}
+    
+    pH_abg = clean_number(abg.get("pH"))
+    hco3_abg = (
+        clean_number(abg.get("HCO3")) or
+        clean_number(abg.get("Bicarbonate"))
+    )
+    
+    anion_gap = clean_number(cdict.get("Anion Gap", {}).get("value"))
+    
+    life_threatening_metabolic_acidosis = (
+        (pH_abg is not None and pH_abg < 7.10) or
+        (hco3_abg is not None and hco3_abg < 10) or
+        (anion_gap is not None and anion_gap >= 25)
+    )
+    
+    if life_threatening_metabolic_acidosis:
+        final_severity = "critical"
+    
+        # 🔒 Suppress low-value routes (CBC noise, generic patterns)
+        routes = [
+            r for r in routes
+            if r.get("priority") == "primary"
+            or "acidosis" in (r.get("pattern") or "").lower()
+            or "metabolic" in (r.get("pattern") or "").lower()
+            or "electrolyte" in (r.get("pattern") or "").lower()
+        ]
+
+
     
 
 
