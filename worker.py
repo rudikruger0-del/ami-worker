@@ -414,16 +414,22 @@ def assess_abg_coherence(cdict: dict, abg: dict | None) -> list:
                 "ABG acidaemia aligns with a high–anion-gap metabolic acidosis pattern."
             )
 
-    # --- Limiting statements ---
-    if pH is not None and pH >= 7.35 and HCO3_chem is not None and HCO3_chem < 22:
+    # --- Limiting statements (ONLY when core data is missing) ---
+    if pH is None and HCO3_chem is None:
         notes.append(
-            "Normal pH limits confidence in the severity of metabolic acidosis without compensation assessment."
+            "Acid–base interpretation is limited due to missing pH and bicarbonate values."
+        )
+    
+    elif (
+        pH is not None
+        and pH >= 7.35
+        and HCO3_chem is not None
+        and HCO3_chem < 22
+    ):
+        notes.append(
+            "Normal pH limits confidence in the severity of metabolic acidosis without full compensation assessment."
         )
 
-    if pH is None:
-        notes.append(
-            "Acid–base interpretation is limited in the absence of arterial or venous blood gas pH."
-        )
 
     return notes
 
