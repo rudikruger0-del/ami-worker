@@ -2206,26 +2206,35 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # =====================================================
     # ABG PRIMARY PHYSIOLOGY ROUTE (VENTILATORY RISK)
     # =====================================================
-    abg = ai_json.get("abg") or {}
     
-    pH_abg = clean_number(abg.get("pH"))
-    pCO2_abg = clean_number(abg.get("pCO2"))
-    lactate_abg = clean_number(abg.get("Lactate"))
-    
-    # ---- Primary respiratory acidosis physiology ----
     if (
         pH_abg is not None and pCO2_abg is not None
         and pH_abg < 7.30
         and pCO2_abg > 45
     ):
+    
+        severe_physiology = (
+            (pH_abg <= 7.20) or
+            (pCO2_abg >= 70) or
+            (lactate_abg is not None and lactate_abg >= 4.0)
+        )
+    
+        if severe_physiology:
+            route_text = (
+                "Marked respiratory acidosis with significantly elevated pCO₂ "
+                "indicates ventilatory failure physiology and high risk of clinical deterioration"
+            )
+        else:
+            route_text = (
+                "Respiratory acidosis with elevated pCO₂ indicates impaired ventilation "
+                "with moderate physiological stress, requiring close clinical assessment"
+            )
+    
         add_route(
             routes,
             priority="primary",
             pattern="Respiratory acidosis physiology",
-            route=(
-                "Low pH with elevated pCO₂ indicates ventilatory failure physiology "
-                "with risk of clinical deterioration"
-            ),
+            route=route_text,
             next_steps=[
                 "Prompt clinical assessment of ventilation and respiratory status",
                 "Correlate with respiratory rate, oxygenation, and mental status",
