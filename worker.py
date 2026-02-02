@@ -2099,6 +2099,34 @@ def apply_universal_registrar_polish(cdict: dict, summary_text: str) -> str:
 
     return summary_text
 
+def generate_report_title(
+    severity: str,
+    dominant_driver: dict,
+    routes: list,
+    supported_domains: list,
+) -> str:
+    """
+    GP-facing report title.
+    Presentation-only.
+    No diagnosis, no logic mutation.
+    """
+
+    sev = (severity or "low").upper()
+
+    driver = None
+    if dominant_driver and dominant_driver.get("driver"):
+        driver = dominant_driver["driver"]
+    elif routes:
+        driver = routes[0].get("pattern")
+
+    if not driver:
+        driver = "Routine Findings"
+
+    domain = "/".join(supported_domains) if supported_domains else "Laboratory"
+
+    return f"{sev} • {driver} • {domain}"
+
+
 
 
 
@@ -3252,6 +3280,17 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     augmented["context_notes"] = context_notes
     augmented["severity"] = sev["severity"]
     augmented["urgency"] = sev.get("urgency")
+
+    supported_domains = []
+if has_cbc:
+    supported_domains.append("CBC")
+if has_chem:
+    supported_domains.append("Chemistry")
+if has_abg:
+    supported_domains.append("ABG")
+if has_ecg:
+    supported_domains.append("ECG")
+
     # ---------------------------
     # PRIMARY PHYSIOLOGY SUMMARY (TOP-LEVEL ORCHESTRATION)
     # ---------------------------
