@@ -3281,7 +3281,7 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     augmented["severity"] = sev["severity"]
     augmented["urgency"] = sev.get("urgency")
 
-        supported_domains = []
+    supported_domains = []
     if has_cbc:
         supported_domains.append("CBC")
     if has_chem:
