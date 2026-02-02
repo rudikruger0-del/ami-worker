@@ -2049,6 +2049,57 @@ def build_primary_physiology_summary(
 
     return " ".join(sentences[:3])
 
+def apply_universal_registrar_polish(cdict: dict, summary_text: str) -> str:
+    """
+    Registrar-grade micro-polish.
+    Presentation-only.
+    Presence-based logic.
+    No diagnosis, no severity change, no routes.
+    """
+
+    if not summary_text:
+        return summary_text
+
+    additions = []
+    v = lambda k: clean_number(cdict.get(k, {}).get("value"))
+
+    # ----------------------------
+    # Inflammatory signal
+    # ----------------------------
+    CRP = v("CRP")
+    if CRP is not None and CRP >= 30:
+        additions.append(
+            "A marked inflammatory response is present."
+        )
+
+    # ----------------------------
+    # Macrocytosis context
+    # ----------------------------
+    MCV = v("MCV")
+    if MCV is not None and MCV > 100:
+        additions.append(
+            "Macrocytosis broadens consideration to nutritional deficiency, alcohol use, medication effects, or marrow stress."
+        )
+
+    # ----------------------------
+    # Renal physiological stress
+    # ----------------------------
+    Cr = v("Creatinine")
+    if Cr is not None and Cr >= 120:
+        additions.append(
+            "Mild to moderate renal impairment may contribute to overall physiological stress."
+        )
+
+    # ----------------------------
+    # Append safely
+    # ----------------------------
+    for line in additions:
+        if line not in summary_text:
+            summary_text = f"{summary_text} {line}"
+
+    return summary_text
+
+
 
 
 
