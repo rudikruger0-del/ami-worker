@@ -3217,13 +3217,13 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # ---------------------------
     # Primary physiology summary fallback (MUST EXIST)
     # ---------------------------
-    if not primary_physiology_summary:
-        primary_physiology_summary = (
-            "Interpretation is limited to available data without a single dominant acute physiology."
-        )
+    primary_physiology_summary = apply_universal_registrar_polish(
+        cdict=cdict,
+        summary_text=primary_physiology_summary
+    )
     
     augmented["primary_physiology_summary"] = primary_physiology_summary
-    return augmented
+
 
 
 
