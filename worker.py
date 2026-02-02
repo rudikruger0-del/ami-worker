@@ -3312,6 +3312,19 @@ if has_ecg:
         summary_text=primary_physiology_summary
     )
     
+    # ---------------------------
+    # GP-facing report title
+    # ---------------------------
+    augmented["report_title"] = generate_report_title(
+        severity=sev["severity"],
+        dominant_driver=dominant_driver,
+        routes=routes,
+        supported_domains=supported_domains,
+    )
+    
+    # ---------------------------
+    # Primary physiology summary
+    # ---------------------------
     augmented["primary_physiology_summary"] = primary_physiology_summary
 
 
