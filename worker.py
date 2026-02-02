@@ -3281,28 +3281,28 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     augmented["severity"] = sev["severity"]
     augmented["urgency"] = sev.get("urgency")
 
-    supported_domains = []
-if has_cbc:
-    supported_domains.append("CBC")
-if has_chem:
-    supported_domains.append("Chemistry")
-if has_abg:
-    supported_domains.append("ABG")
-if has_ecg:
-    supported_domains.append("ECG")
+        supported_domains = []
+    if has_cbc:
+        supported_domains.append("CBC")
+    if has_chem:
+        supported_domains.append("Chemistry")
+    if has_abg:
+        supported_domains.append("ABG")
+    if has_ecg:
+        supported_domains.append("ECG")
 
     # ---------------------------
     # PRIMARY PHYSIOLOGY SUMMARY (TOP-LEVEL ORCHESTRATION)
     # ---------------------------
     primary_physiology_summary = build_primary_physiology_summary(
-    routes=routes,
-    severity=sev.get("severity"),
-    dominant_driver=dominant_driver,
-    chemistry_dominant=chemistry_dominant,
-    acid_base_coherence=acid_base_coherence,
-    ecg_coherence=ecg_coherence,
-    offset_notes=offset_notes,
-)
+        routes=routes,
+        severity=sev.get("severity"),
+        dominant_driver=dominant_driver,
+        chemistry_dominant=chemistry_dominant,
+        acid_base_coherence=acid_base_coherence,
+        ecg_coherence=ecg_coherence,
+        offset_notes=offset_notes,
+    )
 
     # ---------------------------
     # Primary physiology summary fallback (MUST EXIST)
@@ -3311,7 +3311,7 @@ if has_ecg:
         cdict=cdict,
         summary_text=primary_physiology_summary
     )
-    
+
     # ---------------------------
     # GP-facing report title
     # ---------------------------
@@ -3321,14 +3321,11 @@ if has_ecg:
         routes=routes,
         supported_domains=supported_domains,
     )
-    
+
     # ---------------------------
     # Primary physiology summary
     # ---------------------------
     augmented["primary_physiology_summary"] = primary_physiology_summary
-
-
-
 
     return augmented
 
