@@ -2126,11 +2126,50 @@ def generate_report_title(
 
     return f"{sev} • {driver} • {domain}"
 
+def apply_non_negotiable_severity_overrides(cdict: dict) -> str | None:
+    """
+    Returns a minimum severity floor if life-threatening physiology is present.
+    If nothing fires, returns None.
+    """
 
+    v = lambda k: clean_number(cdict.get(k, {}).get("value"))
 
+    # --- Hard overrides ---
+    if v("pH") is not None and v("pH") < 7.10:
+        return "critical"
 
+    if v("Neutrophils") is not None and v("Neutrophils") < 0.5:
+        return "critical"
 
+    if v("Platelets") is not None and v("Platelets") < 30:
+        return "critical"
 
+    if v("ALT") is not None and v("ALT") > 1000:
+        return "critical"
+
+    if v("AST") is not None and v("AST") > 1000:
+        return "critical"
+
+    # Creatinine + another abnormality
+    if v("Creatinine") is not None and v("Creatinine") > 300:
+        other_abnormal = any(
+            v(k) is not None
+            for k in ("Potassium", "Bicarbonate", "CRP", "Platelets", "WBC")
+        )
+        if other_abnormal:
+            return "critical"
+
+    # CRP + cytopenia
+    if v("CRP") is not None and v("CRP") > 200:
+        cytopenia = any([
+            v("Hb") is not None and v("Hb") < 10,
+            v("WBC") is not None and v("WBC") < 3,
+            v("Platelets") is not None and v("Platelets") < 100,
+        ])
+        if cytopenia:
+            return "critical"
+
+    return None
 
 # ---------------------------
 # Route engine aggregator: Patterns -> Route -> Next Steps
@@ -2160,6 +2199,8 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     # Canonical dict
     # ---------------------------
     cdict = build_cbc_value_dict(ai_json)
+    severity_floor = apply_non_negotiable_severity_overrides(cdict)
+
     # ---------------------------
     # Domain presence detection
     # ---------------------------
@@ -3070,8 +3111,15 @@ def build_full_clinical_report(ai_json: dict) -> dict:
     
     # 4️⃣ Choose highest severity
     final_severity = route_sev
-    if severity_rank.get(numeric_sev["severity"], 0) > severity_rank.get(route_sev, 0):
+
+    if severity_rank.get(numeric_sev["severity"], 0) > severity_rank.get(final_severity, 0):
         final_severity = numeric_sev["severity"]
+    
+    # 🔒 NON-NEGOTIABLE FLOOR
+    if severity_floor:
+        if severity_rank.get(final_severity, 0) < severity_rank[severity_floor]:
+            final_severity = severity_floor
+
 
     # SAFETY: CRITICAL must always have at least one route
     if final_severity == "critical" and not routes:
