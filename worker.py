@@ -2176,7 +2176,20 @@ def apply_non_negotiable_severity_overrides(cdict: dict) -> str | None:
 # also includes severity/urgency/differential/trends
 # ---------------------------
 def build_full_clinical_report(ai_json: dict) -> dict:
+
+    # ===============================
+    # GLOBAL SEVERITY RANK (FUNCTION SCOPE)
+    # ===============================
+    severity_rank = {
+        "low": 0,
+        "moderate": 1,
+        "high": 2,
+        "critical": 3
+    }
+
     follow_up = []
+
+
 
     """
     Given ai_json (from call_ai_on_report), add:
