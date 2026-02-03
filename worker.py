@@ -2187,6 +2187,12 @@ def build_full_clinical_report(ai_json: dict) -> dict:
         "critical": 3
     }
 
+    # ===============================
+    # INITIAL SEVERITY PLACEHOLDER
+    # (will be escalated, never trusted)
+    # ===============================
+    final_severity = "low"
+
     follow_up = []
 
 
