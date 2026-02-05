@@ -28,6 +28,7 @@ from supabase import create_client, Client
 from openai import OpenAI
 from pypdf import PdfReader
 from pdf2image import convert_from_bytes
+from services.delivery_service import deliver_prescription
 
 # ---------------------------
 # Environment / clients
@@ -3682,6 +3683,26 @@ def main():
             print("LOOP ERROR:", e)
             traceback.print_exc()
             time.sleep(2)
+
+# =====================================================
+# Explicit doctor-triggered patient notification action
+# =====================================================
+def notify_patient_action(payload: dict):
+    """
+    Explicit, doctor-initiated action.
+    Never called automatically.
+    Never part of report processing.
+    """
+
+    return deliver_prescription(
+        doctor_id=payload["doctor_id"],
+        patient_id=payload.get("patient_id"),
+        prescription_pdf_url=payload["prescription_pdf_url"],
+        patient_email=payload.get("patient_email"),
+        patient_whatsapp=payload.get("patient_whatsapp"),
+        whatsapp_enabled=payload.get("whatsapp_enabled", False),
+    )
+
 
 if __name__ == "__main__":
     main()
