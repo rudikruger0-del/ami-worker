@@ -6,6 +6,7 @@ requests==2.31.0
 pypdf==4.3.1
 pdf2image==1.17.0
 pillow==10.2.0
+reportlab==4.0.9
 
 # OCR
 pytesseract==0.3.10
@@ -13,8 +14,9 @@ pytesseract==0.3.10
 # Supabase
 supabase==2.7.4
 
-# OpenAI (NEW SDK – REQUIRED for OpenAI Vision)
+# OpenAI
 openai==1.51.0
-reportlab
-fastapi
-uvicorn
+
+# HTTP server (REQUIRED)
+fastapi==0.110.0
+uvicorn[standard]==0.27.1
