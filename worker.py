@@ -3800,10 +3800,18 @@ async def http_notify_patient(req: Request):
 # =====================================================
 # HTTP APP — explicit clinician-triggered actions
 # =====================================================
+
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import JSONResponse
+import threading
+import os
 
-app = FastAPI()
+app = FastAPI(title="AMI Worker Actions")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
 @app.post("/action/generate_prescription_draft")
@@ -3817,8 +3825,7 @@ async def http_generate_prescription_draft(
     payload = await request.json()
 
     try:
-        result = generate_prescription_draft_action(payload)
-        return JSONResponse(result)
+        return JSONResponse(generate_prescription_draft_action(payload))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -3834,8 +3841,7 @@ async def http_upload_prescription_template(
     payload = await request.json()
 
     try:
-        result = upload_prescription_template_action(payload)
-        return JSONResponse(result)
+        return JSONResponse(upload_prescription_template_action(payload))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -3851,22 +3857,21 @@ async def http_notify_patient(
     payload = await request.json()
 
     try:
-        result = notify_patient_action(payload)
-        return JSONResponse(result)
+        return JSONResponse(notify_patient_action(payload))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-
-
+# =====================================================
+# ENTRYPOINT — WORKER + HTTP COEXIST
+# =====================================================
 
 if __name__ == "__main__":
-    # Run background worker in a thread
-    t = threading.Thread(target=main, daemon=True)
-    t.start()
+    # Background polling worker (UNCHANGED LOGIC)
+    worker_thread = threading.Thread(target=main, daemon=True)
+    worker_thread.start()
 
-    # Start HTTP server
+    # HTTP server for explicit clinician actions
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
