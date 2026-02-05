@@ -3772,7 +3772,41 @@ def generate_prescription_draft_action(payload: dict):
         patient_dob=payload.get("patient_dob"),
     )
 
+from fastapi import FastAPI, Request, HTTPException
+import os
+import threading
+
+app = FastAPI(title="AMI Worker API")
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/action/generate_prescription_draft")
+async def http_generate_prescription_draft(req: Request):
+    payload = await req.json()
+    return generate_prescription_draft_action(payload)
+
+@app.post("/action/upload_prescription_template")
+async def http_upload_prescription_template(req: Request):
+    payload = await req.json()
+    return upload_prescription_template_action(payload)
+
+@app.post("/action/notify_patient")
+async def http_notify_patient(req: Request):
+    payload = await req.json()
+    return notify_patient_action(payload)
+
+
 
 
 if __name__ == "__main__":
-    main()
+    # Run background worker in a thread
+    t = threading.Thread(target=main, daemon=True)
+    t.start()
+
+    # Start HTTP server
+    import uvicorn
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
