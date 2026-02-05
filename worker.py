@@ -3797,6 +3797,66 @@ async def http_notify_patient(req: Request):
     payload = await req.json()
     return notify_patient_action(payload)
 
+# =====================================================
+# HTTP APP — explicit clinician-triggered actions
+# =====================================================
+from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi.responses import JSONResponse
+
+app = FastAPI()
+
+
+@app.post("/action/generate_prescription_draft")
+async def http_generate_prescription_draft(
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid auth token")
+
+    payload = await request.json()
+
+    try:
+        result = generate_prescription_draft_action(payload)
+        return JSONResponse(result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/action/upload_prescription_template")
+async def http_upload_prescription_template(
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid auth token")
+
+    payload = await request.json()
+
+    try:
+        result = upload_prescription_template_action(payload)
+        return JSONResponse(result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/action/notify_patient")
+async def http_notify_patient(
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid auth token")
+
+    payload = await request.json()
+
+    try:
+        result = notify_patient_action(payload)
+        return JSONResponse(result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 
 
