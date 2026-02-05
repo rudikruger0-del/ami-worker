@@ -30,6 +30,8 @@ from pypdf import PdfReader
 from pdf2image import convert_from_bytes
 from services.delivery_service import deliver_prescription
 from services.prescription_template_service import upload_prescription_template
+from services.prescription_draft_service import generate_prescription_draft
+
 
 # ---------------------------
 # Environment / clients
@@ -3752,6 +3754,24 @@ def upload_prescription_template_action(payload: dict):
         clinician_id=clinician_id,
         pdf_bytes=pdf_bytes,
     )
+
+# =====================================================
+# Explicit clinician-triggered prescription draft creation
+# =====================================================
+def generate_prescription_draft_action(payload: dict):
+    """
+    Creates a filled prescription PDF draft.
+    Explicitly triggered. Never automatic.
+    """
+
+    return generate_prescription_draft(
+        clinician_id=payload["clinician_id"],
+        report_id=payload["report_id"],
+        patient_name=payload.get("patient_name"),
+        patient_id=payload.get("patient_id"),
+        patient_dob=payload.get("patient_dob"),
+    )
+
 
 
 if __name__ == "__main__":
