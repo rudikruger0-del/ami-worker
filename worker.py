@@ -1001,6 +1001,9 @@ def extract_patient_demographics(text: str) -> dict:
     name = None
     age = None
     sex = "Unknown"
+    email = None
+    cell = None
+
 
     # ==================================================
     # NAME (Lancet / Ampath / PathCare)
@@ -1079,11 +1082,37 @@ def extract_patient_demographics(text: str) -> dict:
                 except:
                     continue
 
+     # ==================================================
+    # EMAIL (best-effort, SA labs often include it)
+    # ==================================================
+    email_match = re.search(
+        r"[\w\.-]+@[\w\.-]+\.\w+",
+        text,
+        re.IGNORECASE
+    )
+    if email_match:
+        email = email_match.group(0)
+
+    # ==================================================
+    # CELL / MOBILE (South African formats)
+    # ==================================================
+    cell_match = re.search(
+        r"(\+27\s?\d{9}|\b0\d{9}\b)",
+        text
+    )
+    if cell_match:
+        raw = cell_match.group(1)
+        cell = raw.replace(" ", "")
+
+
     return {
         "name": name,
         "age": age,
-        "sex": sex
+        "sex": sex,
+        "email": email,
+        "cell": cell
     }
+
 
 
 
