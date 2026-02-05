@@ -16,3 +16,5 @@ supabase==2.7.4
 # OpenAI (NEW SDK – REQUIRED for OpenAI Vision)
 openai==1.51.0
 reportlab
+fastapi
+uvicorn
