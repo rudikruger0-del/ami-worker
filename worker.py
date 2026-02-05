@@ -29,6 +29,7 @@ from openai import OpenAI
 from pypdf import PdfReader
 from pdf2image import convert_from_bytes
 from services.delivery_service import deliver_prescription
+from services.prescription_template_service import upload_prescription_template
 
 # ---------------------------
 # Environment / clients
@@ -3733,6 +3734,23 @@ def notify_patient_action(payload: dict):
         patient_email=payload.get("patient_email"),
         patient_whatsapp=payload.get("patient_whatsapp"),
         whatsapp_enabled=payload.get("whatsapp_enabled", False),
+    )
+
+# =====================================================
+# Explicit clinician-triggered prescription template upload
+# =====================================================
+def upload_prescription_template_action(payload: dict):
+    """
+    One-time (or replace) upload of clinician prescription template.
+    Explicitly triggered. Never automatic.
+    """
+
+    clinician_id = payload["clinician_id"]
+    pdf_bytes = payload["pdf_bytes"]
+
+    return upload_prescription_template(
+        clinician_id=clinician_id,
+        pdf_bytes=pdf_bytes,
     )
 
 
