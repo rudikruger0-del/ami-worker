@@ -3646,11 +3646,14 @@ def process_report(job: dict) -> dict:
             "ai_results": augmented,
             "ai_error": None,
         
-            # 🔒 Persist patient fields explicitly
             "name": patient.get("name"),
             "age": patient.get("age"),
             "sex": patient.get("sex"),
+        
+            "patient_email": patient.get("email"),
+            "patient_cell": patient.get("cell"),
         }).eq("id", report_id).execute()
+
 
         print(f"✅ Report {report_id} completed")
         return {"success": True, "data": augmented}
