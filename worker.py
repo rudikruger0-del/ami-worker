@@ -3862,20 +3862,33 @@ async def http_notify_patient(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/action/upload_prescription_template")
-async def upload_prescription_template(request: Request, authorization: str | None = Header(default=None)):
+@app.post("/action/upload_prescription_template")
+async def http_upload_prescription_template(
+    request: Request,
+    authorization: str | None = Header(default=None)
+):
+
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing auth token")
 
     payload = await request.json()
 
-    try:
-        result = upload_prescription_template_action(
-            payload=payload,
-            supabase=supabase
-        )
-        return JSONResponse(result)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+if "pdf_base64" not in payload:
+    raise HTTPException(status_code=400, detail="Missing pdf_base64")
+
+# Decode at the boundary (this is unavoidable)
+pdf_bytes = base64.b64decode(payload["pdf_base64"])
+
+result = upload_prescription_template_action(
+    payload={
+        "clinician_id": payload.get("clinician_id"),
+        "pdf_bytes": pdf_bytes,
+    },
+    supabase=supabase
+)
+
+return JSONResponse(result)
+
 
 
 
