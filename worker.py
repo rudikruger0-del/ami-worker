@@ -31,6 +31,9 @@ from pdf2image import convert_from_bytes
 from services.delivery_service import deliver_prescription
 from services.prescription_template_service import upload_prescription_template_action
 from services.prescription_draft_service import generate_prescription_draft
+from fastapi import FastAPI, Request, Header, HTTPException, UploadFile, File
+from fastapi.responses import JSONResponse
+
 
 
 # ---------------------------
@@ -3878,6 +3881,34 @@ async def http_upload_prescription_template_file(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+from fastapi import UploadFile, File
+
+@app.post("/action/upload_prescription_template_file")
+async def http_upload_prescription_template_file(
+    file: UploadFile = File(...),
+    authorization: str | None = Header(default=None),
+):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid auth token")
+
+    try:
+        pdf_bytes = await file.read()
+
+        if not pdf_bytes:
+            raise HTTPException(status_code=400, detail="Empty file")
+
+        result = upload_prescription_template(
+            clinician_id=None,  # auto-resolve from auth inside service
+            pdf_bytes=pdf_bytes,
+        )
+
+        return JSONResponse(result)
+
+    except Exception as e:
+        print("UPLOAD ERROR:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
