@@ -3861,6 +3861,23 @@ async def http_notify_patient(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/action/upload_prescription_template")
+async def upload_prescription_template(request: Request, authorization: str | None = Header(default=None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing auth token")
+
+    payload = await request.json()
+
+    try:
+        result = upload_prescription_template_action(
+            payload=payload,
+            supabase=supabase
+        )
+        return JSONResponse(result)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 
 # =====================================================
 # ENTRYPOINT — WORKER + HTTP COEXIST
