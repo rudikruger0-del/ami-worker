@@ -29,7 +29,7 @@ from openai import OpenAI
 from pypdf import PdfReader
 from pdf2image import convert_from_bytes
 from services.delivery_service import deliver_prescription
-from services.prescription_template_service import upload_prescription_template
+from services.prescription_template_service import upload_prescription_template_action
 from services.prescription_draft_service import generate_prescription_draft
 
 
