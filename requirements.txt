@@ -20,3 +20,4 @@ openai==1.51.0
 # HTTP server (REQUIRED)
 fastapi==0.110.0
 uvicorn[standard]==0.27.1
+python-multipart==0.0.9
