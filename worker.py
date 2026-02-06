@@ -3803,47 +3803,9 @@ async def http_notify_patient(req: Request):
 
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import JSONResponse
-import threading
-import os
+import base64
 
-app = FastAPI(title="AMI Worker Actions")
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.post("/action/generate_prescription_draft")
-async def http_generate_prescription_draft(
-    request: Request,
-    authorization: str | None = Header(default=None),
-):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid auth token")
-
-    payload = await request.json()
-
-    try:
-        return JSONResponse(generate_prescription_draft_action(payload))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/action/upload_prescription_template")
-async def http_upload_prescription_template(
-    request: Request,
-    authorization: str | None = Header(default=None),
-):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid auth token")
-
-    payload = await request.json()
-
-    try:
-        return JSONResponse(upload_prescription_template_action(payload))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+app = FastAPI()
 
 
 @app.post("/action/notify_patient")
@@ -3861,33 +3823,35 @@ async def http_notify_patient(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/action/upload_prescription_template")
+
 @app.post("/action/upload_prescription_template")
 async def http_upload_prescription_template(
     request: Request,
-    authorization: str | None = Header(default=None)
+    authorization: str | None = Header(default=None),
 ):
-
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing auth token")
 
     payload = await request.json()
 
-if "pdf_base64" not in payload:
-    raise HTTPException(status_code=400, detail="Missing pdf_base64")
+    if "pdf_base64" not in payload:
+        raise HTTPException(status_code=400, detail="Missing pdf_base64")
 
-# Decode at the boundary (this is unavoidable)
-pdf_bytes = base64.b64decode(payload["pdf_base64"])
+    try:
+        pdf_bytes = base64.b64decode(payload["pdf_base64"])
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 PDF")
 
-result = upload_prescription_template_action(
-    payload={
-        "clinician_id": payload.get("clinician_id"),
-        "pdf_bytes": pdf_bytes,
-    },
-    supabase=supabase
-)
-
-return JSONResponse(result)
+    try:
+        result = upload_prescription_template_action(
+            payload={
+                "clinician_id": payload.get("clinician_id"),
+                "pdf_bytes": pdf_bytes,
+            }
+        )
+        return JSONResponse(result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 
@@ -3897,11 +3861,12 @@ return JSONResponse(result)
 # =====================================================
 
 if __name__ == "__main__":
-    # Background polling worker (UNCHANGED LOGIC)
-    worker_thread = threading.Thread(target=main, daemon=True)
-    worker_thread.start()
+    # Run background worker in a thread
+    import threading
+    t = threading.Thread(target=main, daemon=True)
+    t.start()
 
-    # HTTP server for explicit clinician actions
+    # Start HTTP server
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
