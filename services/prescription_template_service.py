@@ -1,48 +1,48 @@
-# services/prescription_template_service.py
+import base64
+from supabase import Client
+from datetime import datetime
 
-import os
-from supabase import create_client
-
-
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-
-supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-
-BUCKET_NAME = "prescription_templates"
-
-
-def upload_prescription_template(
-    *,
-    clinician_id: str,
-    pdf_bytes: bytes
-) -> dict:
+def upload_prescription_template_action(payload: dict, supabase: Client):
     """
-    Uploads or replaces a clinician's prescription template PDF.
+    Uploads a clinician's prescription template PDF
+    and stores the path on clinicians.prescription_template_path
     """
 
-    if not pdf_bytes:
-        raise ValueError("Empty PDF upload")
+    clinician_id = payload.get("clinician_id")
+    file_base64 = payload.get("file_base64")
 
-    storage_path = f"doctor_{clinician_id}.pdf"
+    if not clinician_id:
+        raise Exception("Missing clinician_id")
 
-    # ---- Upload (overwrite allowed) ----
-    supabase.storage.from_(BUCKET_NAME).upload(
-        path=storage_path,
-        file=pdf_bytes,
-        file_options={
+    if not file_base64:
+        raise Exception("Missing file_base64")
+
+    # Decode PDF
+    try:
+        pdf_bytes = base64.b64decode(file_base64)
+    except Exception:
+        raise Exception("Invalid base64 PDF")
+
+    # Storage path
+    storage_path = f"clinician_{clinician_id}/prescription_template.pdf"
+
+    # Upload to Supabase Storage
+    supabase.storage.from_("prescription-templates").upload(
+        storage_path,
+        pdf_bytes,
+        {
             "content-type": "application/pdf",
-            "upsert": True,
-        },
+            "upsert": True
+        }
     )
 
-    full_path = f"{BUCKET_NAME}/{storage_path}"
-
-    # ---- Persist reference on clinician record ----
+    # Save path on clinician record
     supabase.table("clinicians").update({
-        "prescription_template_path": full_path
+        "prescription_template_path": storage_path,
+        "updated_at": datetime.utcnow().isoformat()
     }).eq("id", clinician_id).execute()
 
     return {
-        "prescription_template_path": full_path
+        "status": "success",
+        "storage_path": storage_path
     }
