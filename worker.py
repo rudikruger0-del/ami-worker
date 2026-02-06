@@ -3853,6 +3853,33 @@ async def http_upload_prescription_template(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+from fastapi import UploadFile, File
+
+@app.post("/action/upload_prescription_template_file")
+async def http_upload_prescription_template_file(
+    file: UploadFile = File(...),
+    authorization: str | None = Header(default=None),
+):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing auth token")
+
+    try:
+        pdf_bytes = await file.read()
+        if not pdf_bytes:
+            raise HTTPException(status_code=400, detail="Empty file")
+
+        result = upload_prescription_template_action(
+            payload={
+                "clinician_id": None,
+                "pdf_bytes": pdf_bytes,
+            }
+        )
+        return JSONResponse(result)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 
 
