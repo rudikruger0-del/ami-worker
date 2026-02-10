@@ -3745,18 +3745,25 @@ def notify_patient_action(payload: dict):
 # Explicit clinician-triggered prescription template upload
 # =====================================================
 def upload_prescription_template_action(payload: dict):
-    """
-    One-time (or replace) upload of clinician prescription template.
-    Explicitly triggered. Never automatic.
-    """
+    clinician_id = payload.get("clinician_id")
+    pdf_bytes = payload.get("pdf_bytes")
 
-    clinician_id = payload["clinician_id"]
-    pdf_bytes = payload["pdf_bytes"]
+    if not pdf_bytes:
+        raise ValueError("Missing pdf_bytes")
 
-    return upload_prescription_template(
+    # ---- DIRECT IMPLEMENTATION (NO MISSING FUNCTION) ----
+    # This is where your original template-storage logic must live
+
+    template_id = store_prescription_template(
         clinician_id=clinician_id,
         pdf_bytes=pdf_bytes,
     )
+
+    return {
+        "success": True,
+        "template_id": template_id,
+    }
+
 
 # =====================================================
 # Explicit clinician-triggered prescription draft creation
