@@ -3774,45 +3774,27 @@ def generate_prescription_draft_action(payload: dict):
         patient_id=payload.get("patient_id"),
         patient_dob=payload.get("patient_dob"),
     )
+# =====================================================
+# HTTP API — Explicit clinician-triggered actions ONLY
+# =====================================================
 
-from fastapi import FastAPI, Request, HTTPException
-import os
-import threading
+from fastapi import FastAPI, Request, Header, HTTPException, UploadFile, File
+from fastapi.responses import JSONResponse
 
 app = FastAPI(title="AMI Worker API")
 
+# ---------------------------
+# Health
+# ---------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+# ---------------------------
+# Generate prescription draft (JSON)
+# ---------------------------
 @app.post("/action/generate_prescription_draft")
-async def http_generate_prescription_draft(req: Request):
-    payload = await req.json()
-    return generate_prescription_draft_action(payload)
-
-@app.post("/action/upload_prescription_template")
-async def http_upload_prescription_template(req: Request):
-    payload = await req.json()
-    return upload_prescription_template_action(payload)
-
-@app.post("/action/notify_patient")
-async def http_notify_patient(req: Request):
-    payload = await req.json()
-    return notify_patient_action(payload)
-
-# =====================================================
-# HTTP APP — explicit clinician-triggered actions
-# =====================================================
-
-from fastapi import FastAPI, Request, Header, HTTPException
-from fastapi.responses import JSONResponse
-import base64
-
-app = FastAPI()
-
-
-@app.post("/action/notify_patient")
-async def http_notify_patient(
+async def http_generate_prescription_draft(
     request: Request,
     authorization: str | None = Header(default=None),
 ):
@@ -3820,20 +3802,18 @@ async def http_notify_patient(
         raise HTTPException(status_code=401, detail="Missing or invalid auth token")
 
     payload = await request.json()
+    return generate_prescription_draft_action(payload)
 
-    try:
-        return JSONResponse(notify_patient_action(payload))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
+# ---------------------------
+# Upload prescription template (JSON base64 fallback)
+# ---------------------------
 @app.post("/action/upload_prescription_template")
 async def http_upload_prescription_template(
     request: Request,
     authorization: str | None = Header(default=None),
 ):
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing auth token")
+        raise HTTPException(status_code=401, detail="Missing or invalid auth token")
 
     payload = await request.json()
 
@@ -3845,45 +3825,16 @@ async def http_upload_prescription_template(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid base64 PDF")
 
-    try:
-        result = upload_prescription_template_action(
-            payload={
-                "clinician_id": payload.get("clinician_id"),
-                "pdf_bytes": pdf_bytes,
-            }
-        )
-        return JSONResponse(result)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return upload_prescription_template_action(
+        payload={
+            "clinician_id": payload.get("clinician_id"),
+            "pdf_bytes": pdf_bytes,
+        }
+    )
 
-from fastapi import UploadFile, File
-
-@app.post("/action/upload_prescription_template_file")
-async def http_upload_prescription_template_file(
-    file: UploadFile = File(...),
-    authorization: str | None = Header(default=None),
-):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing auth token")
-
-    try:
-        pdf_bytes = await file.read()
-        if not pdf_bytes:
-            raise HTTPException(status_code=400, detail="Empty file")
-
-        result = upload_prescription_template_action(
-            payload={
-                "clinician_id": None,
-                "pdf_bytes": pdf_bytes,
-            }
-        )
-        return JSONResponse(result)
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-from fastapi import UploadFile, File
-
+# ---------------------------
+# Upload prescription template (MULTIPART — PRIMARY)
+# ---------------------------
 @app.post("/action/upload_prescription_template_file")
 async def http_upload_prescription_template_file(
     file: UploadFile = File(...),
@@ -3892,26 +3843,29 @@ async def http_upload_prescription_template_file(
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid auth token")
 
-    try:
-        pdf_bytes = await file.read()
+    pdf_bytes = await file.read()
 
-        if not pdf_bytes:
-            raise HTTPException(status_code=400, detail="Empty file")
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="Empty file")
 
-        result = upload_prescription_template(
-            clinician_id=None,  # auto-resolve from auth inside service
-            pdf_bytes=pdf_bytes,
-        )
+    return upload_prescription_template(
+        clinician_id=None,  # resolved inside service from auth later
+        pdf_bytes=pdf_bytes,
+    )
 
-        return JSONResponse(result)
+# ---------------------------
+# Notify patient (explicit doctor action)
+# ---------------------------
+@app.post("/action/notify_patient")
+async def http_notify_patient(
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid auth token")
 
-    except Exception as e:
-        print("UPLOAD ERROR:", e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-
-
+    payload = await request.json()
+    return notify_patient_action(payload)
 
 
 # =====================================================
