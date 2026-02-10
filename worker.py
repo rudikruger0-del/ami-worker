@@ -3751,13 +3751,22 @@ def upload_prescription_template_action(payload: dict):
     if not pdf_bytes:
         raise ValueError("Missing pdf_bytes")
 
-    # ---- DIRECT IMPLEMENTATION (NO MISSING FUNCTION) ----
-    # This is where your original template-storage logic must live
+    # ---- EXISTING LOGIC YOU ALREADY HAVE ----
+    template_id = str(uuid.uuid4())
 
-    template_id = store_prescription_template(
-        clinician_id=clinician_id,
-        pdf_bytes=pdf_bytes,
-    )
+    supabase.storage \
+        .from_("prescription-templates") \
+        .upload(
+            f"{template_id}.pdf",
+            pdf_bytes,
+            file_options={"content-type": "application/pdf"},
+        )
+
+    supabase.table("prescription_templates").insert({
+        "id": template_id,
+        "clinician_id": clinician_id,
+        "created_at": datetime.utcnow().isoformat(),
+    }).execute()
 
     return {
         "success": True,
