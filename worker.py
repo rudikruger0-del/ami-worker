@@ -3848,9 +3848,11 @@ async def http_upload_prescription_template_file(
     if not pdf_bytes:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    return upload_prescription_template(
-        clinician_id=None,  # resolved inside service from auth later
-        pdf_bytes=pdf_bytes,
+    return upload_prescription_template_action(
+        payload={
+            "clinician_id": None,  # resolve from auth later
+            "pdf_bytes": pdf_bytes,
+        }
     )
 
 # ---------------------------
