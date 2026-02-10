@@ -14,6 +14,7 @@ Features:
 
 print(">>> AMI Worker v4 starting — Pattern → Route → Next Steps (with urgency, severity, differential, trends)")
 
+import uuid
 import os
 import time
 import json
@@ -22,6 +23,7 @@ import traceback
 import base64
 import re
 from datetime import datetime
+
 
 # Third-party
 from supabase import create_client, Client
