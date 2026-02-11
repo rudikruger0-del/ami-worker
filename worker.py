@@ -3753,21 +3753,21 @@ def main():
 # =====================================================
 # Explicit doctor-triggered patient notification action
 # =====================================================
-def notify_patient_action(payload: dict):
+def notify_patient_action(clinician_id: str, payload: dict):
     """
-    Explicit, doctor-initiated action.
-    Never called automatically.
-    Never part of report processing.
+    Explicit doctor action.
+    JWT-enforced ownership.
     """
 
     return deliver_prescription(
-        doctor_id=payload["doctor_id"],
+        doctor_id=clinician_id,
         patient_id=payload.get("patient_id"),
         prescription_pdf_url=payload["prescription_pdf_url"],
         patient_email=payload.get("patient_email"),
         patient_whatsapp=payload.get("patient_whatsapp"),
         whatsapp_enabled=payload.get("whatsapp_enabled", False),
     )
+
 
 # =====================================================
 # Explicit clinician-triggered prescription template upload
@@ -3849,11 +3849,15 @@ async def http_generate_prescription_draft(
     request: Request,
     authorization: str | None = Header(default=None),
 ):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid auth token")
+    clinician_id = extract_clinician_id_from_token(authorization)
 
     payload = await request.json()
-    return generate_prescription_draft_action(payload)
+
+    return generate_prescription_draft_action(
+        clinician_id=clinician_id,
+        payload=payload
+    )
+
 
 # ---------------------------
 # Upload prescription template (JSON base64 fallback)
@@ -3876,12 +3880,13 @@ async def http_upload_prescription_template(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid base64 PDF")
 
+    clinician_id = extract_clinician_id_from_token(authorization)
+
     return upload_prescription_template_action(
-        payload={
-            "clinician_id": payload.get("clinician_id"),
-            "pdf_bytes": pdf_bytes,
-        }
+        clinician_id=clinician_id,
+        pdf_bytes=pdf_bytes,
     )
+
 
 # ---------------------------
 # Upload prescription template (MULTIPART — PRIMARY)
@@ -3912,11 +3917,15 @@ async def http_notify_patient(
     request: Request,
     authorization: str | None = Header(default=None),
 ):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid auth token")
+    clinician_id = extract_clinician_id_from_token(authorization)
 
     payload = await request.json()
-    return notify_patient_action(payload)
+
+    return notify_patient_action(
+        clinician_id=clinician_id,
+        payload=payload
+    )
+
 
 
 # =====================================================
