@@ -3849,14 +3849,26 @@ async def http_generate_prescription_draft(
     request: Request,
     authorization: str | None = Header(default=None),
 ):
-    clinician_id = extract_clinician_id_from_token(authorization)
+    try:
+        clinician_id = extract_clinician_id_from_token(authorization)
+        print("🔐 Draft clinician_id:", clinician_id)
 
-    payload = await request.json()
+        payload = await request.json()
+        print("📦 Draft payload:", payload)
 
-    return generate_prescription_draft_action(
-        clinician_id=clinician_id,
-        payload=payload
-    )
+        return generate_prescription_draft_action(
+            clinician_id=clinician_id,
+            payload=payload
+        )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
 
 
 # ---------------------------
