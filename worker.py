@@ -3808,19 +3808,23 @@ def upload_prescription_template_action(clinician_id: str, pdf_bytes: bytes):
 # =====================================================
 # Explicit clinician-triggered prescription draft creation
 # =====================================================
-def generate_prescription_draft_action(payload: dict):
+def generate_prescription_draft_action(
+    clinician_id: str,
+    payload: dict
+):
     """
     Creates a filled prescription PDF draft.
-    Explicitly triggered. Never automatic.
+    Ownership enforced via JWT clinician_id.
     """
 
     return generate_prescription_draft(
-        clinician_id=payload["clinician_id"],
+        clinician_id=clinician_id,
         report_id=payload["report_id"],
         patient_name=payload.get("patient_name"),
         patient_id=payload.get("patient_id"),
         patient_dob=payload.get("patient_dob"),
     )
+
 # =====================================================
 # HTTP API — Explicit clinician-triggered actions ONLY
 # =====================================================
