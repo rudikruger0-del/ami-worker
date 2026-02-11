@@ -53,6 +53,30 @@ JWKS_URL = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
 jwks = requests.get(JWKS_URL).json()
 
 
+from jose import jwt
+from jose.exceptions import JWTError
+from jose.utils import base64url_decode
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.backends import default_backend
+
+
+def get_public_key(token: str):
+    unverified_header = jwt.get_unverified_header(token)
+    kid = unverified_header.get("kid")
+
+    if not kid:
+        raise HTTPException(status_code=401, detail="Invalid token header")
+
+    for key in jwks.get("keys", []):
+        if key.get("kid") == kid:
+            n = int.from_bytes(base64url_decode(key["n"].encode()), "big")
+            e = int.from_bytes(base64url_decode(key["e"].encode()), "big")
+
+            return rsa.RSAPublicNumbers(e, n).public_key(default_backend())
+
+    raise HTTPException(status_code=401, detail="Public key not found")
+
+
 def extract_clinician_id_from_token(authorization: str) -> str:
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -63,12 +87,15 @@ def extract_clinician_id_from_token(authorization: str) -> str:
     token = authorization.split(" ")[1]
 
     try:
+        public_key = get_public_key(token)
+
         payload = jwt.decode(
             token,
-            jwks,
+            public_key,
             algorithms=["RS256"],
             audience="authenticated"
         )
+
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
@@ -78,6 +105,7 @@ def extract_clinician_id_from_token(authorization: str) -> str:
         raise HTTPException(status_code=401, detail="Clinician ID missing")
 
     return clinician_id
+
 
 
 
