@@ -39,6 +39,20 @@ from jose import jwt, JWTError
 JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
 JWT_ALGORITHM = "HS256"
 
+from jose import jwt
+from jose.exceptions import JWTError
+import requests
+from fastapi import HTTPException
+import os
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+
+JWKS_URL = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
+
+# Cache JWKS once at startup
+jwks = requests.get(JWKS_URL).json()
+
+
 def extract_clinician_id_from_token(authorization: str) -> str:
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -49,18 +63,21 @@ def extract_clinician_id_from_token(authorization: str) -> str:
     token = authorization.split(" ")[1]
 
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(
+            token,
+            jwks,
+            algorithms=["RS256"],
+            audience="authenticated"
+        )
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
     clinician_id = payload.get("sub")
 
     if not clinician_id:
-        raise HTTPException(status_code=401, detail="Clinician ID missing in token")
+        raise HTTPException(status_code=401, detail="Clinician ID missing")
 
     return clinician_id
-
-from fastapi.responses import JSONResponse
 
 
 
