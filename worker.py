@@ -34,6 +34,32 @@ from services.delivery_service import deliver_prescription
 from services.prescription_template_service import upload_prescription_template_action
 from services.prescription_draft_service import generate_prescription_draft
 from fastapi import FastAPI, Request, Header, HTTPException, UploadFile, File
+from jose import jwt, JWTError
+
+JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
+JWT_ALGORITHM = "HS256"
+
+def extract_clinician_id_from_token(authorization: str) -> str:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid Authorization format")
+
+    token = authorization.split(" ")[1]
+
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    clinician_id = payload.get("sub")
+
+    if not clinician_id:
+        raise HTTPException(status_code=401, detail="Clinician ID missing in token")
+
+    return clinician_id
+
 from fastapi.responses import JSONResponse
 
 
