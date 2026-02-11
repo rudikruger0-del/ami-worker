@@ -67,6 +67,13 @@ def get_public_key(token: str):
     if not kid:
         raise HTTPException(status_code=401, detail="Invalid token header")
 
+    # 🔥 Fetch JWKS LIVE
+    response = requests.get(f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json")
+    if response.status_code != 200:
+        raise HTTPException(status_code=500, detail="Unable to fetch JWKS")
+
+    jwks = response.json()
+
     for key in jwks.get("keys", []):
         if key.get("kid") == kid:
             n = int.from_bytes(base64url_decode(key["n"].encode()), "big")
@@ -75,6 +82,7 @@ def get_public_key(token: str):
             return rsa.RSAPublicNumbers(e, n).public_key(default_backend())
 
     raise HTTPException(status_code=401, detail="Public key not found")
+
 
 
 def extract_clinician_id_from_token(authorization: str) -> str:
