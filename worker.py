@@ -3772,17 +3772,17 @@ def notify_patient_action(payload: dict):
 # =====================================================
 # Explicit clinician-triggered prescription template upload
 # =====================================================
-def upload_prescription_template_action(payload: dict):
-    clinician_id = payload.get("clinician_id")
-    pdf_bytes = payload.get("pdf_bytes")
+def upload_prescription_template_action(clinician_id: str, pdf_bytes: bytes):
+
+    if not clinician_id:
+        raise ValueError("Missing clinician_id")
 
     if not pdf_bytes:
         raise ValueError("Missing pdf_bytes")
 
-    # ---- EXISTING LOGIC YOU ALREADY HAVE ----
     template_id = str(uuid.uuid4())
-    storage_path = f"{template_id}.pdf"
-    
+    storage_path = f"{clinician_id}/{template_id}.pdf"
+
     supabase.storage \
         .from_("prescription-templates") \
         .upload(
@@ -3790,18 +3790,19 @@ def upload_prescription_template_action(payload: dict):
             pdf_bytes,
             file_options={"content-type": "application/pdf"},
         )
-    
+
     supabase.table("prescription_templates").insert({
         "id": template_id,
         "clinician_id": clinician_id,
         "storage_path": storage_path,
+        "created_at": datetime.utcnow().isoformat()
     }).execute()
-
 
     return {
         "success": True,
         "template_id": template_id,
     }
+
 
 
 # =====================================================
@@ -3886,8 +3887,7 @@ async def http_upload_prescription_template_file(
     file: UploadFile = File(...),
     authorization: str | None = Header(default=None),
 ):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid auth token")
+    clinician_id = extract_clinician_id_from_token(authorization)
 
     pdf_bytes = await file.read()
 
@@ -3895,11 +3895,10 @@ async def http_upload_prescription_template_file(
         raise HTTPException(status_code=400, detail="Empty file")
 
     return upload_prescription_template_action(
-        payload={
-            "clinician_id": None,  # resolve from auth later
-            "pdf_bytes": pdf_bytes,
-        }
+        clinician_id=clinician_id,
+        pdf_bytes=pdf_bytes,
     )
+
 
 # ---------------------------
 # Notify patient (explicit doctor action)
