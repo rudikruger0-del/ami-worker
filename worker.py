@@ -85,6 +85,8 @@ def get_public_key(token: str):
 
 
 
+JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
+
 def extract_clinician_id_from_token(authorization: str) -> str:
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -95,15 +97,12 @@ def extract_clinician_id_from_token(authorization: str) -> str:
     token = authorization.split(" ")[1]
 
     try:
-        public_key = get_public_key(token)
-
         payload = jwt.decode(
             token,
-            public_key,
-            algorithms=["RS256"],
+            JWT_SECRET,
+            algorithms=["HS256"],
             audience="authenticated"
         )
-
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
@@ -113,6 +112,7 @@ def extract_clinician_id_from_token(authorization: str) -> str:
         raise HTTPException(status_code=401, detail="Clinician ID missing")
 
     return clinician_id
+
 
 
 
