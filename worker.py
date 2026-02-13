@@ -22,6 +22,7 @@ import io
 import traceback
 import base64
 import re
+import logging
 from datetime import datetime
 
 
@@ -31,7 +32,7 @@ from openai import OpenAI
 from pypdf import PdfReader
 from pdf2image import convert_from_bytes
 from services.delivery_service import deliver_prescription
-from services.prescription_template_service import upload_prescription_template_action
+from services.prescription_template_service import save_prescription_template
 from services.prescription_draft_service import generate_prescription_draft
 from fastapi import FastAPI, Request, Header, HTTPException, UploadFile, File
 from jose import jwt, JWTError
@@ -39,59 +40,14 @@ from jose import jwt, JWTError
 JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
 JWT_ALGORITHM = "HS256"
 
-from jose import jwt
-from jose.exceptions import JWTError
-import requests
-from fastapi import HTTPException
-import os
-
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-
-JWKS_URL = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
-
-# Cache JWKS once at startup
-jwks = requests.get(JWKS_URL).json()
-
-
-from jose import jwt
-from jose.exceptions import JWTError
-from jose.utils import base64url_decode
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.backends import default_backend
-
-
-def get_public_key(token: str):
-    unverified_header = jwt.get_unverified_header(token)
-    kid = unverified_header.get("kid")
-
-    if not kid:
-        raise HTTPException(status_code=401, detail="Invalid token header")
-
-    # 🔥 Fetch JWKS LIVE
-    response = requests.get(f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json")
-    if response.status_code != 200:
-        raise HTTPException(status_code=500, detail="Unable to fetch JWKS")
-
-    jwks = response.json()
-
-    for key in jwks.get("keys", []):
-        if key.get("kid") == kid:
-            n = int.from_bytes(base64url_decode(key["n"].encode()), "big")
-            e = int.from_bytes(base64url_decode(key["e"].encode()), "big")
-
-            return rsa.RSAPublicNumbers(e, n).public_key(default_backend())
-
-    raise HTTPException(status_code=401, detail="Public key not found")
-
-
-
-JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
 
 def extract_clinician_id_from_token(authorization: str) -> str:
     if not authorization:
+        logger.error("Upload request rejected: missing Authorization header. Ensure server is running and token is provided.")
         raise HTTPException(status_code=401, detail="Missing Authorization header")
 
     if not authorization.startswith("Bearer "):
+        logger.error("Upload request rejected: invalid Authorization format.")
         raise HTTPException(status_code=401, detail="Invalid Authorization format")
 
     token = authorization.split(" ")[1]
@@ -104,6 +60,7 @@ def extract_clinician_id_from_token(authorization: str) -> str:
             audience="authenticated"
         )
     except JWTError:
+        logger.error("Upload request rejected: invalid JWT token.")
         raise HTTPException(status_code=401, detail="Invalid token")
 
     clinician_id = payload.get("sub")
@@ -124,13 +81,19 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+logger = logging.getLogger(__name__)
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_KEY is missing")
+    logger.warning("SUPABASE_URL or SUPABASE_SERVICE_KEY is missing; template uploads will fall back to local storage.")
+    supabase = None
+else:
+    supabase: Client | None = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 if not OPENAI_API_KEY:
-    print("⚠️ OPENAI_API_KEY not set — OpenAI requests will likely fail (but code will still run).")
+    logger.warning("OPENAI_API_KEY not set — OpenAI requests will likely fail (but code will still run).")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 BUCKET = "reports"
@@ -3823,42 +3786,6 @@ def notify_patient_action(clinician_id: str, payload: dict):
 
 
 # =====================================================
-# Explicit clinician-triggered prescription template upload
-# =====================================================
-def upload_prescription_template_action(clinician_id: str, pdf_bytes: bytes):
-
-    if not clinician_id:
-        raise ValueError("Missing clinician_id")
-
-    if not pdf_bytes:
-        raise ValueError("Missing pdf_bytes")
-
-    template_id = str(uuid.uuid4())
-    storage_path = f"{clinician_id}/{template_id}.pdf"
-
-    supabase.storage \
-        .from_("prescription-templates") \
-        .upload(
-            storage_path,
-            pdf_bytes,
-            file_options={"content-type": "application/pdf"},
-        )
-
-    supabase.table("prescription_templates").insert({
-        "id": template_id,
-        "clinician_id": clinician_id,
-        "storage_path": storage_path,
-        "created_at": datetime.utcnow().isoformat()
-    }).execute()
-
-    return {
-        "success": True,
-        "template_id": template_id,
-    }
-
-
-
-# =====================================================
 # Explicit clinician-triggered prescription draft creation
 # =====================================================
 def generate_prescription_draft_action(
@@ -4036,10 +3963,12 @@ async def http_upload_prescription_template(
 
     clinician_id = extract_clinician_id_from_token(authorization)
 
-    return upload_prescription_template_action(
+    result = save_prescription_template(
         clinician_id=clinician_id,
-        pdf_bytes=pdf_bytes,
+        file_bytes=pdf_bytes,
+        supabase=supabase,
     )
+    return {"success": True, "template_id": result["template_id"], "message": "Template uploaded successfully"}
 
 
 # ---------------------------
@@ -4047,20 +3976,50 @@ async def http_upload_prescription_template(
 # ---------------------------
 @app.post("/action/upload_prescription_template_file")
 async def http_upload_prescription_template_file(
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(default=None),
     authorization: str | None = Header(default=None),
 ):
+    if not authorization:
+        logger.error("Template upload failed: missing Authorization header. Is the API server running and request configured correctly?")
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    if not authorization.startswith("Bearer "):
+        logger.error("Template upload failed: malformed Authorization header.")
+        raise HTTPException(status_code=401, detail="Invalid Authorization format")
+
     clinician_id = extract_clinician_id_from_token(authorization)
 
+    if file is None:
+        raise HTTPException(status_code=400, detail="Missing file")
+
+    content_type = (file.content_type or "").lower()
+    if content_type not in {"application/pdf", "application/x-pdf"}:
+        raise HTTPException(status_code=400, detail="Invalid file type. Only PDF files are accepted")
+
     pdf_bytes = await file.read()
-
     if not pdf_bytes:
-        raise HTTPException(status_code=400, detail="Empty file")
+        raise HTTPException(status_code=400, detail="Invalid file: empty upload")
 
-    return upload_prescription_template_action(
+    if not pdf_bytes.startswith(b"%PDF"):
+        raise HTTPException(status_code=400, detail="Invalid file: uploaded file is not a PDF")
+
+    result = save_prescription_template(
         clinician_id=clinician_id,
-        pdf_bytes=pdf_bytes,
+        file_bytes=pdf_bytes,
+        supabase=supabase,
     )
+
+    logger.info(
+        "Prescription template uploaded successfully for clinician_id=%s, template_id=%s, backend=%s",
+        clinician_id,
+        result["template_id"],
+        result["storage_backend"],
+    )
+
+    return {
+        "success": True,
+        "template_id": result["template_id"],
+        "message": "Template uploaded successfully",
+    }
 
 
 # ---------------------------
@@ -4088,10 +4047,13 @@ async def http_notify_patient(
 # =====================================================
 
 if __name__ == "__main__":
-    # Run background worker in a thread
-    import threading
-    t = threading.Thread(target=main, daemon=True)
-    t.start()
+    # Run background worker in a thread when Supabase is configured
+    if supabase is None:
+        logger.warning("Background worker disabled because Supabase is not configured. HTTP API is still available.")
+    else:
+        import threading
+        t = threading.Thread(target=main, daemon=True)
+        t.start()
 
     # Start HTTP server
     import uvicorn
