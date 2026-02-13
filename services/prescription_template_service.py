@@ -1,48 +1,67 @@
-import base64
-from supabase import Client
+import os
+import uuid
+import logging
 from datetime import datetime
+from pathlib import Path
 
-def upload_prescription_template_action(payload: dict, supabase: Client):
-    """
-    Uploads a clinician's prescription template PDF
-    and stores the path on clinicians.prescription_template_path
-    """
+from supabase import Client
 
-    clinician_id = payload.get("clinician_id")
-    file_base64 = payload.get("file_base64")
+
+logger = logging.getLogger(__name__)
+
+
+def save_prescription_template(
+    clinician_id: str,
+    file_bytes: bytes,
+    supabase: Client | None,
+) -> dict:
+    """Persist a clinician template to Supabase Storage, with local fallback."""
 
     if not clinician_id:
-        raise Exception("Missing clinician_id")
+        raise ValueError("Missing clinician_id")
+    if not file_bytes:
+        raise ValueError("Missing file bytes")
 
-    if not file_base64:
-        raise Exception("Missing file_base64")
+    template_id = str(uuid.uuid4())
+    storage_path = f"{clinician_id}/{template_id}.pdf"
+    now = datetime.utcnow().isoformat()
 
-    # Decode PDF
-    try:
-        pdf_bytes = base64.b64decode(file_base64)
-    except Exception:
-        raise Exception("Invalid base64 PDF")
+    if supabase:
+        supabase.storage.from_("prescription-templates").upload(
+            storage_path,
+            file_bytes,
+            file_options={
+                "content-type": "application/pdf",
+                "upsert": False,
+            },
+        )
+        supabase.table("prescription_templates").insert(
+            {
+                "id": template_id,
+                "clinician_id": clinician_id,
+                "storage_path": storage_path,
+                "storage_backend": "supabase",
+                "created_at": now,
+            }
+        ).execute()
 
-    # Storage path
-    storage_path = f"clinician_{clinician_id}/prescription_template.pdf"
-
-    # Upload to Supabase Storage
-    supabase.storage.from_("prescription-templates").upload(
-        storage_path,
-        pdf_bytes,
-        {
-            "content-type": "application/pdf",
-            "upsert": True
+        return {
+            "template_id": template_id,
+            "storage_path": storage_path,
+            "storage_backend": "supabase",
         }
+
+    base_dir = Path(os.getenv("LOCAL_TEMPLATE_DIR", "storage/prescription-templates"))
+    local_path = base_dir / clinician_id / f"{template_id}.pdf"
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_bytes(file_bytes)
+    logger.warning(
+        "Supabase client not configured. Stored template locally at %s",
+        local_path,
     )
 
-    # Save path on clinician record
-    supabase.table("clinicians").update({
-        "prescription_template_path": storage_path,
-        "updated_at": datetime.utcnow().isoformat()
-    }).eq("id", clinician_id).execute()
-
     return {
-        "status": "success",
-        "storage_path": storage_path
+        "template_id": template_id,
+        "storage_path": str(local_path),
+        "storage_backend": "local",
     }
