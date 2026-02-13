@@ -3878,6 +3878,89 @@ def generate_prescription_draft_action(
         patient_dob=payload.get("patient_dob"),
     )
 
+
+def _route_based_medications(routes: list[dict], severity_text: str) -> list[dict]:
+    """
+    Build a conservative draft medication list from route text only.
+    Includes no admission/disposition logic.
+    """
+    medications = []
+    seen = set()
+
+    def add(name: str, rationale: str):
+        key = name.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        medications.append(
+            {
+                "name": name,
+                "rationale": rationale,
+                "source": "route_based_draft",
+                "severity_text": severity_text,
+            }
+        )
+
+    route_blob = " ".join(
+        f"{(r.get('pattern') or '')} {(r.get('route') or '')}".lower()
+        for r in (routes or [])
+        if isinstance(r, dict)
+    )
+
+    if any(k in route_blob for k in ["infect", "sepsis", "inflammatory"]):
+        add("Paracetamol", "Symptom support for febrile/inflammatory route context.")
+
+    if any(k in route_blob for k in ["microcytic", "anaemia", "anemia", "iron"]):
+        add("Ferrous sulfate", "Route suggests anaemia pattern where iron replacement may be considered.")
+
+    if any(k in route_blob for k in ["potassium", "arrhythmia", "electrolyte"]):
+        add("Potassium management protocol", "Electrolyte-related route requires protocol-driven potassium correction.")
+
+    if any(k in route_blob for k in ["respiratory", "acidosis", "ventilatory"]):
+        add("Nebulised salbutamol", "Respiratory/acid-base route may benefit from bronchodilator support in selected patients.")
+
+    if any(k in route_blob for k in ["platelet", "thrombocytopenia", "bleeding"]):
+        add("Tranexamic acid (if bleeding)", "Bleeding-risk route context may require haemostatic support when clinically indicated.")
+
+    if not medications:
+        add("No automatic medication", "No specific medication route trigger detected; clinician review required.")
+
+    return medications
+
+
+def generate_prescription_draft_json_action(payload: dict) -> dict:
+    """
+    Route-driven prescription draft payload.
+    Expected payload: {"patient_id": str, "ai_results": dict}
+    """
+    patient_id = payload.get("patient_id")
+    ai_results = payload.get("ai_results")
+
+    if not patient_id:
+        raise HTTPException(status_code=400, detail="Missing patient_id")
+    if not isinstance(ai_results, dict):
+        raise HTTPException(status_code=400, detail="ai_results must be a JSON object")
+
+    routes = ai_results.get("_routes") or []
+    severity_text = (
+        ai_results.get("severity")
+        or (ai_results.get("_severity") or {}).get("severity")
+        or "unknown"
+    )
+
+    medications = _route_based_medications(routes, severity_text)
+
+    return {
+        "patient_id": patient_id,
+        "severity_text": severity_text,
+        "medications": medications,
+        "meta": {
+            "generated_from": "ai_results._routes",
+            "route_count": len(routes),
+            "generated_at": datetime.utcnow().isoformat(),
+        },
+    }
+
 # =====================================================
 # HTTP API — Explicit clinician-triggered actions ONLY
 # =====================================================
@@ -3921,6 +4004,12 @@ async def http_generate_prescription_draft(
             status_code=500,
             content={"error": str(e)}
         )
+
+
+@app.post("/api/generate-prescription-draft")
+async def http_generate_prescription_draft_json(request: Request):
+    payload = await request.json()
+    return generate_prescription_draft_json_action(payload)
 
 
 
