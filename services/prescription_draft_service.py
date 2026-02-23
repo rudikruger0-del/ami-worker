@@ -10,6 +10,7 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 DRAFT_BUCKET = "prescription_drafts"
+TEMPLATE_BUCKET = "prescription-templates"
 
 
 def generate_prescription_draft(
@@ -25,24 +26,25 @@ def generate_prescription_draft(
     Nothing is sent.
     """
 
-    # ---- Fetch clinician template path ----
-    clinician = (
-        supabase.table("clinicians")
-        .select("prescription_template_path")
-        .eq("id", clinician_id)
-        .single()
+    # ---- Fetch latest clinician template path ----
+    template_records = (
+        supabase.table("prescription_templates")
+        .select("storage_path")
+        .eq("clinician_id", clinician_id)
+        .order("created_at", desc=True)
+        .limit(1)
         .execute()
     )
 
-    template_path = clinician.data.get("prescription_template_path")
+    latest_template = template_records.data[0] if template_records.data else None
+    template_path = latest_template.get("storage_path") if latest_template else None
     if not template_path:
         raise ValueError("No prescription template uploaded for this clinician")
 
     # ---- Download template ----
-    bucket, path = template_path.split("/", 1)
     template_bytes = (
-        supabase.storage.from_(bucket)
-        .download(path)
+        supabase.storage.from_(TEMPLATE_BUCKET)
+        .download(template_path)
     )
 
     template_pdf_bytes = (
