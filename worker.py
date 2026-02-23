@@ -41,7 +41,10 @@ JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
 JWT_ALGORITHM = "HS256"
 
 
-def extract_auth_user_id_from_token(authorization: str) -> str:
+def extract_auth_user_id_from_token(
+    authorization: str,
+    supabase_client: Client | None = None,
+) -> str:
     if not authorization:
         logger.error("Upload request rejected: missing Authorization header. Ensure server is running and token is provided.")
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -51,6 +54,20 @@ def extract_auth_user_id_from_token(authorization: str) -> str:
         raise HTTPException(status_code=401, detail="Invalid Authorization format")
 
     token = authorization.split(" ")[1]
+
+    if supabase_client is not None:
+        try:
+            user_response = supabase_client.auth.get_user(token)
+            user_obj = getattr(user_response, "user", None)
+            auth_user_id = getattr(user_obj, "id", None)
+            if auth_user_id:
+                return auth_user_id
+        except Exception:
+            logger.warning("Supabase get_user token validation failed; falling back to JWT decode", exc_info=True)
+
+    if not JWT_SECRET:
+        logger.error("Upload request rejected: SUPABASE_JWT_SECRET not configured and auth fallback unavailable.")
+        raise HTTPException(status_code=503, detail="Authentication unavailable")
 
     try:
         payload = jwt.decode(
@@ -73,7 +90,7 @@ def extract_auth_user_id_from_token(authorization: str) -> str:
 
 def resolve_clinician_id_from_token(authorization: str, supabase_client: Client | None) -> str:
     """Map JWT subject -> clinicians.id using clinicians.auth_user_id."""
-    auth_user_id = extract_auth_user_id_from_token(authorization)
+    auth_user_id = extract_auth_user_id_from_token(authorization, supabase_client)
 
     if supabase_client is None:
         logger.error("Clinician lookup failed: Supabase client not configured")
