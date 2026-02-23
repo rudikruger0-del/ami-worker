@@ -3974,10 +3974,14 @@ async def http_upload_prescription_template(
     request: Request,
     authorization: str | None = Header(default=None),
 ):
+    logger.info("Endpoint hit: POST /action/upload_prescription_template")
+
     if not authorization or not authorization.startswith("Bearer "):
+        logger.warning("Template upload rejected due to missing/invalid Authorization header")
         raise HTTPException(status_code=401, detail="Missing or invalid auth token")
 
     payload = await request.json()
+    logger.info("Template upload payload received with keys=%s", list(payload.keys()))
 
     if "pdf_base64" not in payload:
         raise HTTPException(status_code=400, detail="Missing pdf_base64")
@@ -3985,6 +3989,7 @@ async def http_upload_prescription_template(
     try:
         pdf_bytes = base64.b64decode(payload["pdf_base64"])
     except Exception:
+        logger.exception("Template upload rejected due to invalid base64 payload")
         raise HTTPException(status_code=400, detail="Invalid base64 PDF")
 
     clinician_id = resolve_clinician_id_from_token(authorization, supabase)
@@ -4084,4 +4089,6 @@ if __name__ == "__main__":
     # Start HTTP server
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
+    print("FastAPI server started")
+    logger.info("Starting FastAPI server on 0.0.0.0:%s", port)
     uvicorn.run(app, host="0.0.0.0", port=port)
