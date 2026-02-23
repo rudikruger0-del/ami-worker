@@ -85,6 +85,20 @@ def test_save_template_supabase_includes_clinician_id():
     assert supabase.table_ref.insert_payload["clinician_id"] == "clinician-abc"
 
 
+def test_save_template_supabase_upload_uses_string_content_type_header():
+    supabase = _FakeSupabase()
+
+    save_prescription_template(
+        clinician_id="clinician-headers",
+        file_bytes=b"%PDF-1.7\nmock",
+        supabase=supabase,
+    )
+
+    upload_call = supabase.storage.bucket.upload_calls[0]
+    assert upload_call["file_options"] == {"content-type": "application/pdf"}
+    assert all(isinstance(k, str) and isinstance(v, str) for k, v in upload_call["file_options"].items())
+
+
 def test_save_template_requires_file_bytes():
     try:
         save_prescription_template("clinician-123", b"", None)
