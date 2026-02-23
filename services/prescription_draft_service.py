@@ -42,16 +42,16 @@ def generate_prescription_draft(
         raise ValueError("No prescription template uploaded for this clinician")
 
     # ---- Download template ----
-    template_bytes = (
-        supabase.storage.from_(TEMPLATE_BUCKET)
-        .download(template_path)
-    )
+    template_pdf_bytes = supabase.storage.from_(TEMPLATE_BUCKET).download(template_path)
 
-    template_pdf_bytes = (
-        template_bytes.data
-        if hasattr(template_bytes, "data")
-        else template_bytes
-    )
+    if template_pdf_bytes in (None, False):
+        raise ValueError("Failed to download prescription template from storage")
+
+    if not isinstance(template_pdf_bytes, bytes):
+        raise TypeError(
+            "Expected bytes from Supabase storage download, "
+            f"got {type(template_pdf_bytes).__name__}"
+        )
 
     # ---- Render filled PDF ----
     rendered_pdf = render_prescription_pdf(
