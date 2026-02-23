@@ -27,13 +27,24 @@ def save_prescription_template(
     now = datetime.utcnow().isoformat()
 
     if supabase:
+        file_options = {"content-type": "application/pdf"}
+        normalized_file_options: dict[str, str] = {}
+        for key, value in file_options.items():
+            if value is None:
+                continue
+            if isinstance(value, dict):
+                raise ValueError(f"Invalid header value for {key}: nested dictionaries are not allowed")
+            normalized_file_options[str(key)] = str(value)
+
+        logger.info(
+            "Uploading prescription template to Supabase storage_path=%s with file_options=%s",
+            storage_path,
+            normalized_file_options,
+        )
         supabase.storage.from_("prescription-templates").upload(
             storage_path,
             file_bytes,
-            file_options={
-                "content-type": "application/pdf",
-                "upsert": False,
-            },
+            file_options=normalized_file_options,
         )
         logger.info(
             "Inserting prescription template row with clinician_id=%s, template_id=%s",
