@@ -4086,17 +4086,39 @@ async def http_notify_patient(
 # =====================================================
 
 if __name__ == "__main__":
-    # Run background worker in a thread when Supabase is configured
+    import threading
+    import uvicorn
+
+    def _background_worker_forever():
+        print("=== BACKGROUND POLLER THREAD STARTED ===")
+        while True:
+            try:
+                main()
+                logger.warning("Background polling loop returned unexpectedly; restarting in 2s")
+            except Exception:
+                logger.exception("Background polling loop crashed; restarting in 2s")
+            time.sleep(2)
+
+    # Run background worker in a daemon thread when Supabase is configured.
     if supabase is None:
         logger.warning("Background worker disabled because Supabase is not configured. HTTP API is still available.")
     else:
-        import threading
-        t = threading.Thread(target=main, daemon=True)
-        t.start()
+        polling_thread = threading.Thread(
+            target=_background_worker_forever,
+            name="ami-background-poller",
+            daemon=True,
+        )
+        polling_thread.start()
 
-    # Start HTTP server
-    import uvicorn
+    # Start HTTP server as the primary blocking process.
     port = int(os.environ.get("PORT", 8080))
-    print("=== AMI WORKER FASTAPI STARTED ===")
-    logger.info("FastAPI server started on 0.0.0.0:%s", port)
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    print("=== FASTAPI SERVING ON PORT", port)
+    logger.info("FastAPI server starting on 0.0.0.0:%s", port)
+
+    while True:
+        try:
+            uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+            logger.warning("Uvicorn exited unexpectedly; restarting in 2s")
+        except Exception:
+            logger.exception("Uvicorn crashed; restarting in 2s")
+        time.sleep(2)
