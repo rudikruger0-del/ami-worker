@@ -3930,6 +3930,14 @@ app = FastAPI(title="AMI Worker API")
 def health():
     return {"status": "ok"}
 
+
+@app.get("/debug/identity")
+async def debug_identity():
+    return {
+        "service": "ami-worker-api",
+        "status": "alive"
+    }
+
 # ---------------------------
 # Generate prescription draft (JSON)
 # ---------------------------
@@ -3974,7 +3982,7 @@ async def http_upload_prescription_template(
     request: Request,
     authorization: str | None = Header(default=None),
 ):
-    logger.info("Endpoint hit: POST /action/upload_prescription_template")
+    logger.info("UPLOAD ENDPOINT HIT")
 
     if not authorization or not authorization.startswith("Bearer "):
         logger.warning("Template upload rejected due to missing/invalid Authorization header")
@@ -4089,6 +4097,6 @@ if __name__ == "__main__":
     # Start HTTP server
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
-    print("FastAPI server started")
-    logger.info("Starting FastAPI server on 0.0.0.0:%s", port)
+    print("=== AMI WORKER FASTAPI STARTED ===")
+    logger.info("FastAPI server started on 0.0.0.0:%s", port)
     uvicorn.run(app, host="0.0.0.0", port=port)
