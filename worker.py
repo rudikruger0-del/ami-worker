@@ -41,7 +41,7 @@ JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
 JWT_ALGORITHM = "HS256"
 
 
-def extract_clinician_id_from_token(authorization: str) -> str:
+def extract_auth_user_id_from_token(authorization: str) -> str:
     if not authorization:
         logger.error("Upload request rejected: missing Authorization header. Ensure server is running and token is provided.")
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -63,11 +63,37 @@ def extract_clinician_id_from_token(authorization: str) -> str:
         logger.error("Upload request rejected: invalid JWT token.")
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    clinician_id = payload.get("sub")
+    auth_user_id = payload.get("sub")
 
-    if not clinician_id:
-        raise HTTPException(status_code=401, detail="Clinician ID missing")
+    if not auth_user_id:
+        raise HTTPException(status_code=401, detail="Auth user ID missing in token")
 
+    return auth_user_id
+
+
+def resolve_clinician_id_from_token(authorization: str, supabase_client: Client | None) -> str:
+    """Map JWT subject -> clinicians.id using clinicians.auth_user_id."""
+    auth_user_id = extract_auth_user_id_from_token(authorization)
+
+    if supabase_client is None:
+        logger.error("Clinician lookup failed: Supabase client not configured")
+        raise HTTPException(status_code=503, detail="Clinician lookup unavailable")
+
+    clinician_response = (
+        supabase_client.table("clinicians")
+        .select("id")
+        .eq("auth_user_id", auth_user_id)
+        .limit(1)
+        .execute()
+    )
+
+    clinician_rows = clinician_response.data or []
+    if not clinician_rows:
+        logger.warning("Clinician lookup failed for auth_user_id=%s", auth_user_id)
+        raise HTTPException(status_code=404, detail="Clinician not found")
+
+    clinician_id = clinician_rows[0]["id"]
+    logger.info("Resolved clinician_id=%s for auth_user_id=%s", clinician_id, auth_user_id)
     return clinician_id
 
 
@@ -3913,7 +3939,7 @@ async def http_generate_prescription_draft(
     authorization: str | None = Header(default=None),
 ):
     try:
-        clinician_id = extract_clinician_id_from_token(authorization)
+        clinician_id = resolve_clinician_id_from_token(authorization, supabase)
         print("🔐 Draft clinician_id:", clinician_id)
 
         payload = await request.json()
@@ -3961,7 +3987,7 @@ async def http_upload_prescription_template(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid base64 PDF")
 
-    clinician_id = extract_clinician_id_from_token(authorization)
+    clinician_id = resolve_clinician_id_from_token(authorization, supabase)
 
     result = save_prescription_template(
         clinician_id=clinician_id,
@@ -3986,7 +4012,7 @@ async def http_upload_prescription_template_file(
         logger.error("Template upload failed: malformed Authorization header.")
         raise HTTPException(status_code=401, detail="Invalid Authorization format")
 
-    clinician_id = extract_clinician_id_from_token(authorization)
+    clinician_id = resolve_clinician_id_from_token(authorization, supabase)
 
     if file is None:
         raise HTTPException(status_code=400, detail="Missing file")
@@ -4030,7 +4056,7 @@ async def http_notify_patient(
     request: Request,
     authorization: str | None = Header(default=None),
 ):
-    clinician_id = extract_clinician_id_from_token(authorization)
+    clinician_id = resolve_clinician_id_from_token(authorization, supabase)
 
     payload = await request.json()
 

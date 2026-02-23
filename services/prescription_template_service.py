@@ -35,6 +35,11 @@ def save_prescription_template(
                 "upsert": False,
             },
         )
+        logger.info(
+            "Inserting prescription template row with clinician_id=%s, template_id=%s",
+            clinician_id,
+            template_id,
+        )
         supabase.table("prescription_templates").insert(
             {
                 "id": template_id,
