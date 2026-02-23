@@ -75,8 +75,21 @@ def generate_prescription_draft(
         file_options=draft_file_options,
     )
 
-    full_path = f"{DRAFT_BUCKET}/{draft_path}"
+    signed_url_response = supabase.storage.from_(DRAFT_BUCKET).create_signed_url(
+        draft_path,
+        expires_in=3600,
+    )
+
+    if not isinstance(signed_url_response, dict):
+        raise TypeError(
+            "Expected dict from Supabase storage create_signed_url, "
+            f"got {type(signed_url_response).__name__}"
+        )
+
+    signed_url = signed_url_response.get("signedURL") or signed_url_response.get("signedUrl")
+    if not signed_url:
+        raise ValueError("Failed to create signed URL for prescription draft")
 
     return {
-        "prescription_draft_path": full_path
+        "prescription_draft_url": signed_url
     }
