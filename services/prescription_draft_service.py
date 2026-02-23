@@ -1,13 +1,7 @@
 # services/prescription_draft_service.py
 
-import os
-from supabase import create_client
 from services.prescription_render_service import render_prescription_pdf
-
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-
-supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+from services.supabase_client import supabase
 
 DRAFT_BUCKET = "prescription_drafts"
 TEMPLATE_BUCKET = "prescription-templates"
@@ -25,6 +19,9 @@ def generate_prescription_draft(
     Generates a filled prescription PDF draft.
     Nothing is sent.
     """
+
+    if supabase is None:
+        raise RuntimeError("Supabase client is not configured")
 
     # ---- Fetch latest clinician template path ----
     template_records = (
