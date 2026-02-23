@@ -3950,6 +3950,7 @@ def health():
 
 @app.get("/debug/identity")
 async def debug_identity():
+    logger.info("Identity probe hit: ami-worker-api is alive")
     return {
         "service": "ami-worker-api",
         "status": "alive"
