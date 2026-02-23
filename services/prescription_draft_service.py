@@ -62,13 +62,17 @@ def generate_prescription_draft(
     # ---- Store draft ----
     draft_path = f"drafts/{report_id}_{clinician_id}.pdf"
 
+    draft_file_options = {
+        "content-type": "application/pdf",
+        # Supabase storage headers must be strings; booleans can trigger
+        # "'bool' object has no attribute 'encode'" in the HTTP client.
+        "upsert": "true",
+    }
+
     supabase.storage.from_(DRAFT_BUCKET).upload(
         path=draft_path,
         file=rendered_pdf,
-        file_options={
-            "content-type": "application/pdf",
-            "upsert": True,
-        },
+        file_options=draft_file_options,
     )
 
     full_path = f"{DRAFT_BUCKET}/{draft_path}"
