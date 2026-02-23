@@ -4,16 +4,8 @@ from datetime import datetime
 from uuid import uuid4
 
 from services.email_service import send_email
+from services.supabase_client import supabase
 from services.whatsapp_service import send_whatsapp_notification
-from supabase import create_client
-import os
-
-
-# --- Supabase client ---
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-
-supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
 def deliver_prescription(
@@ -29,6 +21,9 @@ def deliver_prescription(
     Attempts delivery and records outcome.
     Never retries. Never raises to caller.
     """
+
+    if supabase is None:
+        raise RuntimeError("Supabase client is not configured")
 
     delivery_id = str(uuid4())
 

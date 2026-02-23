@@ -27,13 +27,14 @@ from datetime import datetime
 
 
 # Third-party
-from supabase import create_client, Client
+from supabase import Client
 from openai import OpenAI
 from pypdf import PdfReader
 from pdf2image import convert_from_bytes
 from services.delivery_service import deliver_prescription
 from services.prescription_template_service import save_prescription_template
 from services.prescription_draft_service import generate_prescription_draft
+from services.supabase_client import supabase
 from fastapi import FastAPI, Request, Header, HTTPException, UploadFile, File
 from jose import jwt, JWTError
 
@@ -120,19 +121,16 @@ def resolve_clinician_id_from_token(authorization: str, supabase_client: Client 
 # ---------------------------
 # Environment / clients
 # ---------------------------
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 logger = logging.getLogger(__name__)
 if not logging.getLogger().handlers:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    logger.warning("SUPABASE_URL or SUPABASE_SERVICE_KEY is missing; template uploads will fall back to local storage.")
-    supabase = None
-else:
-    supabase: Client | None = create_client(SUPABASE_URL, SUPABASE_KEY)
+if supabase is None:
+    logger.warning(
+        "Supabase client unavailable in worker; template uploads will fall back to local storage."
+    )
 
 if not OPENAI_API_KEY:
     logger.warning("OPENAI_API_KEY not set — OpenAI requests will likely fail (but code will still run).")
