@@ -34,6 +34,7 @@ from pdf2image import convert_from_bytes
 from services.delivery_service import deliver_prescription
 from services.prescription_template_service import save_prescription_template
 from services.prescription_draft_service import generate_prescription_draft
+from services.prescription_render_service import render_prescription_pdf
 from services.supabase_client import supabase
 from fastapi import FastAPI, Request, Header, HTTPException, UploadFile, File
 from jose import jwt, JWTError
@@ -3938,6 +3939,18 @@ from fastapi.responses import JSONResponse
 
 app = FastAPI(title="AMI Worker API")
 
+
+def _is_development_mode() -> bool:
+    env = (
+        os.getenv("ENV")
+        or os.getenv("APP_ENV")
+        or os.getenv("ENVIRONMENT")
+        or os.getenv("FASTAPI_ENV")
+        or ""
+    ).strip().lower()
+    debug = (os.getenv("DEBUG") or "").strip().lower()
+    return env in {"dev", "development", "local"} or debug in {"1", "true", "yes", "on"}
+
 # ---------------------------
 # Health
 # ---------------------------
@@ -3987,6 +4000,136 @@ async def http_generate_prescription_draft(
 async def http_generate_prescription_draft_json(request: Request):
     payload = await request.json()
     return generate_prescription_draft_json_action(payload)
+
+
+@app.post("/action/prescription_submit")
+async def http_prescription_submit(
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
+    try:
+        payload = await request.json()
+        logger.info("prescription_submit payload=%s", payload)
+
+        clinician_id = resolve_clinician_id_from_token(authorization, supabase)
+        logger.info("prescription_submit resolved clinician_id=%s", clinician_id)
+
+        report_id = (payload.get("report_id") or "").strip() if isinstance(payload, dict) else ""
+        prescription_text = (payload.get("prescription_text") or "") if isinstance(payload, dict) else ""
+
+        if not report_id:
+            raise HTTPException(status_code=400, detail="report_id is required")
+
+        if not isinstance(prescription_text, str) or not prescription_text.strip():
+            raise HTTPException(status_code=400, detail="prescription_text must not be empty")
+
+        if supabase is None:
+            raise HTTPException(status_code=503, detail="Supabase client is not configured")
+
+        report_lookup = (
+            supabase.table("reports")
+            .select("id,patient_name,patient_id,patient_dob,clinician_id")
+            .eq("id", report_id)
+            .limit(1)
+            .execute()
+        )
+        logger.info("prescription_submit report_lookup_result=%s", getattr(report_lookup, "data", None))
+
+        report_rows = report_lookup.data or []
+        if not report_rows:
+            raise HTTPException(status_code=404, detail="report_id not found")
+
+        report_row = report_rows[0]
+        report_clinician_id = report_row.get("clinician_id")
+        if report_clinician_id and report_clinician_id != clinician_id:
+            raise HTTPException(status_code=403, detail="report does not belong to clinician")
+
+        template_lookup = (
+            supabase.table("prescription_templates")
+            .select("id,storage_path")
+            .eq("clinician_id", clinician_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        logger.info("prescription_submit template_lookup_result=%s", getattr(template_lookup, "data", None))
+
+        template_rows = template_lookup.data or []
+        if not template_rows:
+            raise HTTPException(status_code=404, detail="No prescription template uploaded for this clinician")
+
+        template_path = template_rows[0].get("storage_path")
+        if not template_path:
+            raise HTTPException(status_code=500, detail="Template storage_path is missing")
+
+        template_pdf_bytes = supabase.storage.from_("prescription-templates").download(template_path)
+        if template_pdf_bytes in (None, False) or not isinstance(template_pdf_bytes, bytes):
+            raise HTTPException(status_code=500, detail="Failed to download prescription template")
+
+        logger.info("prescription_submit pdf_rendering_start report_id=%s", report_id)
+        rendered_pdf = render_prescription_pdf(
+            template_pdf_bytes=template_pdf_bytes,
+            patient_name=report_row.get("patient_name"),
+            patient_id=report_row.get("patient_id"),
+            patient_dob=report_row.get("patient_dob"),
+            reference=report_id,
+        )
+        logger.info("prescription_submit pdf_rendering_complete bytes=%s", len(rendered_pdf))
+
+        prescription_id = str(uuid.uuid4())
+        upload_path = f"signed/{clinician_id}/{prescription_id}.pdf"
+
+        insert_response = (
+            supabase.table("prescriptions")
+            .insert(
+                {
+                    "id": prescription_id,
+                    "clinician_id": clinician_id,
+                    "report_id": report_id,
+                    "prescription_text": prescription_text.strip(),
+                    "pdf_path": upload_path,
+                    "status": "submitted",
+                }
+            )
+            .execute()
+        )
+        logger.info("prescription_submit supabase_insert_response=%s", getattr(insert_response, "data", None))
+
+        if not getattr(insert_response, "data", None):
+            raise HTTPException(status_code=500, detail="Failed to create prescription record in database")
+
+        upload_result = supabase.storage.from_("prescription_drafts").upload(
+            path=upload_path,
+            file=rendered_pdf,
+            file_options={"content-type": "application/pdf", "upsert": "true"},
+        )
+        logger.info("prescription_submit storage_upload_result=%s", upload_result)
+
+        signed_url_response = supabase.storage.from_("prescription_drafts").create_signed_url(
+            upload_path,
+            expires_in=3600,
+        )
+        logger.info("prescription_submit signed_url_generation_result=%s", signed_url_response)
+
+        signed_url = None
+        if isinstance(signed_url_response, dict):
+            signed_url = signed_url_response.get("signedURL") or signed_url_response.get("signedUrl")
+
+        if not signed_url:
+            raise HTTPException(status_code=500, detail="Failed to create signed URL for prescription")
+
+        return {
+            "success": True,
+            "prescription_id": prescription_id,
+            "prescription_pdf_url": signed_url,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to finalize and sign prescription")
+        err_msg = str(e) if _is_development_mode() else "Failed to finalize and sign prescription."
+        return JSONResponse(status_code=500, content={"error": err_msg})
 
 
 
