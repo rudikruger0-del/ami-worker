@@ -4079,20 +4079,39 @@ async def http_prescription_submit(
         prescription_id = str(uuid.uuid4())
         upload_path = f"signed/{clinician_id}/{prescription_id}.pdf"
 
-        insert_response = (
-            supabase.table("prescriptions")
-            .insert(
-                {
-                    "id": prescription_id,
-                    "clinician_id": clinician_id,
-                    "report_id": report_id,
-                    "prescription_text": prescription_text.strip(),
-                    "pdf_path": upload_path,
-                    "status": "submitted",
-                }
+        prescription_row = {
+            "id": prescription_id,
+            "clinician_id": clinician_id,
+            "report_id": report_id,
+            "prescription_text": prescription_text.strip(),
+            "pdf_path": upload_path,
+            "status": "submitted",
+        }
+
+        try:
+            insert_response = (
+                supabase.table("prescriptions")
+                .insert(prescription_row)
+                .execute()
             )
-            .execute()
-        )
+        except Exception as insert_err:
+            # Backwards compatibility: some deployments still use
+            # `prescription_pdf_url` instead of `pdf_path`.
+            logger.warning(
+                "prescription_submit insert with pdf_path failed; retrying with prescription_pdf_url. error=%s",
+                insert_err,
+            )
+            fallback_row = {
+                **prescription_row,
+                "prescription_pdf_url": upload_path,
+            }
+            fallback_row.pop("pdf_path", None)
+
+            insert_response = (
+                supabase.table("prescriptions")
+                .insert(fallback_row)
+                .execute()
+            )
         logger.info("prescription_submit supabase_insert_response=%s", getattr(insert_response, "data", None))
 
         if not getattr(insert_response, "data", None):
