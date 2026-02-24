@@ -3821,7 +3821,7 @@ def notify_patient_action(clinician_id: str, payload: dict):
     return deliver_prescription(
         doctor_id=clinician_id,
         patient_id=payload.get("patient_id"),
-        prescription_pdf_url=payload["prescription_pdf_url"],
+        pdf_path=payload["pdf_path"],
         patient_email=payload.get("patient_email"),
         patient_whatsapp=payload.get("patient_whatsapp"),
         whatsapp_enabled=payload.get("whatsapp_enabled", False),
@@ -4080,33 +4080,13 @@ async def http_prescription_submit(
             "report_id": report_id,
             "prescription_text": prescription_text.strip(),
             "pdf_path": upload_path,
-            "status": "submitted",
         }
 
-        try:
-            insert_response = (
-                supabase.table("prescriptions")
-                .insert(prescription_row)
-                .execute()
-            )
-        except Exception as insert_err:
-            # Backwards compatibility: some deployments still use
-            # `prescription_pdf_url` instead of `pdf_path`.
-            logger.warning(
-                "prescription_submit insert with pdf_path failed; retrying with prescription_pdf_url. error=%s",
-                insert_err,
-            )
-            fallback_row = {
-                **prescription_row,
-                "prescription_pdf_url": upload_path,
-            }
-            fallback_row.pop("pdf_path", None)
-
-            insert_response = (
-                supabase.table("prescriptions")
-                .insert(fallback_row)
-                .execute()
-            )
+        insert_response = (
+            supabase.table("prescriptions")
+            .insert(prescription_row)
+            .execute()
+        )
         logger.info("prescription_submit supabase_insert_response=%s", getattr(insert_response, "data", None))
 
         if not getattr(insert_response, "data", None):
@@ -4135,7 +4115,8 @@ async def http_prescription_submit(
         return {
             "success": True,
             "prescription_id": prescription_id,
-            "prescription_pdf_url": signed_url,
+            "pdf_path": upload_path,
+            "signed_pdf_url": signed_url,
         }
 
     except HTTPException:

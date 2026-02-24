@@ -12,7 +12,7 @@ def deliver_prescription(
     *,
     doctor_id: str,
     patient_id: str | None,
-    prescription_pdf_url: str,
+    pdf_path: str,
     patient_email: str | None,
     patient_whatsapp: str | None,
     whatsapp_enabled: bool,
@@ -40,7 +40,7 @@ def deliver_prescription(
                 to=patient_email,
                 subject="Your prescription",
                 body="Please find your prescription attached.",
-                attachment_url=prescription_pdf_url,
+                attachment_url=pdf_path,
             )
             email_status = "sent"
         except Exception as e:
@@ -69,7 +69,7 @@ def deliver_prescription(
         "id": delivery_id,
         "doctor_id": doctor_id,
         "patient_id": patient_id,
-        "prescription_pdf_url": prescription_pdf_url,
+        "pdf_path": pdf_path,
 
         "email_address": patient_email,
         "email_status": email_status,
