@@ -35,6 +35,7 @@ from services.delivery_service import deliver_prescription
 from services.prescription_template_service import save_prescription_template
 from services.prescription_draft_service import generate_prescription_draft
 from services.prescription_render_service import render_prescription_pdf
+from services.report_patient_extractor_service import extract_patient_fields_from_report
 from services.supabase_client import supabase
 from fastapi import FastAPI, Request, Header, HTTPException, UploadFile, File
 from jose import jwt, JWTError
@@ -4020,7 +4021,7 @@ async def http_prescription_submit(
 
         report_lookup = (
             supabase.table("reports")
-            .select("id,patient_name,patient_id,patient_dob,clinician_id")
+            .select("*")
             .eq("id", report_id)
             .limit(1)
             .execute()
@@ -4035,6 +4036,8 @@ async def http_prescription_submit(
         report_clinician_id = report_row.get("clinician_id")
         if report_clinician_id and report_clinician_id != clinician_id:
             raise HTTPException(status_code=403, detail="report does not belong to clinician")
+
+        patient_fields = extract_patient_fields_from_report(report_row)
 
         template_lookup = (
             supabase.table("prescription_templates")
@@ -4061,9 +4064,9 @@ async def http_prescription_submit(
         logger.info("prescription_submit pdf_rendering_start report_id=%s", report_id)
         rendered_pdf = render_prescription_pdf(
             template_pdf_bytes=template_pdf_bytes,
-            patient_name=report_row.get("patient_name"),
-            patient_id=report_row.get("patient_id"),
-            patient_dob=report_row.get("patient_dob"),
+            patient_name=patient_fields.get("patient_name"),
+            patient_id=patient_fields.get("patient_id"),
+            patient_dob=patient_fields.get("patient_dob"),
             reference=report_id,
         )
         logger.info("prescription_submit pdf_rendering_complete bytes=%s", len(rendered_pdf))
