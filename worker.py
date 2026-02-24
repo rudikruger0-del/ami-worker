@@ -3941,15 +3941,7 @@ app = FastAPI(title="AMI Worker API")
 
 
 def _is_development_mode() -> bool:
-    env = (
-        os.getenv("ENV")
-        or os.getenv("APP_ENV")
-        or os.getenv("ENVIRONMENT")
-        or os.getenv("FASTAPI_ENV")
-        or ""
-    ).strip().lower()
-    debug = (os.getenv("DEBUG") or "").strip().lower()
-    return env in {"dev", "development", "local"} or debug in {"1", "true", "yes", "on"}
+    return True
 
 # ---------------------------
 # Health
@@ -4147,8 +4139,7 @@ async def http_prescription_submit(
         raise
     except Exception as e:
         logger.exception("Failed to finalize and sign prescription")
-        err_msg = str(e) if _is_development_mode() else "Failed to finalize and sign prescription."
-        return JSONResponse(status_code=500, content={"error": err_msg})
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 
