@@ -4068,6 +4068,7 @@ async def http_prescription_submit(
             patient_id=patient_fields.get("patient_id"),
             patient_dob=patient_fields.get("patient_dob"),
             reference=report_id,
+            prescription_text=prescription_text,
         )
         logger.info("prescription_submit pdf_rendering_complete bytes=%s", len(rendered_pdf))
 
