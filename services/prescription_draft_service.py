@@ -26,7 +26,7 @@ def generate_prescription_draft(
     # ---- Fetch latest clinician template path ----
     template_records = (
         supabase.table("prescription_templates")
-        .select("storage_path")
+        .select("storage_path,layout_json")
         .eq("clinician_id", clinician_id)
         .order("created_at", desc=True)
         .limit(1)
@@ -37,6 +37,10 @@ def generate_prescription_draft(
     template_path = latest_template.get("storage_path") if latest_template else None
     if not template_path:
         raise ValueError("No prescription template uploaded for this clinician")
+
+    layout_json = latest_template.get("layout_json") if latest_template else None
+    if not isinstance(layout_json, dict):
+        raise ValueError("No valid template layout_json found for this clinician")
 
     # ---- Download template ----
     template_pdf_bytes = supabase.storage.from_(TEMPLATE_BUCKET).download(template_path)
@@ -57,6 +61,7 @@ def generate_prescription_draft(
         patient_id=patient_id,
         patient_dob=patient_dob,
         reference=report_id,
+        layout_json=layout_json,
     )
 
     # ---- Store draft ----

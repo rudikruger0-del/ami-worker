@@ -4041,7 +4041,7 @@ async def http_prescription_submit(
 
         template_lookup = (
             supabase.table("prescription_templates")
-            .select("id,storage_path")
+            .select("id,storage_path,layout_json")
             .eq("clinician_id", clinician_id)
             .order("created_at", desc=True)
             .limit(1)
@@ -4057,6 +4057,10 @@ async def http_prescription_submit(
         if not template_path:
             raise HTTPException(status_code=500, detail="Template storage_path is missing")
 
+        layout_json = template_rows[0].get("layout_json")
+        if not isinstance(layout_json, dict):
+            raise HTTPException(status_code=500, detail="Template layout_json is missing or invalid")
+
         template_pdf_bytes = supabase.storage.from_("prescription-templates").download(template_path)
         if template_pdf_bytes in (None, False) or not isinstance(template_pdf_bytes, bytes):
             raise HTTPException(status_code=500, detail="Failed to download prescription template")
@@ -4069,6 +4073,7 @@ async def http_prescription_submit(
             patient_dob=patient_fields.get("patient_dob"),
             reference=report_id,
             prescription_text=prescription_text,
+            layout_json=layout_json,
         )
         logger.info("prescription_submit pdf_rendering_complete bytes=%s", len(rendered_pdf))
 
